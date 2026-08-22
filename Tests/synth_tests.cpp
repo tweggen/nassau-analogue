@@ -298,8 +298,19 @@ int main() {
             {1500, NoteEvent::AllNotesOff, 0, 0.0f},
         };
 
+        // G6 (R11 finding): reset() clears STATE and never touches PARAMS
+        // (DESIGN.md §11 "Reset semantics") -- this AC exists to prove the
+        // former, not to re-exercise the latter. Once kMasterVolume/kDrive
+        // actually reached the audio path (this gate), `fresh` needs the
+        // SAME param values `used` below sets, or a divergence caused
+        // purely by DIFFERENT params (fresh at the -6dB/15% defaults, used
+        // at 6dB/80%) gets misread as a reset() defect. Latent since G0;
+        // invisible until params 0/38 had an audible effect.
         SynthCore fresh;
         fresh.init(48000.0f);
+        fresh.setMasterVolumeDb(6.0f);
+        fresh.setDrivePercent(80.0f);
+        fresh.setPolyphony(SynthCore::Polyphony::Sixteen);
         std::vector<float> freshL(static_cast<size_t>(N)), freshR(static_cast<size_t>(N));
         fresh.process(events.data(), static_cast<int>(events.size()), freshL.data(), freshR.data(),
                       N);

@@ -128,7 +128,8 @@ which are computed once per voice and used by both chains (PERF-5).
     11. PAN        c == 0 → left by Spread, c == 1 → right by Spread
                                   │
                                   ▼
-          voice accumulator (L, R) ──> Master volume ──> Output clip ──> out
+          voice accumulator (L, R) ──> Master volume ──> Output clip ──>
+          Output DC block (§11, when clip is on) ────────────────> out
 ```
 
 ### Ordering constraints (non-negotiable)
@@ -904,7 +905,10 @@ core and no mono-sum wrapper — `SynthCore` is natively stereo out.
 
 ```
 outL/R = MasterVolume_linear * accumulator
-if (kOutputClip) outL/R = shapeCubic(outL/R, 2.0)
+if (kOutputClip) {
+    outL/R = shapeCubic(outL/R, 2.0)
+    outL/R = OutputDcBlock(outL/R)     // 1-pole HP @ 5 Hz — see below
+}
 ```
 
 `shapeCubic(x, L) = x + x^3/(2L^2) - x^5/(2L^4)` for `|x| < L`, `±L` beyond —
@@ -922,6 +926,25 @@ x = 0.25 (−12 dBFS):
 will never produce. G1.19 and G6.12 assert `0.251922607421875` bit-exactly; it
 is arithmetic, not a measurement, so an implementation that disagrees with it is
 wrong.
+
+**The output clip needs its own DC blocker, found at G6, same mechanism as
+§5.6, one stage further downstream.** `shapeCubic` is an odd function, exactly
+like the filters' feedback saturators, and by G6 the drive stage (§4) sits
+upstream of it in the same chain — so a non-half-wave-symmetric signal (any
+pulse at duty ≠ 50 %, or a plain saw) that reaches the clip's nonlinear region
+re-introduces DC that neither the mixer blocker (§4.1) nor the post-filter
+blocker (§5.6) can remove, because both sit *before* the clip. Measured with
+only those two: worst corner 1.94e-3 (pulse, PW = 25 %, Drive = 0 %, HPF
+bypassed, output clip on) against every other cell of the same grid at
+≈1e-10 — the clip is unambiguously the source. A third one-pole 5 Hz
+high-pass on the clipped signal, mirroring the two upstream blockers exactly,
+brings the whole grid back to ≈1e-10. It runs **only when `kOutputClip` is
+on**: with the clip off there is no clip-introduced DC to remove (the signal
+is already clean by construction, §4.1/§5.6), and gating it this way is what
+keeps `kOutputClip = off` a bit-exact passthrough of the master-scaled sum
+(G6.12). One instance, not per-channel: `outL`/`outR` are identical until
+stereo mode (§9, G8) gives them independent content, at which point G8 is the
+gate positioned to decide whether this needs to become per-channel.
 
 ### Reset semantics
 

@@ -85,3 +85,16 @@ target_compile_definitions(synth_golden PRIVATE
     GOLDEN_FIXTURE_PATH_G5="${SYNTH_GOLDEN_FIXTURE_G5}")
 
 add_test(NAME GoldenParityG5 COMMAND synth_golden verify "${SYNTH_GOLDEN_FIXTURE_G5}")
+
+# ---- G6: HPF, drive, Poly-Mod, output stage, complete voice ---------------
+# Links nassau_synth_core: the HPF's static-response ACs (G6.1/G6.2/G6.3/
+# G6.5/G6.6) drive Source/DSP/synth_filter.h's HpfCascade directly (same
+# shape as filter_tests.cpp's G4/G5 precedent); the rest drive the real
+# SynthCore per-voice path.
+add_executable(voice_tests voice_tests.cpp)
+target_link_libraries(voice_tests nassau_synth_core)
+target_include_directories(voice_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(voice_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME VoiceTests COMMAND voice_tests)

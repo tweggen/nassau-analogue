@@ -46,14 +46,42 @@ namespace {
 // ---- Per-case parameter set --------------------------------------------
 // Every SynthCore param 0-37 landed through G5 (DESIGN.md §11), defaulted
 // to the §11 default column so a Case only overrides what it is actually
-// testing. Params 38+ (G6 onward) do not exist yet and are not set here --
-// SynthCore's own setters for them are no-ops on this gate's audible path
-// (nothing downstream of the LPF reads them until G6 wires drive/HPF/
-// Poly-Mod in), so leaving them at SynthCore's own atomic defaults is
-// correct, not an oversight.
+// testing.
+//
+// *** G6 amendment (R11 -- a decision the plan did not name, recorded here) ***
+// `masterVolumeDb`/`outputClip` (params 0/1) default AWAY from DESIGN.md
+// §11's own default column (-6dB / on) to 0dB / off instead. This is
+// deliberate, not an oversight: G0-G5 set these two atomics on every case
+// (see configure() below) but process() never actually APPLIED them --
+// docs/GATES.md's own G6 brief: "Params 0 and 1 are still unapplied from
+// G0 -- this gate wires them." Now that G6 wires the output stage in
+// (master volume then, if kOutputClip is on, shapeCubic), the FIXED
+// fixture this file compares against (Tests/fixtures/golden_g5.bin) was
+// captured as the raw pre-output-stage voice accumulator -- G5's own
+// "sound-defining core" reference for the mixer->drive->HPF->LPF->VCA
+// chain (docs/GATES.md G6.16: "GoldenParityG5 still passes... proving
+// nothing upstream moved"). At their DESIGN.md-default values (-6dB, on)
+// the newly-wired output stage would scale every sample by 0.501187 and
+// then reshape it through shapeCubic -- correct behaviour, but it would
+// make EVERY case's fixture bytes disagree with golden_g5.bin regardless
+// of whether the upstream chain moved at all, defeating the very thing
+// this AC exists to isolate. 0dB (10^(0/20) == 1.0 exactly, an IEEE-754
+// no-op multiply) and clip off (a bit-exact passthrough, DESIGN.md §11,
+// docs/GATES.md G6.12) keep this file's own render bit-identical to what
+// it always was, so G6.16 continues to test what it always tested: the
+// mixer/drive/HPF/LPF/VCA chain, not the (separately, freshly tested by
+// G6.12/G6.14) output stage. `drivePercent` is likewise forced to 0.0f
+// (NOT DESIGN.md §11's own 15% default) for the identical reason PLUS
+// G6.16's own literal wording ("drive forced to 0") -- `shapeTriodeK`'s
+// bit-exact identity at Drive=0 (DESIGN.md §4, G6.7) is what makes this
+// work. `kHpfCutoff`'s own DESIGN.md default (20Hz) is ALREADY the hard
+// bypass (DESIGN.md §5.5, G6.4) and needs no override; `kHpfKeyFollow`/
+// `kPmEnvFToOsc2`/`kPmEnvFToPw` all default to 0% already (no-ops at
+// their DESIGN.md defaults), so they are set here for explicitness only,
+// not because their values matter.
 struct SynthParams {
-  float masterVolumeDb = -6.0f;
-  bool outputClip = true;
+  float masterVolumeDb = 0.0f;   // [voicing] G6: NOT DESIGN.md's -6dB default -- see the note above
+  bool outputClip = false;       // [voicing] G6: NOT DESIGN.md's "on" default -- see the note above
   SynthCore::Wave osc1Wave = SynthCore::Wave::Saw;
   SynthCore::Octave osc1Octave = SynthCore::Octave::Ft8;
   float osc1FineCents = 0.0f;
@@ -90,6 +118,15 @@ struct SynthParams {
   float lpfEnvAmountPercent = 40.0f;
   float lpfKeyFollowPercent = 50.0f;
   float lpfLfoAmountPercent = 0.0f;
+  // ---- G6 (params 38-43) -- see the struct comment above for why
+  // drivePercent overrides DESIGN.md's own 15% default; the rest are
+  // already no-ops at DESIGN.md's own defaults.
+  float drivePercent = 0.0f;                      // [voicing] G6: NOT DESIGN.md's 15% default
+  SynthCore::HpfSlope hpfSlope = SynthCore::HpfSlope::Db12;  // DESIGN.md default
+  float hpfCutoffHz = 20.0f;                       // DESIGN.md default -- already the hard bypass
+  float hpfKeyFollowPercent = 0.0f;                // DESIGN.md default
+  float pmEnvFToOsc2Percent = 0.0f;                // DESIGN.md default
+  float pmEnvFToPwPercent = 0.0f;                  // DESIGN.md default
 };
 
 void configure(SynthCore& core, const SynthParams& p) {
@@ -131,6 +168,12 @@ void configure(SynthCore& core, const SynthParams& p) {
   core.setLpfEnvAmountPercent(p.lpfEnvAmountPercent);
   core.setLpfKeyFollowPercent(p.lpfKeyFollowPercent);
   core.setLpfLfoAmountPercent(p.lpfLfoAmountPercent);
+  core.setDrivePercent(p.drivePercent);
+  core.setHpfSlope(p.hpfSlope);
+  core.setHpfCutoffHz(p.hpfCutoffHz);
+  core.setHpfKeyFollowPercent(p.hpfKeyFollowPercent);
+  core.setPmEnvFToOsc2Percent(p.pmEnvFToOsc2Percent);
+  core.setPmEnvFToPwPercent(p.pmEnvFToPwPercent);
   // Params set BEFORE init(): init()/reset() is what snaps every per-voice
   // filter/envelope/oscillator state to a deterministic start (R13); a
   // case's own init() call below happens AFTER configure() has already set

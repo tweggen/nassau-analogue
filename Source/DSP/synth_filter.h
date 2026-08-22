@@ -363,3 +363,94 @@ struct SvfFilter {
   }
   // ---- PER-SAMPLE PROCESS END ----
 };
+
+// ============================================================================
+// HpfCascade — G6, DESIGN.md §5.5: a cascade of up to 4 IDENTICAL TPT
+// one-pole high-passes (2 poles for 12 dB mode, 4 for 24 dB mode). No
+// resonance and no feedback loop (DESIGN.md §5.5: "the Jupiter-6's
+// high-pass has none") -- so, unlike LadderFilter/SvfFilter, there is no
+// closed-form zero-delay solve here: each stage's HP output simply feeds
+// the next stage's input, reusing TptOnePole (G1) verbatim exactly as
+// LadderFilter's four poles do.
+//
+// The caller (SynthCore::controlRateUpdate()) is responsible for DESIGN.md
+// §5.5's HARD BYPASS at kHpfCutoff's minimum (20 Hz): that is an
+// architectural skip of this whole struct, not a filter setting, because a
+// real (even very-low-fc) digital high-pass is never BIT-EXACTLY identity
+// (DESIGN.md §5.5, docs/GATES.md G6.4) -- see synth_core.cpp's per-sample
+// loop for where that skip happens.
+//
+// `g` is shared by every stage (identical poles): DESIGN.md §2 names `gHpf`
+// as one of exactly three quantities linearly interpolated PER SAMPLE
+// (alongside `gLpf`/`vcaGain`) -- advanceCoeff() below is the same pattern
+// LadderFilter/SvfFilter already established at G5, applied here for G6.
+// ============================================================================
+struct HpfCascade {
+  TptOnePole p1, p2, p3, p4;
+  double g = 0.0;  // [dsp] tan(pi*fc/fs), control-rate (DESIGN.md §5.5)
+
+  void reset() {
+    p1.reset();
+    p2.reset();
+    p3.reset();
+    p4.reset();
+    g = 0.0;
+  }
+
+  /// Control-rate coefficient update (DESIGN.md §2/§5.5): call once per
+  /// control block. `fc` is the ALREADY-modulated (key-follow), ALREADY-
+  /// clamped cutoff in Hz -- the caller applies DESIGN.md §5.4/§5.5's
+  /// [10, 0.45*fs] robustness clamp itself, matching LadderFilter/SvfFilter's
+  /// own setControlRate() convention. Robustness clamp repeated here too
+  /// (TptOnePole::setFc's own guard) so a caller that forgot it cannot make
+  /// tan() diverge.
+  void setControlRate(double fc, double fs) {
+    g = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.5/§5.4
+    p1.g = g;
+    p2.g = g;
+    p3.g = g;
+    p4.g = g;
+  }
+
+  /// G6 (DESIGN.md §2's "gHpf" -- see LadderFilter::advanceCoeff's identical
+  /// class-level rationale, which applies verbatim here since every stage
+  /// shares the same `g`, no resonance term to re-derive). Applies an
+  /// already-interpolated `gValue` (the caller ramps it via plain addition,
+  /// R12's own "adds, not transcendentals" exception).
+  inline void advanceCoeff(double gValue) {
+    g = gValue;
+    p1.g = g;
+    p2.g = g;
+    p3.g = g;
+    p4.g = g;
+  }
+
+  /// One sample through `nPoles` (2 or 12 dB mode / 4 for 24 dB mode)
+  /// cascaded identical HP stages -- DESIGN.md §5.5. Each stage's HP output
+  /// (`x - lp`, computed exactly by TptOnePole::process(), G1.2) feeds the
+  /// next stage's input; stages beyond `nPoles` are simply not run (their
+  /// state stays at rest, matching the "only the selected structure runs"
+  /// convention DESIGN.md §5.1 already uses for the LPF). No division, no
+  /// transcendental, no atomic load written directly in THIS function's own
+  /// text (TptOnePole::process() itself does one division per stage, same
+  /// pre-existing pattern as LadderFilter's four poles -- see
+  /// LadderFilter::process()'s own comment on why that is not a new R12
+  /// concern).
+  inline double process(double x, int nPoles) {
+    p1.process(x);
+    double h = p1.hp();
+    if (nPoles >= 2) {
+      p2.process(h);
+      h = p2.hp();
+    }
+    if (nPoles >= 3) {
+      p3.process(h);
+      h = p3.hp();
+    }
+    if (nPoles >= 4) {
+      p4.process(h);
+      h = p4.hp();
+    }
+    return h;
+  }
+};

@@ -456,6 +456,37 @@ public:
         return mVoices[voiceIndex].debugLpfCutoffHz;
     }
 
+    // ===== Test-only debug accessors (G6, docs/GATES.md) =====
+
+    /// G6.7: voice slot `voiceIndex`'s MIXER-stage output (post mixer DC
+    /// block, pre-drive) for the most recently processed sample -- see
+    /// Voice::debugMixOut's own comment.
+    double getDebugVoiceMixOut(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugMixOut;
+    }
+    /// G6.4: voice slot `voiceIndex`'s DRIVE-stage output for the most
+    /// recently processed sample -- see Voice::debugDriveOut's own comment.
+    /// 0.0 for an inactive slot (matches this class's established
+    /// "0 for a slot that is not active" convention).
+    double getDebugVoiceDriveOut(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugDriveOut;
+    }
+    /// G6.4: voice slot `voiceIndex`'s HPF-stage output for the most
+    /// recently processed sample -- see Voice::debugHpfOut's own comment.
+    double getDebugVoiceHpfOut(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugHpfOut;
+    }
+    /// G6.5: voice slot `voiceIndex`'s actual modulated+clamped HPF cutoff
+    /// (Hz) -- see Voice::debugHpfCutoffHz's own comment. 0.0 while
+    /// bypassed or inactive.
+    double getDebugVoiceHpfCutoff(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugHpfCutoffHz;
+    }
+
 private:
     // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
     // Built exactly once per process() call: every atomic is loaded exactly
@@ -511,6 +542,13 @@ private:
         float hpfKeyFollowPercent;
         float pmEnvFToOsc2Percent;
         float pmEnvFToPwPercent;
+        // NOTE: this comment marks the raw-field/atomic boundary for the G6
+        // params -- the block-rate DERIVED fields for drive/output stage
+        // (drivePre, driveKnee, masterVolumeLinear) live further down with
+        // the rest of ParamSnapshot's "derived, BLOCK-RATE constants" (see
+        // that section's own comment) rather than here, to keep this run of
+        // fields a 1:1 mirror of the 53 setters, matching G0's original
+        // layout note.
         int   polyphony;
         int   voiceMode;
         float glideTimeMs;
@@ -536,6 +574,18 @@ private:
         double envAAttackCoeff = 0.0, envADecayCoeff = 0.0, envAReleaseCoeff = 0.0, envASustainLevel = 0.0;
         double lfoIncrement = 0.0;    ///< cycles/control-step, DESIGN.md §7
         double lfoDelaySeconds = 0.0;
+
+        // ---- G6: derived, BLOCK-RATE constants (DESIGN.md §2.2/§4/§11) ----
+        // `kDrive` and `kMasterVolume` are each a SINGLE instrument-wide
+        // param (no per-voice modulation, unlike the LPF/HPF cutoffs), so
+        // their derived quantities belong here alongside the ADSR
+        // coefficients above -- computed ONCE per host block by
+        // finishSnapshot(), not per control block or per sample (R12: the
+        // std::pow() calls involved are block-rate, legal; they must never
+        // run at audio rate).
+        double drivePre = 1.0;            ///< [dsp] DESIGN.md §4: 1 + 2*(Drive/100); ==1.0 EXACTLY at Drive=0
+        double driveKnee = 0.0;           ///< [dsp] DESIGN.md §4: 3*(Drive/100)^1.5; ==0.0 EXACTLY at Drive=0
+        double masterVolumeLinear = 1.0;  ///< [dsp] DESIGN.md §11: 10^(masterVolumeDb/20)
     };
 
     /// Loads every one of the 53 atomics exactly once (relaxed ordering — a
@@ -607,6 +657,42 @@ private:
         double gLpfLadderCur = 0.0, gLpfLadderStep = 0.0;
         double gLpfSvfCur = 0.0, gLpfSvfStep = 0.0;
 
+        // ===== G6: per-voice HPF state (DESIGN.md §5.5) =====
+        // ONE structure per voice (unlike the LPF's two: the HPF has no
+        // slope-switch crossfade, DESIGN.md §5.1's [PERF-8] machinery is
+        // LPF-only -- switching kHpfSlope mid-note is not covered by any G6
+        // AC). `gHpfCur`/`gHpfStep` are this voice's own per-sample `gHpf`
+        // interpolation state (DESIGN.md §2's third interpolated quantity,
+        // alongside gLpf/vcaGain), the same shape as the LPF's own
+        // gLpf*Cur/Step pair above.
+        HpfCascade hpf;
+        double gHpfCur = 0.0, gHpfStep = 0.0;
+
+        /// G6.4 test-only readback: this voice's DRIVE-stage output (post
+        /// mixer DC block, post shapeTriodeK, pre-HPF) and HPF-stage output
+        /// (post the hard-bypass check), for the MOST RECENTLY PROCESSED
+        /// audio sample. Overwritten every sample in the audio-rate loop
+        /// (cheap plain assignments, same pattern as debugLpfCutoffHz/
+        /// lastLpfOutput above -- R12-legal, no transcendental/atomic).
+        /// Exists so G6.4 can assert the two are BIT-IDENTICAL when the HPF
+        /// is bypassed by reading PRODUCTION's own real per-sample values,
+        /// not a synthetic re-derivation of the drive formula that would
+        /// not actually exercise the real bypass branch (R11).
+        /// G6.7 test-only readback: this voice's MIXER-stage output (post
+        /// mixer DC block, DESIGN.md §4.1, pre-drive) for the most recently
+        /// processed sample -- same pattern/rationale as debugDriveOut/
+        /// debugHpfOut just below.
+        double debugMixOut = 0.0;
+        double debugDriveOut = 0.0;
+        double debugHpfOut = 0.0;
+        /// G6.5: this voice's actual modulated+clamped HPF cutoff (Hz), as
+        /// last fed to hpf.setControlRate() -- mirrors debugLpfCutoffHz's
+        /// own (G5.6) convention exactly. Left at 0.0 while the HPF is
+        /// bypassed (DESIGN.md §5.5): there is no "cutoff" for a stage that
+        /// is not running, matching this class's "0 for a slot/state that
+        /// does not apply" convention throughout.
+        double debugHpfCutoffHz = 0.0;
+
         bool active = false;   ///< sounding (Attack/Decay/Sustain/Release), not Idle
         int note = -1;
         double vcaGainStart = 0.0;   ///< interpolation endpoints for THIS control block
@@ -631,6 +717,28 @@ private:
     Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
                                   ///< control block, read by every voice -- never per-voice.
     double mLastLfoValue = 0.0;  ///< test-only readback of the most recent mLfo.step() result (G3.10)
+
+    /// G6 (DESIGN.md §1/§11 "Output stage", §5.6's same rationale one stage
+    /// further downstream): a THIRD 5 Hz one-pole DC blocker, on the FINAL
+    /// summed output, after master volume and output clip. Found, not
+    /// assumed: `shapeCubic` (the output clip) is itself an ODD, nonlinear
+    /// function -- exactly `shapeTriodeK`'s own class of mechanism (DESIGN.md
+    /// §5.6) -- and DRIVE (this gate) is a second odd nonlinearity ahead of
+    /// it. Measured: with output clip OFF, the two existing per-voice
+    /// blockers (mixer + post-LPF) already reduce drive's own DC to
+    /// numerical noise (~1e-10) at every {PW, drive, HPF} corner tested; with
+    /// output clip ON, a non-half-wave-symmetric signal (any pulse at duty
+    /// != 50%, or a saw) reaching the clip's nonlinear region re-introduces
+    /// DC that NEITHER existing blocker can remove, because both sit
+    /// upstream of the clip -- worst measured corner 1.94e-3 (PW=25%,
+    /// Drive=0%, HPF bypassed, output clip on), ~20x the project's standard
+    /// 1e-4 bound. ONE instance (not per-voice, not per-channel): this runs
+    /// on the single summed/mastered/clipped signal, after every voice has
+    /// already been mixed down -- mono until G8 (outL==outR always, pre-G8),
+    /// so a single instance is correct here; G8 is the gate positioned to
+    /// decide whether this needs to become per-channel once L and R can
+    /// genuinely differ.
+    OnePoleHP mOutputDcBlock;
     double mDebugLpfCutoffHz = 0.0;  ///< G4.9: last clamped (UNMODULATED) LPF cutoff -- see
                                       ///< getDebugLpfCutoff()'s own comment for why this stays
                                       ///< unmodulated even after G5.
@@ -655,6 +763,26 @@ private:
     /// choice (G5.4's own tolerance is +/-2ms), not a measured hardware
     /// figure, hence [voicing] rather than [ref].
     static constexpr double kLpfCrossfadeSeconds = 0.020;
+
+    // ===== G6: the HPF slope/bypass selection (DESIGN.md §5.5) =====
+    // `kHpfSlope`/`kHpfCutoff` are single INSTRUMENT-WIDE params (DESIGN.md
+    // §11), so -- exactly like the LPF's mLpfSlopeSettled above -- how many
+    // poles run and whether the HPF is bypassed at all are each decided
+    // ONCE per control block, shared by every voice, not per voice. Unlike
+    // the LPF there is no crossfade to track (no G6 AC exercises a live
+    // kHpfSlope switch), so this is just two plain cached values, not a
+    // state machine.
+    ///
+    /// [voicing] DESIGN.md §5.5/§11: the low end of kHpfCutoff's 20..2000 Hz
+    /// range doubles as the HARD BYPASS threshold ("kHpfCutoff at its
+    /// minimum (20 Hz) is a HARD BYPASS... not a 20 Hz filter -- an actual
+    /// bypass", docs/GATES.md G6.4). Compared against the RAW param value
+    /// (before key-follow modulation), matching "the leftmost position of a
+    /// real instrument's high-pass switch" -- a knob position, not a
+    /// modulated result.
+    static constexpr float kHpfCutoffMinHz = 20.0f;
+    bool mHpfBypassed = true;  ///< re-derived from the current atomics on every reset()/first control block
+    int mHpfNumPoles = 2;      ///< 2 (Db12) or 4 (Db24); matches kHpfSlope's default (Db12)
 
     /// Runs voice `v`'s structure selected by `slope` (LpfSlope::Db24 (0) ->
     /// LadderFilter, Db12 (1) -> SvfFilter) on one sample `x`. DESIGN.md §2:

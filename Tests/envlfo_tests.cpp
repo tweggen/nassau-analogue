@@ -469,6 +469,20 @@ int main() {
       c.setEnvADecayMs(500.0f);
       c.setEnvASustainPercent(80.0f);
       c.setEnvAReleaseMs(300.0f);
+      // G6 (docs/GATES.md R11): the demodulation trick below divides one
+      // render by another SAMPLE BY SAMPLE and only recovers the true gain
+      // envelope if everything from the VCA multiply onward is LINEAR.
+      // kOutputClip's shapeCubic (on by default, DESIGN.md §11, now wired by
+      // G6) sits AFTER the VCA multiply and is emphatically NOT linear
+      // (shapeCubic(g*x) != g*shapeCubic(x) in general), which corrupted
+      // this AC's own measurement (16.37dB observed vs the required 20dB)
+      // the moment G6 wired the output stage in -- not a VCA-interpolation
+      // regression, a broken measurement assumption (R11's own "test
+      // measures the wrong quantity" trap, same class as G4/G5's own
+      // harness fixes). Explicitly bypassing the clip here restores the
+      // linearity the demodulation trick requires; G6.12/G6.14 are the ACs
+      // that actually test the output stage itself.
+      c.setOutputClip(false);
     };
 
     SynthCore coreA;

@@ -45,6 +45,10 @@ void SynthCore::init(float sampleRate) {
         mVoices[i].dcBlock.setFc(5.0, sampleRate);
         mVoices[i].postLpfDcBlock.setFc(5.0, sampleRate);
     }
+    // [dsp] G6: the THIRD (final-output) DC blocker -- see its own field
+    // comment in synth_core.h for why it exists. Same 5Hz corner as the
+    // other two (DESIGN.md §4/§11), for the identical reason.
+    mOutputDcBlock.setFc(5.0, sampleRate);
 
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
     // Everything else fixed-size for kMaxVoices + 2 fade slots (DESIGN.md
@@ -73,6 +77,13 @@ void SynthCore::reset() {
         v.envA.reset();
         v.lpfLadder.reset();  // G5: both structures exist per voice regardless of kLpfSlope
         v.lpfSvf.reset();     // (DESIGN.md §5.1 [PERF-8] crossfade), so both must reset here.
+        v.hpf.reset();        // G6: DESIGN.md §5.5
+        v.gHpfCur = 0.0;
+        v.gHpfStep = 0.0;
+        v.debugMixOut = 0.0;
+        v.debugDriveOut = 0.0;
+        v.debugHpfOut = 0.0;
+        v.debugHpfCutoffHz = 0.0;
         v.lastLpfOutput = 0.0;
         v.debugLpfCutoffHz = 0.0;
         v.gLpfLadderCur = 0.0;
@@ -88,6 +99,7 @@ void SynthCore::reset() {
     mActiveVoiceCount = 0;
     mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
     mLastLfoValue = 0.0;
+    mOutputDcBlock.reset();  // G6: see its own field comment in synth_core.h
 
     // G5: the crossfade never survives a reset (DESIGN.md §11 "Reset
     // semantics": clears state, never touches params) -- re-settle on
@@ -101,6 +113,14 @@ void SynthCore::reset() {
     mLpfCrossfadeToSlope = mLpfSlopeSettled;
     mLpfCrossfadeSamplesTotal = 0;
     mLpfCrossfadeSamplesElapsed = 0;
+
+    // G6 (DESIGN.md §5.5): re-derive the shared HPF bypass/pole-count from
+    // the CURRENT atomics, mirroring mLpfSlopeSettled's own reset()
+    // pattern just above -- so a reset() immediately after setHpfCutoffHz()/
+    // setHpfSlope() reflects that new value right away rather than a stale
+    // pre-reset cache.
+    mHpfBypassed = mHpfCutoffHz.load(std::memory_order_relaxed) <= kHpfCutoffMinHz;
+    mHpfNumPoles = (mHpfSlope.load(std::memory_order_relaxed) == static_cast<int>(HpfSlope::Db24)) ? 4 : 2;
 
     mPendingCount = 0;
 
@@ -216,6 +236,42 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 // clipping, which would make the timbre track pulse width in
                 // a way that is not the PWM sound anyone wants.
                 const double mix = v.dcBlock.process(mixRaw);
+                v.debugMixOut = mix;  // G6.7 test-only readback, see Voice::debugMixOut's comment
+
+                // G6 (DESIGN.md §1 step 7, §4): DRIVE sits between the
+                // mixer DC blocker and the HPF -- never after the filters
+                // (DESIGN.md §1's own "ordering constraints": "the mixer's
+                // summed level is what pushes it, exactly as in a real
+                // instrument where the VCA-input stage is what runs out of
+                // headroom first"). snapshot.drivePre/driveKnee are BLOCK-
+                // RATE derived constants (finishSnapshot(), R12) -- at
+                // Drive=0 they are EXACTLY 1.0/0.0, so this whole line is
+                // bit-exact identity (mix*1.0==mix, shapeTriodeK(x,0)==x,
+                // x/1.0==x, DESIGN.md §4's own "bit-exact identity" claim,
+                // docs/GATES.md G6.7).
+                const double driven = shapeTriodeK(mix * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
+                v.debugDriveOut = driven;  // G6.4 test-only readback, see Voice::debugDriveOut's comment
+
+                // G6 (DESIGN.md §1 step 8, §5.5): HPF, hard-bypassed at
+                // kHpfCutoff's minimum (DESIGN.md §5.5: "not a 20Hz filter
+                // -- an actual bypass"). mHpfBypassed/mHpfNumPoles are
+                // shared, instrument-wide, computed once per control block
+                // below (kHpfSlope/kHpfCutoff are single params, not
+                // per-voice) -- this is an ARCHITECTURAL skip (the whole
+                // HpfCascade call is never made), which is what makes the
+                // bypass path BIT-EXACT (docs/GATES.md G6.4) rather than
+                // merely "a very low corner". gHpfCur/Step is this voice's
+                // own per-sample gHpf interpolation (DESIGN.md §2's third
+                // interpolated quantity, alongside gLpf/vcaGain).
+                double hpfOut;
+                if (mHpfBypassed) {
+                    hpfOut = driven;
+                } else {
+                    v.hpf.advanceCoeff(v.gHpfCur);
+                    v.gHpfCur += v.gHpfStep;
+                    hpfOut = v.hpf.process(driven, mHpfNumPoles);
+                }
+                v.debugHpfOut = hpfOut;  // G6.4 test-only readback, see Voice::debugHpfOut's comment
 
                 // G5 (DESIGN.md §1 step 9, §5): the LPF is now GENUINELY IN
                 // THE SIGNAL PATH -- the interaction G4's gate note flagged
@@ -239,11 +295,11 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 // mechanism. Hence postLpfDcBlock below (DESIGN.md §5.6).
                 double lpfOut;
                 if (mLpfCrossfadeActive) {
-                    const double yFrom = runLpfStructure(v, mLpfCrossfadeFromSlope, mix);
-                    const double yTo = runLpfStructure(v, mLpfCrossfadeToSlope, mix);
+                    const double yFrom = runLpfStructure(v, mLpfCrossfadeFromSlope, hpfOut);
+                    const double yTo = runLpfStructure(v, mLpfCrossfadeToSlope, hpfOut);
                     lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
                 } else {
-                    lpfOut = runLpfStructure(v, mLpfSlopeSettled, mix);
+                    lpfOut = runLpfStructure(v, mLpfSlopeSettled, hpfOut);
                 }
                 v.lastLpfOutput = lpfOut;
                 lpfOut = v.postLpfDcBlock.process(lpfOut);
@@ -267,8 +323,33 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 }
             }
 
-            outL[n + i] = static_cast<float>(mixSum);
-            outR[n + i] = static_cast<float>(mixSum);
+            // G6 (DESIGN.md §11 "Output stage"): master volume then output
+            // clip, applied to the SUMMED voice accumulator -- "post-
+            // summation and post-master, so it limits the stack, not the
+            // individual voice" (DESIGN.md §1's ordering constraint #4).
+            // snapshot.masterVolumeLinear is a BLOCK-RATE derived constant
+            // (finishSnapshot(), R12); shapeCubic() itself is pure
+            // arithmetic (no transcendental), so it is audio-rate legal
+            // (same category as shapeTriodeK above).
+            double outSample = mixSum * snapshot.masterVolumeLinear;
+            if (snapshot.outputClip) {
+                outSample = shapeCubic(outSample, 2.0);  // [dsp] DESIGN.md §11, L=2.0 -> +6dBFS ceiling
+                // G6 finding (see mOutputDcBlock's own field comment): the
+                // clip just above is an odd nonlinearity with nothing
+                // downstream to remove the DC it can re-introduce from a
+                // non-half-wave-symmetric signal -- this third blocker is
+                // that removal. Deliberately only run WHEN the clip itself
+                // runs (not unconditionally every sample): with the clip
+                // off there is no clip-introduced DC to begin with (the two
+                // existing per-voice blockers already leave drive's own DC
+                // at numerical noise, measured ~1e-10 at every corner), and
+                // gating it this way is what keeps kOutputClip=off a
+                // bit-exact passthrough of the master-scaled sum (DESIGN.md
+                // §11, docs/GATES.md G6.12).
+                outSample = mOutputDcBlock.process(outSample);
+            }
+            outL[n + i] = static_cast<float>(outSample);
+            outR[n + i] = static_cast<float>(outSample);
         }
         // ---- AUDIO-RATE LOOP END ----
 
@@ -396,6 +477,21 @@ void SynthCore::finishSnapshot(ParamSnapshot& s, double fsControl) {
     // [dsp] DESIGN.md §7: LFO increment is a plain divide, no transcendental.
     s.lfoIncrement = static_cast<double>(s.lfoRateHz) / std::max(fsControl, 1e-6);
     s.lfoDelaySeconds = std::max(static_cast<double>(s.lfoDelayMs), 0.0) * 0.001;
+
+    // [dsp] DESIGN.md §4: pre = 1 + 2*(Drive/100); knee = 3*(Drive/100)^1.5.
+    // At Drive=0 these are EXACTLY 1.0 and 0.0 (not merely close): 1+2*0.0
+    // is exact IEEE-754 arithmetic, and std::pow(0.0, 1.5) == 0.0 exactly --
+    // this is what makes G6.7's drive-bypass bit-exactness hold. Block-rate
+    // only (std::pow is transcendental, R12) -- Drive is a single
+    // instrument-wide param, not per-voice, so this belongs here alongside
+    // the ADSR coefficients above, not in the per-voice control-rate loop.
+    const double drivePct = static_cast<double>(s.drivePercent) * 0.01;
+    s.drivePre = 1.0 + 2.0 * drivePct;
+    s.driveKnee = 3.0 * std::pow(drivePct, 1.5);
+
+    // [dsp] DESIGN.md §11 "Output stage": MasterVolume_linear = 10^(dB/20).
+    // Also block-rate only (std::pow), also a single instrument-wide param.
+    s.masterVolumeLinear = std::pow(10.0, static_cast<double>(s.masterVolumeDb) / 20.0);
 }
 
 // ===== G3: event application (DESIGN.md §10.1/§10.3, minimal/provisional) ===
@@ -549,6 +645,17 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
     }
     const double lpfResonancePercent = static_cast<double>(snapshot.lpfResonancePercent);
 
+    // G6 (DESIGN.md §5.5): kHpfSlope/kHpfCutoff are single instrument-wide
+    // params (DESIGN.md §11), so -- exactly like the LPF slope-settle logic
+    // above -- whether the HPF is bypassed and how many poles run are each
+    // decided ONCE here, shared by every voice, not per voice. Compared
+    // against the RAW hpfCutoffHz (not key-follow-modulated): DESIGN.md
+    // §5.5's bypass is "the leftmost position of a real instrument's
+    // high-pass switch", a knob position, independent of what note is
+    // playing or how much key follow is dialled in.
+    mHpfBypassed = snapshot.hpfCutoffHz <= kHpfCutoffMinHz;
+    mHpfNumPoles = (snapshot.hpfSlope == static_cast<int>(HpfSlope::Db24)) ? 4 : 2;
+
     for (int i = 0; i < kG3Voices; ++i) {
         Voice& v = mVoices[i];
 
@@ -589,10 +696,22 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // per R11 as a decision the plan did not cover.
         const double noteForOsc2 = snapshot.osc2KeyTrack ? static_cast<double>(v.note) : 60.0;
 
+        // [ref] DESIGN.md §8 [PERF-6]: Poly-Mod, control-rate only.
+        // kPmEnvFToOsc2 -- ENV-F to VCO2 pitch, bipolar, +/-24 semitones at
+        // 100%; kPmEnvFToPw -- ENV-F to BOTH oscillators' pulse width,
+        // bipolar, +/-45% at 100%. `v.envF.y` is this SAME control step's
+        // freshly-advanced ENV-F value (v.envF.step() ran a few lines above,
+        // matching the way lfoPitchModSemis/lfoPwmModPercent above already
+        // reuse this control block's freshly-stepped LFO value).
+        const double pmOsc2Semis =
+            (static_cast<double>(snapshot.pmEnvFToOsc2Percent) * 0.01) * 24.0 * v.envF.y;
+        const double pmPwModPercent =
+            (static_cast<double>(snapshot.pmEnvFToPwPercent) * 0.01) * 45.0 * v.envF.y;
+
         const double osc1Semis = static_cast<double>(v.note) + lfoPitchModSemis +
                                   octaveOffsetSemis(static_cast<Octave>(snapshot.osc1Octave)) +
                                   static_cast<double>(snapshot.osc1FineCents) * 0.01;
-        const double osc2Semis = noteForOsc2 + lfoPitchModSemis +
+        const double osc2Semis = noteForOsc2 + lfoPitchModSemis + pmOsc2Semis +
                                   octaveOffsetSemis(static_cast<Octave>(snapshot.osc2Octave)) +
                                   static_cast<double>(snapshot.osc2Semi) +
                                   static_cast<double>(snapshot.osc2FineCents) * 0.01;
@@ -603,8 +722,8 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         v.osc1.setDt(std::clamp(f1 / std::max(fs, 1.0), 0.0, 0.49));
         v.osc2.setDt(std::clamp(f2 / std::max(fs, 1.0), 0.0, 0.49));
 
-        v.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent);
-        v.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent);
+        v.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent + pmPwModPercent);
+        v.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent + pmPwModPercent);
 
         // G5.4: THIS voice's own most recent LPF output seeds the incoming
         // structure -- each voice carries a different signal, so each needs
@@ -666,6 +785,28 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
             prepGInterp(v.lpfLadder, v.gLpfLadderCur, v.gLpfLadderStep);
         } else {
             prepGInterp(v.lpfSvf, v.gLpfSvfCur, v.gLpfSvfStep);
+        }
+
+        // G6 (DESIGN.md §5.5): fc_hp = clamp(HpfCutoff * exp2(HpfKeyFollow/100
+        // * (note-60)/12), 10, 0.45*fs). Only recomputed (and the per-sample
+        // gHpf ramp only prepared) when the HPF is NOT bypassed this control
+        // block -- when bypassed, DESIGN.md §5.5's skip means nothing ever
+        // reads v.hpf's coefficients anyway (see process()'s own comment),
+        // matching the LPF's own "only the currently-selected structure gets
+        // prepGInterp" convention (DESIGN.md §5.1 [PERF-8]).
+        if (!mHpfBypassed) {
+            const double hpfKeyFollowOct = (static_cast<double>(snapshot.hpfKeyFollowPercent) * 0.01) *
+                                            (static_cast<double>(v.note) - 60.0) / 12.0;
+            const double hpfFcRaw = static_cast<double>(snapshot.hpfCutoffHz) * std::exp2(hpfKeyFollowOct);
+            const double hpfFcVoice = std::clamp(hpfFcRaw, 10.0, 0.45 * fs);
+            v.debugHpfCutoffHz = hpfFcVoice;  // G6.5 readback
+
+            const double gHpfStart = v.hpf.g;
+            v.hpf.setControlRate(hpfFcVoice, fs);
+            v.gHpfStep = (v.hpf.g - gHpfStart) / static_cast<double>(std::max(1, mControlBlock));
+            v.gHpfCur = gHpfStart;
+        } else {
+            v.debugHpfCutoffHz = 0.0;  // G6.5: 0 while bypassed, matches this class's convention
         }
     }
 }

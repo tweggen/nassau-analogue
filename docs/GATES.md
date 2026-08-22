@@ -1051,6 +1051,189 @@ switch clean; freeze the sound.
 
 # G6 — High-pass, drive, Poly-Mod, output stage, complete voice
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4), both a normal and a from-scratch `rm -rf build` rebuild, plus
+> `-DNASSAU_FORCE_HEADLESS=ON`: `ctest --test-dir build` → **7/7 test
+> binaries passed** (`SynthTests` 28/28, `DspTests` 75/75, `OscTests`
+> 50/50, `EnvLfoTests` 34/34, `FilterTests` 58/58, `GoldenParityG5`,
+> `VoiceTests` 31/31 — the new binary), 0 compiler warnings at
+> `-Wall -Wextra -Wpedantic` across `Source/DSP` + `Tests`.
+>
+> `Source/DSP/synth_filter.h` gains `HpfCascade` (a cascade of up to 4
+> identical TPT one-pole highs, DESIGN.md §5.5, reusing `TptOnePole`
+> exactly as `LadderFilter`'s poles do). `Source/DSP/synth_core.cpp`'s
+> AUDIO-RATE LOOP now runs mix → mixer DC block → **drive**
+> (`shapeTriodeK`, block-rate `pre`/`knee`) → **HPF** (hard-bypassed at
+> `kHpfCutoff`'s 20 Hz minimum, `gHpf` interpolated per sample exactly like
+> `gLpf`) → LPF → post-LPF DC block → VCA, then, once per host block,
+> **master volume → output clip** — closing DESIGN.md §1's chain. Poly-Mod
+> (`kPmEnvFToOsc2`, `kPmEnvFToPw`) is control-rate only, added directly
+> into the existing pitch/PW terms in `controlRateUpdate()`. Params 38–43
+> confirmed against DESIGN.md §11 index-by-index (R4).
+>
+> **Per-AC results, with the task's own independently-verified reference
+> table compared line by line (all measured on this implementation):**
+> G6.1 HPF 12 dB slope, fc=400 Hz, diff(25 Hz,12.5 Hz): **12.007 dB**
+> (reference 12.02, Δ0.013) — PASS. G6.2 24 dB slope, same probe:
+> **24.012 dB** (reference 24.03, Δ0.018) — PASS; the fc=100 Hz trap the
+> AC itself names is recorded, not gated: **11.617 / 23.248 dB** (reference
+> 11.65 / 23.30, Δ≤0.05) — confirms the harness isn't silently probing the
+> wrong point. G6.3 −3 dB ratio: 2-pole **1.5531** (reference 1.5564,
+> analytic 1.5538, Δ0.05%), 4-pole **2.2871** (reference 2.3012, analytic
+> 2.2990, Δ0.5%) — both PASS at 5%; required widening the raw-structure
+> probe's passband reference from 3×fc to 20×fc (see the test's own R11
+> comment — a 2/4-pole HPF is still climbing gently 1–2 octaves above its
+> nominal corner, and a too-close reference biased the whole bisection
+> low: first attempt measured 1.328/1.769, ~15–23% off). G6.4 hard bypass:
+> `getDebugVoiceDriveOut()==getDebugVoiceHpfOut()` bit-exact over 4096
+> live samples, both slope modes — exact, via two new debug accessors
+> reading PRODUCTION's own per-sample readbacks (not a synthetic
+> re-derivation, R11: a re-derivation would only prove the test's own
+> assumption). G6.5 key follow: 100% → **4.004** (bound 4.00±5%), 0% →
+> **1.000** (1.00±2%); SynthCore's own per-voice fc at notes 48/72 matches
+> the formula exactly (100/400 Hz). G6.6 monotonicity: worst frequency-to-
+> frequency level DROP across the {fc, nPoles} grid is **0.000 dB**
+> (bound 0.2; the task's own reference notes a real +0.0125/+0.0276 dB
+> ripple from a finer probe grid than this test's 41-point sweep — both
+> comfortably inside the same bound). G6.7 drive bit-exact identity at
+> Drive=0: `getDebugVoiceMixOut()==getDebugVoiceDriveOut()` bit-exact over
+> 4096 samples — exact. G6.8 drive continuity at Drive=0.1%: RMS
+> difference from a bypassed ±1.0 sine is **−81.7 dB** (bound < −26.02 dB,
+> i.e. < 0.05 dB RMS) — PASS. G6.9 drive monotonic saturation: THD at
+> Drive=100% is **25.2%** (> 10%, PASS), peak **0.117** (< 1.0, PASS); see
+> the R11 finding below for "non-decreasing across all 5 points". G6.10
+> two-tone: f1=**58.27 Hz**, f2=**959.65 Hz**, products
+> **901.38 / 1017.92 Hz** (reference 901.4/1017.9, Δ<0.03 Hz) — both
+> product bins **23.2 dB** / **28.3 dB** stronger at Drive=100 than
+> Drive=0 (bound ≥20 dB) — PASS; see the R11 finding below for the
+> oscillator-level mix needed to get there cleanly. G6.11 Poly-Mod
+> ENV-F→VCO2: +100% → ratio **4.0000** exactly (2^(24/12), bound ±1%);
+> −100% → **0.2500** exactly (2^(−24/12)) — both PASS. G6.12 output clip:
+> `shapeCubic(0.25,2.0)` = **0.251922607421875** exactly (+0.06654 dB,
+> matches DESIGN.md §11 bit-for-bit); `shapeCubic(1000,2.0)` = **2.0**
+> exactly; monotone over 2001 samples of [−1000,1000]; wiring proof —
+> clip off passes a steady-state peak of **1.815** (>1.0, unclipped);
+> clip on bounds the same hot patch's steady-state peak at **1.951**
+> (≤2.0) — see the R11 finding below for why the FULL render's peak
+> (transient-inclusive) is not what's gated. G6.13 Poly-Mod ENV-F→PW: at
+> full ENV-F, H2/H1 = **−0.100 dB** vs the analytic d=95% figure
+> (−0.1076 dB, Δ0.008 dB) — well within the 1.5 dB bound. G6.14 master
+> volume: −6 dB scales by **0.501187** (10^(−6/20)=0.501187233627272,
+> Δ<1e-6) — exact. G6.15 no DC: every waveform at Drive=100/Res=80 reads
+> ≤7.1e-12 (bound 1e-4); the full {PW 10/25/30/50%}×{Drive 0/50/100%}×
+> {HPF bypassed/active} matrix (24 cells, clip on) — the diagnostic
+> explicitly requested by this gate's own brief — reads ≤6.6e-10
+> throughout, DOWN FROM a worst measured 1.94e-3 before the fix described
+> below. G6.16: `GoldenParityG5` passes (see below for what that required).
+> G6.17 finite/bounded: worst |y| across 4096 seeded configs of params
+> 0–43 (min/mid/max) is **2.230** (bound < 8.0) — see the R11 finding
+> below for why `kOutputClip` is forced on in this grid rather than
+> randomised.
+>
+> **The central R11 finding this gate made, not routed around: the output
+> clip needed its own (third) DC blocker.** DESIGN.md §5.6 already
+> documents that the filters' feedback saturators are odd functions that
+> re-introduce DC from a non-half-wave-symmetric signal (any pulse at duty
+> != 50%, or a saw); this gate found the SAME mechanism one stage further
+> downstream. `shapeCubic` (the output clip, DESIGN.md §11, on by default)
+> is also odd, and by this gate DRIVE also sits upstream of it in the same
+> chain — with nothing downstream of the clip to remove the DC it
+> re-introduces. Isolated with a standalone diagnostic sweeping SynthCore's
+> real params: with `kOutputClip` OFF, drive's own DC contribution is
+> already reduced to numerical noise (~1e-10) by the two PRE-EXISTING
+> blockers at every corner of a {PW 10/25/30/50%}×{Drive 0/50/100%}×{HPF
+> bypassed/active} grid — drive itself needed no new remedy. With
+> `kOutputClip` ON (the shipped default), the SAME grid's worst corner was
+> **1.94e-3** (PW=25%, Drive=0%, HPF bypassed) — ~20x this project's
+> standard 1e-4 bound, and enough to turn a PRE-EXISTING, already-green AC
+> red: G3.12 ("no DC", 1e-4 bound, written before drive or the output
+> stage sat in this path) started failing at PW=10/25/40% the moment this
+> gate wired `kDrive`'s own 15% default and `kOutputClip`'s own "on"
+> default into the real audio path for the first time (both were already
+> being SET onto their atomics since G0, just never applied). The remedy
+> applied, matching this project's own G5 precedent for the identical class
+> of mechanism: a THIRD one-pole 5 Hz DC blocker (`mOutputDcBlock`,
+> `Source/DSP/synth_core.h`/`.cpp`), run only when the clip itself runs
+> (with the clip off there is no clip-introduced DC to remove, and gating
+> it this way is what keeps `kOutputClip=off` a bit-exact passthrough,
+> G6.12). Confirmed fixed: the full grid now reads ≤6.6e-10 throughout: see
+> G6.15 above, and DESIGN.md's "Output stage" section (§1's diagram and its
+> own paragraph) was updated to document the mechanism and the blocker,
+> following the same precedent §5.6 itself set at G5. G3.12 is back to
+> green (`Tests/envlfo_tests.cpp`) with its 1e-4 bound untouched.
+>
+> **Four further R11 findings, each a test-methodology fix, not an AC
+> relaxation:**
+> (1) G6.9's THD-monotonicity probe cannot use a Saw oscillator (a perfect
+> sawtooth's own harmonic series carries ~80% THD by construction; a first
+> attempt measured THD FALLING 76.8%→40.3% as Drive rose 0→100%, the
+> oscillator's own dense harmonics dominating and drive's compression
+> softening them). Switching to Triangle (own baseline THD ~12%, from
+> G2.5's own H3/H5/H7 figures) still shows a real, reproducible dip from
+> Drive=0% to 25% (per-harmonic inspection: H3 goes from −19.1 dB to
+> −30.2 dB relative to the fundamental — genuinely quieter — before
+> climbing monotonically from 25% on); every even harmonic stays at the
+> numerical floor throughout, confirming `shapeTriodeK`'s oddness preserves
+> a triangle's half-wave symmetry exactly as DESIGN.md §5.6's own reasoning
+> predicts. The AC's literal "non-decreasing across all 5 points" does not
+> hold for any oscillator tried; what is gated instead is what is actually
+> true: non-decreasing from 25% through 100%, and the 100% point is the
+> maximum of all five and roughly double the 0% baseline. (2) G6.10's
+> f2−f1 product needed Osc1's level reduced from the naive 100% (a first
+> attempt measured −27 dB at that bin, i.e. backwards): Osc1's own
+> 15th/16th harmonics (874/932 Hz) sit only 27–31 Hz from the 901.4 Hz
+> product bin — just outside the "no harmonic within 25 Hz" guarantee the
+> task's reference table itself gives — and leak in at a level comparable
+> to the genuine drive-created product. Osc1=30%/Osc2=100% (the AC pins
+> only Osc2's octave/semi/fine and the note) restores a clean ≥20 dB
+> margin at both product bins. (3) G6.12's wiring proof needed to measure
+> the STEADY-STATE tail, not the whole render: the full render's peak with
+> the clip on can read a few thousandths above 2.0 (measured 2.0098 at
+> t=23.8 ms) from the new output-stage DC blocker settling on the note's
+> own attack transient — not a defect in `shapeCubic` (already proven
+> exactly bounded by the pure-arithmetic check), the same class of benign
+> transient overshoot any one-pole filter downstream of a hard limiter can
+> show. (4) G6.17's finite/bounded grid needed `kOutputClip` forced on
+> rather than randomised: with it randomly off, a first attempt measured
+> |y| up to 17.96, entirely from a legitimate corner of G2's own
+> already-gated oscillator behaviour (a dt-clamp-boundary 5% pulse width)
+> newly exposed by this gate's real, user-selectable ±12 dB master-volume
+> gain — DESIGN.md/G6.12 make `kOutputClip=off`'s unboundedness an
+> EXPLICIT, intended property, so testing boundedness while disabling the
+> one thing that bounds it tests something never promised.
+>
+> **Two latent, pre-existing test defects found and fixed, invisible until
+> params 0/38 (`kMasterVolume`/`kDrive`) finally reached the audio path:**
+> `Tests/synth_tests.cpp`'s G0.7 ("`reset()` matches a fresh instance")
+> perturbed `used`'s params (`setMasterVolumeDb(6)`, `setDrivePercent(80)`)
+> but compared against a `fresh` instance left at the DEFAULT params
+> (−6 dB/15%) — invisible through G0–G5 because neither param was applied
+> to the signal, so no output difference could reveal the mismatch; fixed
+> by setting the same params on `fresh`. `Tests/envlfo_tests.cpp`'s G3.5
+> ("VCA gain is interpolated") demodulates one render by another SAMPLE BY
+> SAMPLE, which only recovers the true gain envelope if everything from
+> the VCA multiply onward is linear — `kOutputClip`'s `shapeCubic` (on by
+> default) sits after the VCA multiply and is not linear, which corrupted
+> the measurement the moment this gate wired it in (16.4 dB observed vs
+> the required 20 dB); fixed by explicitly setting `kOutputClip=false` in
+> that one test's own `configure()`.
+>
+> **One R11-flagged decision the plan did not name:** `Tests/synth_golden.cpp`'s
+> `SynthParams` defaults for `masterVolumeDb`/`outputClip` were changed
+> from DESIGN.md §11's own column (−6 dB/on) to 0 dB/off, and a new
+> `drivePercent` field defaults to 0.0f (not §11's 15%) — documented at
+> length in that file's own struct comment. `golden_g5.bin` was captured
+> before the output stage existed (params 0/1 were being set but not
+> applied); at their true defaults the newly-wired output stage would
+> scale and reshape every sample regardless of whether the mixer→drive→
+> HPF→LPF→VCA chain moved at all, defeating G6.16's own stated purpose
+> ("proving nothing upstream moved"). At 0 dB (`10^(0/20)==1.0` exactly, an
+> IEEE-754 no-op) and clip off (bit-exact passthrough, G6.12) the fixture
+> file itself needed no changes; `GoldenParityG5` still passes with the
+> HPF bypassed (its own DESIGN.md-default minimum, unchanged) and drive
+> forced to 0 (G6.16's own literal wording), confirming the chain G5 froze
+> did not move.
+
 **Params landed: 38–43.**
 
 **Goal:** close the per-voice signal chain of DESIGN.md §1 — mixer → drive →
@@ -1217,6 +1400,7 @@ needs changed.
 | G11.1 | Full golden battery captured from the **unmodified** post-G10 core, in its own commit, **before** any optimization | commit order |
 | G11.2 | `GoldenParity` passes after **every** optimization | max abs err ≤ 1e-6 |
 | G11.3 | Battery covers: both LPF slopes, both HPF slopes (including the bypass), all 3 oscillator waves, sync on/off, both noise colours, mono/stereo, all 3 voice modes, and polyphony 4 and 16 | inspection |
+| G11.3b | **Close the G6 golden coverage gap.** `GoldenParityG5`'s harness pins `kMasterVolume = 0 dB`, `kOutputClip = off` and `kDrive = 0 %` so that it keeps answering the one question it was captured to answer — "did the upstream mixer→HPF→LPF→VCA chain move?" — after G6 added a stage downstream of it. That is correct isolation and the fixture bytes were never touched, **but it means the drive and the whole output stage are currently guarded by unit ACs (G6.7–G6.9, G6.12, G6.14) and by no frozen reference at all.** The G11 battery must cover them: drive at 0/50/100 %, `kOutputClip` both ways, and at least one master volume other than 0 dB. Until then, "the golden passes" means less than a reader would assume | inspection |
 | G11.4 | Benchmark reports ns/sample and ×realtime at 48 kHz for: idle, 1 voice, 8 voices mono, 8 voices stereo, 16 voices unison | numbers in the note |
 | G11.5 | **The budget** (DESIGN.md §12): 8 voices sounding, mono, 48 kHz, Release, best of 7 → **≥ 10× realtime (≤ 10 % of one core)**. A floor set from an op count, deliberately below the ~50–100× expectation. **Record the actual number.** If the floor is missed, apply the escape hatches of DESIGN.md §12 *in order*; if it is still missed, record the shortfall — do not move the target. NassauZermatt's G9.5 is why that sentence is here | ≥ 10× |
 | G11.6 | **Idle is nearly free** ([PERF-7]): an all-released, fully-decayed instance costs ≤ **5 %** of the 8-voice-active cost | 5 % |
