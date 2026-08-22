@@ -88,11 +88,15 @@
 // IPLUG_EDITOR (1 with IGraphics, forced 0 headless), so a forced-headless
 // build still links cleanly — it simply reports no editor.
 #define PLUG_HAS_UI     1
-// G0 placeholder size: only 2 params exist (Master Volume, Output Clip) plus
-// the preset selector. G10 (full UI, requires Windows/macOS) will grow this
-// to fit all 13 signal-chain groups DESIGN.md §1/§11 describes.
-#define PLUG_WIDTH      360
-#define PLUG_HEIGHT     180
+// G10: sized for the full 13-panel editor (VCO 1 / VCO 2 / Sub+Noise /
+// Mixer+Drive / HPF / LPF / ENV-F / ENV-A / LFO / Poly-Mod / Voice / Stereo /
+// Output, docs/GATES.md G10.2), covering all 53 params plus the preset
+// selector and an IVKeyboardControl strip along the bottom. See
+// NassauAnalogueUI.cpp's layout-metrics comment for the exact arithmetic
+// this size was derived from (was a 360x180 G0 placeholder covering only
+// kMasterVolume/kOutputClip).
+#define PLUG_WIDTH      944
+#define PLUG_HEIGHT     590
 #define PLUG_FPS        60
 
 #define PLUG_SHARED_RESOURCES 0
