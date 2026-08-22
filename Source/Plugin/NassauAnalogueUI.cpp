@@ -186,16 +186,24 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     //   row2 (LPF tallest):  16 + 20+4 + 56+4 + 56         = 156
     //   row3 (Voice tallest):16 + (20+4)*2 + 56            = 120
     //   header 32, keyboard 90, 4x kRowGap(8) between the five bands
-    //   32 + 8+144 + 8+156 + 8+120 + 8+90 = 574
-    //   PLUG_HEIGHT = 574 + 2*kMargin(8) = 590
+    //   32 + 8+180 + 8+176 + 8+146 + 8+90 = 656
+    //   PLUG_HEIGHT = 656 + 2*kMargin(8) = 672
+    //
+    // Grew from 590 after the first Windows screenshot: every font is +1pt and
+    // kSwitchH went 20 -> 30 so the tab captions stop being clipped.
     //
     // (53 params plus a keyboard needs considerably more room than Zermatt's
     // 552x390 six-panel/25-param layout -- this is roughly 2.4x the area.)
     const float kMargin     = 8.f;
     const float kHeaderH    = 32.f;
-    const float kPanelTitle = 16.f;   // panel caption strip
-    const float kRowH       = 56.f;   // one knob row (knob + label + value)
-    const float kSwitchH    = 20.f;   // one tab-switch / toggle row
+    const float kPanelTitle = 18.f;   // panel caption strip (+2 for the +1pt font)
+    const float kRowH       = 60.f;   // one knob row (knob + label + value; +4 for the +1pt font)
+    // 20 was too short to contain its own text: IVTabSwitchControl draws the
+    // LABEL above the widget and the tab captions inside it, so a 20px box with
+    // a 10pt label left the captions clipped -- visible in the first Windows
+    // screenshot on every wave/range/slope switch. 30 gives the label its own
+    // line and the tabs a legible box at the larger font. [voicing]
+    const float kSwitchH    = 30.f;   // one tab-switch / toggle row
     const float kGap        = 4.f;    // vertical gap inside a panel
     const float kColGap     = 8.f;    // horizontal gap between panels
     const float kRowGap     = 8.f;    // vertical gap between bands
@@ -206,28 +214,28 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     // panel weights to contentW below, exactly as NassauZermattUI.cpp does.
     const float kKeyboardH  = 90.f;   // bottom keyboard strip
 
-    const IText header(16, kText, "default", EAlign::Near);
-    const IText brand(11, kAccent, "default", EAlign::Far);
-    const IText colHdr(11, kAccent, "default", EAlign::Center);
+    const IText header(17, kText, "default", EAlign::Near);
+    const IText brand(12, kAccent, "default", EAlign::Far);
+    const IText colHdr(12, kAccent, "default", EAlign::Center);
 
     const IVStyle knobStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
-        .WithLabelText(IText(10, kText, "default"))
-        .WithValueText(IText(9, kText, "default"))
+        .WithLabelText(IText(11, kText, "default"))
+        .WithValueText(IText(10, kText, "default"))
         .WithDrawFrame(false)
         .WithShowValue(true);
 
     const IVStyle switchStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
         .WithColor(kBG, kPanel)
-        .WithLabelText(IText(9, kText, "default"))
-        .WithValueText(IText(9, kText, "default"))
+        .WithLabelText(IText(10, kText, "default"))
+        .WithValueText(IText(10, kText, "default"))
         .WithDrawFrame(true);
 
     const IVStyle toggleStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
-        .WithValueText(IText(10, kText, "default"))
-        .WithLabelText(IText(9, kText, "default"));
+        .WithValueText(IText(11, kText, "default"))
+        .WithLabelText(IText(10, kText, "default"));
 
     ui.AttachPanelBackground(kBg);
 
@@ -239,8 +247,8 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
         .WithDrawShadows(false)
         .WithColor(kFG, kAccent)
         .WithColor(kBG, kPanel)
-        .WithLabelText(IText(10, kText, "default", EAlign::Center, EVAlign::Middle))
-        .WithValueText(IText(10, kText, "default"));
+        .WithLabelText(IText(11, kText, "default", EAlign::Center, EVAlign::Middle))
+        .WithValueText(IText(11, kText, "default"));
     // Factory ("baked") preset manager: [<] preset-name menu [>], auto-
     // populated from the plugin's MakePreset* bank; arrowing/selecting calls
     // RestorePreset. G10.2's "plus the preset selector" requirement.

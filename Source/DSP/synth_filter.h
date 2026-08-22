@@ -205,9 +205,14 @@ struct LadderFilter {
     invDenom = static_cast<nassau_real>(1.0 / (1.0 + kD * G4D));  // [dsp] THE control-rate division (G4.11)
 
     p1.g = g;
+
+    p1.setG();
     p2.g = g;
+    p2.setG();
     p3.g = g;
+    p3.setG();
     p4.g = g;
+    p4.setG();
   }
 
   // G5 (DESIGN.md §2: "gLpf (LPF TPT coefficient)... interpolated per
@@ -248,9 +253,13 @@ struct LadderFilter {
     twoG = nassau_real(2.0) * G;
     invDenom = nassau_real(1.0) / (nassau_real(1.0) + k * G4);
     p1.g = g;
+    p1.setG();
     p2.g = g;
+    p2.setG();
     p3.g = g;
+    p3.setG();
     p4.g = g;
+    p4.setG();
   }
 
   // R12/G4.11: no division, no transcendental, no atomic load anywhere in
@@ -485,9 +494,13 @@ struct HpfCascade {
     g = static_cast<nassau_real>(
         std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs));  // [dsp] DESIGN.md §5.5/§5.4
     p1.g = g;
+    p1.setG();
     p2.g = g;
+    p2.setG();
     p3.g = g;
+    p3.setG();
     p4.g = g;
+    p4.setG();
   }
 
   /// G6 (DESIGN.md §2's "gHpf" -- see LadderFilter::advanceCoeff's identical
@@ -498,9 +511,13 @@ struct HpfCascade {
   inline void advanceCoeff(nassau_real gValue) {
     g = gValue;
     p1.g = g;
+    p1.setG();
     p2.g = g;
+    p2.setG();
     p3.g = g;
+    p3.setG();
     p4.g = g;
+    p4.setG();
   }
 
   /// One sample through `nPoles` (2 or 12 dB mode / 4 for 24 dB mode)

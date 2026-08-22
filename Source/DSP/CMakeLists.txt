@@ -1,6 +1,7 @@
 add_library(nassau_synth_core
     synth_core.cpp
     synth_core.h
+    synth_simd.h
 )
 
 target_include_directories(nassau_synth_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

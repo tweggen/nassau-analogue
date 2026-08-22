@@ -276,6 +276,7 @@ inline double shapeCubic(double x, double L) {
 // single final rounding.
 struct TptOnePole {
   nassau_real g = 0.0;   // [dsp] tan(pi*fc/fs)
+  nassau_real G = 0.0;   // [dsp] g/(1+g), control-rate cache -- see setG()
   nassau_real s = 0.0;   // integrator state
   nassau_real curLp = 0.0;
   nassau_real curHp = 0.0;
@@ -287,6 +288,7 @@ struct TptOnePole {
   void setFc(double fc, double fs) {
     fc = std::clamp(fc, 1.0, 0.49 * fs);
     g = static_cast<nassau_real>(std::tan(kAmpPi * fc / fs));
+    setG();
   }
 
   void reset() {
@@ -300,8 +302,22 @@ struct TptOnePole {
   // (not `double` narrowed only at the end) -- this is the per-sample loop
   // DESIGN.md §12.2 targets, so the arithmetic itself must run at the
   // reduced width for a weak-ARM build to see any benefit from it.
+  // G11-opt: G = g/(1+g) is a function of `g` ALONE, and `g` only moves at
+  // control rate -- yet this was recomputed on EVERY call, i.e. a division per
+  // pole per sample. An HpfCascade runs 2 or 4 of these per voice per sample,
+  // so the instrument was paying 2-4 redundant divisions per voice per sample
+  // for a value that had not changed. Found while auditing why the SIMD pair
+  // path beat its own estimate: that path had deduplicated the division across
+  // its four stages, so it was being credited to "SIMD" when it is really a
+  // scalar fix that both paths deserve.
+  //
+  // setG() must be called whenever `g` is assigned; setFc() does it, and so do
+  // the filter structures that write `.g` directly (synth_filter.h,
+  // synth_simd.h). Bit-exact: the same `g` yields the same `G`, computed once
+  // instead of N times. [dsp]
+  inline void setG() { G = g / (nassau_real(1.0) + g); }
+
   inline nassau_real process(nassau_real x) {
-    const nassau_real G = g / (nassau_real(1.0) + g);
     const nassau_real v = (x - s) * G;
     const nassau_real lp = v + s;
     s = lp + v;
