@@ -29,6 +29,8 @@
 // through Xorshift32 (also the production RNG, Source/DSP/synth_dsp.h),
 // fixed seeds only.
 
+#include "synth_core.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -313,6 +315,23 @@ inline double measuredF0(const std::vector<float>& v, double fs) {
 // G5, G6.3) to locate a filter's ACTUAL corner, which DESIGN.md repeatedly
 // warns is not at the nominal cutoff parameter for any structure in this
 // plugin. Self-checked in Tests/dsp_tests.cpp against TptOnePole.
+// ---- seqHoldNote (G3, docs/GATES.md "Shared test harness") -----------------
+// A single held note: NoteOn at sample 0, NoteOff at round(onSec*fs) samples.
+// `offSec` is not baked into an event (there is nothing to schedule -- a
+// NoteOff is the only event a "hold, then release" sequence needs); it is
+// part of the signature so the CALLER's total render length,
+// round((onSec+offSec)*fs) samples, is unambiguous from the same three
+// numbers that produced the events, matching DESIGN.md §10.1's NoteEvent
+// wire format (framework-free, no SynthCore-specific state).
+inline std::vector<NoteEvent> seqHoldNote(int note, float vel, double onSec, double offSec, double fs) {
+  (void)offSec;  // documents total-length intent at the call site; not itself an event
+  const int offOffset = static_cast<int>(std::lround(onSec * fs));
+  return {
+      {0, NoteEvent::NoteOn, note, vel},
+      {offOffset, NoteEvent::NoteOff, note, 0.0f},
+  };
+}
+
 template <typename ProcessBlockFn>
 inline double minus3dBPoint(ProcessBlockFn&& processBlock, double fs, double refHz, double loHz,
                              double hiHz, int iterations = 40) {

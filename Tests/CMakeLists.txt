@@ -33,3 +33,20 @@ target_include_directories(osc_tests PRIVATE
 target_compile_options(osc_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME OscTests COMMAND osc_tests)
+
+# ---- G3: envelopes, LFO, control-rate architecture (Source/DSP/synth_core.*)
+# Links nassau_synth_core (unlike dsp_tests/osc_tests): envlfo_tests.cpp
+# drives the real SynthCore voice path (NoteEvent in, rendered audio out),
+# not synth_dsp.h/synth_osc.h primitives directly.
+add_executable(envlfo_tests envlfo_tests.cpp)
+target_link_libraries(envlfo_tests nassau_synth_core)
+target_include_directories(envlfo_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(envlfo_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+# G3.2's grep-based inspection check reads synth_core.cpp's own source text
+# (between its "AUDIO-RATE LOOP BEGIN/END" markers) at an ABSOLUTE path, so
+# it resolves regardless of ctest's working directory.
+target_compile_definitions(envlfo_tests PRIVATE
+    NASSAU_CORE_CPP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_core.cpp")
+
+add_test(NAME EnvLfoTests COMMAND envlfo_tests)

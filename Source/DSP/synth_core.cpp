@@ -1,6 +1,7 @@
 #include "synth_core.h"
 
 #include <algorithm>
+#include <cmath>
 
 // ===== Constructor & Initialization =====
 
@@ -8,7 +9,10 @@ SynthCore::SynthCore() {
     // All parameter atomics are already default-initialised at their in-class
     // default member initializers (see synth_core.h) — DESIGN.md §11's
     // default column, transcribed there with a [voicing] provenance tag.
-    // Nothing else to do here: G0 has no DSP state to construct.
+    // Voice/LFO state (G3) is likewise default-member-initialised
+    // (Osc/AdsrEnv/etc. all zero/Idle by construction) -- reset() below is
+    // what makes that state deterministic across reset()/fresh-instance
+    // comparisons (R13), not this constructor.
 }
 
 SynthCore::~SynthCore() {
@@ -25,41 +29,101 @@ void SynthCore::init(float sampleRate) {
     }
     mSampleRate.store(sampleRate, std::memory_order_relaxed);
 
+    // G3: (re)derive the triangle leaky-integrator's per-sample leak
+    // coefficient for the new rate (Osc::setSampleRate(), synth_osc.h) --
+    // this is the ONE oscillator quantity that genuinely depends on fs
+    // rather than being recomputed every control block, so it lives here
+    // (called once per init(), not once per control block/sample, R12).
+    for (int i = 0; i < kG3Voices; ++i) {
+        mVoices[i].osc1.setSampleRate(sampleRate);
+        mVoices[i].osc2.setSampleRate(sampleRate);
+    }
+
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
-    // At G0 there are none yet — later gates' oscillator/filter/envelope/
-    // voice state will be prepared here, all fixed-size for kMaxVoices + 2
-    // fade slots (DESIGN.md §10.3), never allocated in process().
+    // Everything else fixed-size for kMaxVoices + 2 fade slots (DESIGN.md
+    // §10.3) is G7's job; G3's kG3Voices-sized array is already fixed-size.
     reset();
 }
 
 void SynthCore::reset() {
     // DESIGN.md §11 "Reset semantics": clears state, never touches
-    // parameters. At G0 the only internal state that exists is the
-    // control-rate grid position (DESIGN.md §2) — later gates add oscillator
-    // phase, filter state, envelope state, noise-generator seeds and the
-    // voice allocator here, all under the same "never touch a parameter"
-    // rule.
+    // parameters. G3 adds oscillator phase, envelope state, noise-generator
+    // seeds and the (provisional, G3-only) voice array/LFO here; later gates
+    // add filter state and the real G7 allocator under the same "never touch
+    // a parameter" rule.
     mControlPhase = 0;
+
+    for (int i = 0; i < kG3Voices; ++i) {
+        Voice& v = mVoices[i];
+        v.osc1.reset();   // full reset (phase + triangle integrator state) --
+        v.osc2.reset();   // distinct from the PHASE-ONLY resetPhase() a note-on
+                           // uses (DESIGN.md §3.2), see applyEvent()'s comment.
+        v.sub.reset();
+        v.noise.init(i);  // [dsp] DESIGN.md §3.5/R8/R13: seeded from voice index
+        v.envF.reset();
+        v.envA.reset();
+        v.active = false;
+        v.note = -1;
+        v.vcaGainStart = 0.0;
+        v.vcaGainEnd = 0.0;
+        v.debugLfoPitchModSemis = 0.0;
+    }
+    mActiveVoiceCount = 0;
+    mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
+    mLastLfoValue = 0.0;
+
+    mPendingCount = 0;
+
+    // mControlBlock, mDebugAtomicLoadCount and the two mDebug* VCA test hooks
+    // are deliberately NOT touched here -- they are test-only instrumentation
+    // / harness configuration, not synth state (same precedent as
+    // mControlBlock already being left alone by this function since G0).
 }
 
 // ===== Audio Processing =====
 
 void SynthCore::process(const NoteEvent* events, int numEvents,
                          float* outL, float* outR, int numSamples) {
-    // G0: no voice allocation yet (that lands in G7, DESIGN.md §10.3). The
-    // framework-free NoteEvent interface (DESIGN.md §10.1, R14) is already
-    // load-bearing as an API shape — accepted here — but not yet consumed.
-    (void)events;
-    (void)numEvents;
-
     // DESIGN.md §2.2: exactly ONE ParamSnapshot per host block, every atomic
     // loaded exactly once (R3's mechanism — the audio-rate loop below never
-    // touches an atomic, satisfying R12 too). G0 has no voice/filter/envelope
-    // math to feed it yet, so the snapshot is built and discarded; G2-G8
-    // progressively consume it instead of loading their own atomics per
-    // sample.
-    const ParamSnapshot snapshot = buildSnapshot();
-    (void)snapshot;
+    // touches an atomic, satisfying R12 too). G3.1's instrumented count is
+    // driven by buildSnapshot()'s own counting wrapper (see below) — nothing
+    // else in this function increments it.
+    ParamSnapshot snapshot = buildSnapshot();
+
+    // fs is read exactly ONCE per host block too (block rate, not audio
+    // rate) -- deliberately OUTSIDE buildSnapshot() so it does not count
+    // against G3.1's "53 params" figure (mSampleRate is configuration, not
+    // one of DESIGN.md §11's 53 parameters). finishSnapshot() below computes
+    // every block-rate DERIVED constant (ADSR coefficients, LFO increment)
+    // from it plus the raw snapshot fields — DESIGN.md §2.2.
+    const double fs = static_cast<double>(mSampleRate.load(std::memory_order_relaxed));
+    const double fsControl = fs / std::max(1, mControlBlock);
+    finishSnapshot(snapshot, fsControl);
+
+    // Configure the LFO's wave/rate/delay from THIS host block's snapshot
+    // BEFORE any event is applied below. This matters on a fresh instance's
+    // (or first-note-of-a-block's) very first control-rate update: an event
+    // this call delivers can call mLfo.noteOnEdge() (DESIGN.md §7's 0->1
+    // retrigger) at the FIRST control-block boundary crossed, and
+    // noteOnEdge() reads mLfo.delaySeconds to decide whether to gate depth
+    // to 0 -- if that read happened before delaySeconds was ever set from
+    // kLfoDelayMs (still at Lfo's own construction-time default of 0), a
+    // configured delay would be silently skipped on the very note it should
+    // apply to. Doing this once per HOST block (not per control block) is
+    // also simply correct: delay/rate/wave are param-derived, not something
+    // that needs re-deriving every control step.
+    mLfo.wave = static_cast<Lfo::Wave>(snapshot.lfoWave);
+    mLfo.setRateHz(snapshot.lfoRateHz, snapshot.fsControl);
+    mLfo.setDelayMs(snapshot.lfoDelayMs);
+
+    // DESIGN.md §10.2: events are quantised forward to the control-block
+    // grid. `eventIdx` walks this call's own (assumed time-ordered, per
+    // standard MIDI-queue convention) events array; any left unconsumed when
+    // this call ends (because no further control-block boundary was reached)
+    // are queued into mPendingEvents and drained at the very first boundary
+    // a LATER call reaches — see that member's own comment.
+    int eventIdx = 0;
 
     // DESIGN.md §2 [PERF-1]: control-rate sub-blocking, `mControlBlock`
     // samples per control block. `mControlPhase` is a PERSISTENT member (see
@@ -67,97 +131,362 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
     // the top of this call — so the grid is anchored to the sample stream,
     // not to host block boundaries. This is what docs/GATES.md G3.3
     // (block-size invariance) depends on.
-    //
-    // At G0 there is nothing to do at a control-block boundary yet (no ADSR,
-    // no LFO, no per-voice pitch/cutoff/gain recompute exists). G3 lands that
-    // work at the "control-rate update point" marked below, inside this same
-    // loop shape — the shape itself does not change from G0 onward.
     int n = 0;
     while (n < numSamples) {
         const int samplesToBoundary = mControlBlock - mControlPhase;
         const int samplesRemaining = numSamples - n;
         const int chunk = std::min(samplesToBoundary, samplesRemaining);
+        const int blockSizeForFrac = std::max(1, mControlBlock);
 
-        // Audio-rate loop (R12: no transcendentals, no atomic loads in here —
-        // trivially true at G0 since the body is a constant write). G0: exact
-        // silence — no oscillator, filter or VCA exists yet (G2-G6 land the
-        // real per-sample signal path behind this same loop).
+        // ---- AUDIO-RATE LOOP BEGIN (R12/R3: no transcendentals, no atomic
+        // loads anywhere between this marker and AUDIO-RATE LOOP END --
+        // G3.2's grep-based inspection test (Tests/envlfo_tests.cpp) checks
+        // this region of THIS FILE verbatim, so keep any future edit to this
+        // loop inside these two markers and free of tan/exp/exp2/pow/log/
+        // sin/cos/.load(). The three DESIGN.md §2 interpolated scalars
+        // (gLpf, gHpf, vcaGain) are a lerp -- add/sub/mul/div only. ----
         for (int i = 0; i < chunk; ++i) {
-            outL[n + i] = 0.0f;
-            outR[n + i] = 0.0f;
+            const int posInBlock = mControlPhase + i;
+            const double frac = static_cast<double>(posInBlock) / static_cast<double>(blockSizeForFrac);
+            double mixSum = 0.0;
+            for (int vi = 0; vi < kG3Voices; ++vi) {
+                Voice& v = mVoices[vi];
+                if (!v.active) continue;
+
+                const double prePhase1 = v.osc1.phase;
+                const auto r1 = v.osc1.step();
+                double y2 = v.osc2.step().y;
+                if (snapshot.osc2Sync && r1.wrapped) {
+                    y2 = v.osc2.hardSync(r1.wrapFrac / v.osc1.dt, y2);
+                }
+                const double ysub = v.sub.step(prePhase1, v.osc1.dt, r1.wrapped, true);
+                const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+
+                const double mix = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
+                                                    snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
+                                                    ynoise, snapshot.noiseLevelPercent);
+
+                const double gain = mDebugDisableVcaInterpolation
+                                         ? v.vcaGainEnd
+                                         : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
+                mixSum += mix * gain;
+            }
+            outL[n + i] = static_cast<float>(mixSum);
+            outR[n + i] = static_cast<float>(mixSum);
         }
+        // ---- AUDIO-RATE LOOP END ----
 
         n += chunk;
         mControlPhase += chunk;
         if (mControlPhase >= mControlBlock) {
             mControlPhase = 0;
-            // ---- control-rate update point (G3 lands real work here) ----
-            // Per control block: ADSRs advance one step, the LFO advances one
-            // step (globally, once — not per voice), pitch/filter-cutoff/
-            // VCA-gain/mixer levels are recomputed (DESIGN.md §2). Nothing to
-            // do yet at G0.
+
+            // ---- control-rate update point ----
+            // Any events queued by a PREVIOUS call that couldn't reach a
+            // boundary within their own call are due at THIS, the first
+            // boundary a call reaches -- drain them first (chronologically
+            // they precede this call's own events).
+            for (int p = 0; p < mPendingCount; ++p) applyEvent(mPendingEvents[p]);
+            mPendingCount = 0;
+
+            // This call's own events with sampleOffset < n (i.e. within the
+            // chunk[s] just rendered, [.., n)) are due at this boundary too.
+            while (eventIdx < numEvents && events[eventIdx].sampleOffset < n) {
+                applyEvent(events[eventIdx]);
+                ++eventIdx;
+            }
+
+            // Per control block: ADSRs advance one step, the LFO advances
+            // one step (globally, once — not per voice), pitch/VCA-gain are
+            // recomputed (DESIGN.md §2).
+            controlRateUpdate(snapshot, fs);
         }
+    }
+
+    // Any events this call never reached a boundary for: queue them for the
+    // next call (DESIGN.md §10.2 — see mPendingEvents's own comment). Silent,
+    // bounded drop past kMaxPendingEvents rather than an allocation (R3);
+    // not reachable by any realistic event stream at this queue's size.
+    for (; eventIdx < numEvents && mPendingCount < kMaxPendingEvents; ++eventIdx) {
+        mPendingEvents[mPendingCount++] = events[eventIdx];
     }
 }
 
 // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
 
 SynthCore::ParamSnapshot SynthCore::buildSnapshot() const {
+    // G3.1: every .load() below goes through this counting wrapper, so a
+    // debug build (or a Release one -- the counter is cheap and unconditional,
+    // there is no "debug build" config distinction in this tree) can assert
+    // "exactly 53 * numHostBlocks" (docs/GATES.md G3.1). A generic lambda
+    // (C++17) so it works uniformly across the float/int/bool-as-float
+    // atomics below without a template function per type.
+    auto ld = [this](const auto& atomicRef) {
+        ++mDebugAtomicLoadCount;
+        return atomicRef.load(std::memory_order_relaxed);
+    };
+
     ParamSnapshot s{};
-    s.masterVolumeDb          = mMasterVolumeDb.load(std::memory_order_relaxed);
-    s.outputClip              = mOutputClip.load(std::memory_order_relaxed) != 0.0f;
-    s.osc1Wave                = mOsc1Wave.load(std::memory_order_relaxed);
-    s.osc1Octave               = mOsc1Octave.load(std::memory_order_relaxed);
-    s.osc1FineCents           = mOsc1FineCents.load(std::memory_order_relaxed);
-    s.osc1PwPercent           = mOsc1PwPercent.load(std::memory_order_relaxed);
-    s.osc1LevelPercent        = mOsc1LevelPercent.load(std::memory_order_relaxed);
-    s.osc2Wave                = mOsc2Wave.load(std::memory_order_relaxed);
-    s.osc2Octave               = mOsc2Octave.load(std::memory_order_relaxed);
-    s.osc2Semi                = mOsc2Semi.load(std::memory_order_relaxed);
-    s.osc2FineCents           = mOsc2FineCents.load(std::memory_order_relaxed);
-    s.osc2PwPercent           = mOsc2PwPercent.load(std::memory_order_relaxed);
-    s.osc2LevelPercent        = mOsc2LevelPercent.load(std::memory_order_relaxed);
-    s.osc2Sync                = mOsc2Sync.load(std::memory_order_relaxed) != 0.0f;
-    s.osc2KeyTrack            = mOsc2KeyTrack.load(std::memory_order_relaxed) != 0.0f;
-    s.subOctave                = mSubOctave.load(std::memory_order_relaxed);
-    s.subLevelPercent         = mSubLevelPercent.load(std::memory_order_relaxed);
-    s.noiseColor                = mNoiseColor.load(std::memory_order_relaxed);
-    s.noiseLevelPercent       = mNoiseLevelPercent.load(std::memory_order_relaxed);
-    s.envFAttackMs            = mEnvFAttackMs.load(std::memory_order_relaxed);
-    s.envFDecayMs             = mEnvFDecayMs.load(std::memory_order_relaxed);
-    s.envFSustainPercent      = mEnvFSustainPercent.load(std::memory_order_relaxed);
-    s.envFReleaseMs           = mEnvFReleaseMs.load(std::memory_order_relaxed);
-    s.envAAttackMs            = mEnvAAttackMs.load(std::memory_order_relaxed);
-    s.envADecayMs             = mEnvADecayMs.load(std::memory_order_relaxed);
-    s.envASustainPercent      = mEnvASustainPercent.load(std::memory_order_relaxed);
-    s.envAReleaseMs           = mEnvAReleaseMs.load(std::memory_order_relaxed);
-    s.lfoWave                  = mLfoWave.load(std::memory_order_relaxed);
-    s.lfoRateHz               = mLfoRateHz.load(std::memory_order_relaxed);
-    s.lfoDelayMs              = mLfoDelayMs.load(std::memory_order_relaxed);
-    s.lfoPitchAmountPercent   = mLfoPitchAmountPercent.load(std::memory_order_relaxed);
-    s.lfoPwmAmountPercent     = mLfoPwmAmountPercent.load(std::memory_order_relaxed);
-    s.lpfSlope                  = mLpfSlope.load(std::memory_order_relaxed);
-    s.lpfCutoffHz             = mLpfCutoffHz.load(std::memory_order_relaxed);
-    s.lpfResonancePercent     = mLpfResonancePercent.load(std::memory_order_relaxed);
-    s.lpfEnvAmountPercent     = mLpfEnvAmountPercent.load(std::memory_order_relaxed);
-    s.lpfKeyFollowPercent     = mLpfKeyFollowPercent.load(std::memory_order_relaxed);
-    s.lpfLfoAmountPercent     = mLpfLfoAmountPercent.load(std::memory_order_relaxed);
-    s.drivePercent            = mDrivePercent.load(std::memory_order_relaxed);
-    s.hpfSlope                  = mHpfSlope.load(std::memory_order_relaxed);
-    s.hpfCutoffHz             = mHpfCutoffHz.load(std::memory_order_relaxed);
-    s.hpfKeyFollowPercent     = mHpfKeyFollowPercent.load(std::memory_order_relaxed);
-    s.pmEnvFToOsc2Percent     = mPmEnvFToOsc2Percent.load(std::memory_order_relaxed);
-    s.pmEnvFToPwPercent       = mPmEnvFToPwPercent.load(std::memory_order_relaxed);
-    s.polyphony                 = mPolyphony.load(std::memory_order_relaxed);
-    s.voiceMode                 = mVoiceMode.load(std::memory_order_relaxed);
-    s.glideTimeMs             = mGlideTimeMs.load(std::memory_order_relaxed);
-    s.bendRangeSemitones      = mBendRangeSemitones.load(std::memory_order_relaxed);
-    s.velToVcaPercent         = mVelToVcaPercent.load(std::memory_order_relaxed);
-    s.velToFilterPercent      = mVelToFilterPercent.load(std::memory_order_relaxed);
-    s.stereoMode               = mStereoMode.load(std::memory_order_relaxed) != 0.0f;
-    s.stereoDetuneCents       = mStereoDetuneCents.load(std::memory_order_relaxed);
-    s.stereoSpreadPercent     = mStereoSpreadPercent.load(std::memory_order_relaxed);
+    s.masterVolumeDb          = ld(mMasterVolumeDb);
+    s.outputClip              = ld(mOutputClip) != 0.0f;
+    s.osc1Wave                = ld(mOsc1Wave);
+    s.osc1Octave               = ld(mOsc1Octave);
+    s.osc1FineCents           = ld(mOsc1FineCents);
+    s.osc1PwPercent           = ld(mOsc1PwPercent);
+    s.osc1LevelPercent        = ld(mOsc1LevelPercent);
+    s.osc2Wave                = ld(mOsc2Wave);
+    s.osc2Octave               = ld(mOsc2Octave);
+    s.osc2Semi                = ld(mOsc2Semi);
+    s.osc2FineCents           = ld(mOsc2FineCents);
+    s.osc2PwPercent           = ld(mOsc2PwPercent);
+    s.osc2LevelPercent        = ld(mOsc2LevelPercent);
+    s.osc2Sync                = ld(mOsc2Sync) != 0.0f;
+    s.osc2KeyTrack            = ld(mOsc2KeyTrack) != 0.0f;
+    s.subOctave                = ld(mSubOctave);
+    s.subLevelPercent         = ld(mSubLevelPercent);
+    s.noiseColor                = ld(mNoiseColor);
+    s.noiseLevelPercent       = ld(mNoiseLevelPercent);
+    s.envFAttackMs            = ld(mEnvFAttackMs);
+    s.envFDecayMs             = ld(mEnvFDecayMs);
+    s.envFSustainPercent      = ld(mEnvFSustainPercent);
+    s.envFReleaseMs           = ld(mEnvFReleaseMs);
+    s.envAAttackMs            = ld(mEnvAAttackMs);
+    s.envADecayMs             = ld(mEnvADecayMs);
+    s.envASustainPercent      = ld(mEnvASustainPercent);
+    s.envAReleaseMs           = ld(mEnvAReleaseMs);
+    s.lfoWave                  = ld(mLfoWave);
+    s.lfoRateHz               = ld(mLfoRateHz);
+    s.lfoDelayMs              = ld(mLfoDelayMs);
+    s.lfoPitchAmountPercent   = ld(mLfoPitchAmountPercent);
+    s.lfoPwmAmountPercent     = ld(mLfoPwmAmountPercent);
+    s.lpfSlope                  = ld(mLpfSlope);
+    s.lpfCutoffHz             = ld(mLpfCutoffHz);
+    s.lpfResonancePercent     = ld(mLpfResonancePercent);
+    s.lpfEnvAmountPercent     = ld(mLpfEnvAmountPercent);
+    s.lpfKeyFollowPercent     = ld(mLpfKeyFollowPercent);
+    s.lpfLfoAmountPercent     = ld(mLpfLfoAmountPercent);
+    s.drivePercent            = ld(mDrivePercent);
+    s.hpfSlope                  = ld(mHpfSlope);
+    s.hpfCutoffHz             = ld(mHpfCutoffHz);
+    s.hpfKeyFollowPercent     = ld(mHpfKeyFollowPercent);
+    s.pmEnvFToOsc2Percent     = ld(mPmEnvFToOsc2Percent);
+    s.pmEnvFToPwPercent       = ld(mPmEnvFToPwPercent);
+    s.polyphony                 = ld(mPolyphony);
+    s.voiceMode                 = ld(mVoiceMode);
+    s.glideTimeMs             = ld(mGlideTimeMs);
+    s.bendRangeSemitones      = ld(mBendRangeSemitones);
+    s.velToVcaPercent         = ld(mVelToVcaPercent);
+    s.velToFilterPercent      = ld(mVelToFilterPercent);
+    s.stereoMode               = ld(mStereoMode) != 0.0f;
+    s.stereoDetuneCents       = ld(mStereoDetuneCents);
+    s.stereoSpreadPercent     = ld(mStereoSpreadPercent);
     return s;
+}
+
+// ===== G3: block-rate derived constants (DESIGN.md §2.2) =====
+
+void SynthCore::finishSnapshot(ParamSnapshot& s, double fsControl) {
+    s.fsControl = fsControl;
+    // [dsp] DESIGN.md §6 -- AdsrEnv's own derivation (attack/decay/release
+    // divisors), computed via AdsrEnv::coeffForMs(), not re-derived here.
+    s.envFAttackCoeff  = AdsrEnv::coeffForMs(s.envFAttackMs,  AdsrEnv::attackDivisor(),  fsControl);
+    s.envFDecayCoeff   = AdsrEnv::coeffForMs(s.envFDecayMs,   AdsrEnv::decayDivisor(),   fsControl);
+    s.envFReleaseCoeff = AdsrEnv::coeffForMs(s.envFReleaseMs, AdsrEnv::releaseDivisor(), fsControl);
+    s.envFSustainLevel = std::clamp(static_cast<double>(s.envFSustainPercent) * 0.01, 0.0, 1.0);
+    s.envAAttackCoeff  = AdsrEnv::coeffForMs(s.envAAttackMs,  AdsrEnv::attackDivisor(),  fsControl);
+    s.envADecayCoeff   = AdsrEnv::coeffForMs(s.envADecayMs,   AdsrEnv::decayDivisor(),   fsControl);
+    s.envAReleaseCoeff = AdsrEnv::coeffForMs(s.envAReleaseMs, AdsrEnv::releaseDivisor(), fsControl);
+    s.envASustainLevel = std::clamp(static_cast<double>(s.envASustainPercent) * 0.01, 0.0, 1.0);
+    // [dsp] DESIGN.md §7: LFO increment is a plain divide, no transcendental.
+    s.lfoIncrement = static_cast<double>(s.lfoRateHz) / std::max(fsControl, 1e-6);
+    s.lfoDelaySeconds = std::max(static_cast<double>(s.lfoDelayMs), 0.0) * 0.001;
+}
+
+// ===== G3: event application (DESIGN.md §10.1/§10.3, minimal/provisional) ===
+
+void SynthCore::applyEvent(const NoteEvent& ev) {
+    switch (ev.type) {
+        case NoteEvent::NoteOn: {
+            // Reuse a voice already sounding THIS note (avoids piling up a
+            // second voice on a fast repeated NoteOn -- not G7.5's full
+            // "reuse" AC, but the same idea; free to add here).
+            int slot = -1;
+            for (int i = 0; i < kG3Voices; ++i) {
+                if (mVoices[i].active && mVoices[i].note == ev.note) { slot = i; break; }
+            }
+            if (slot < 0) {
+                for (int i = 0; i < kG3Voices; ++i) {
+                    if (!mVoices[i].active) { slot = i; break; }
+                }
+            }
+            // No allocation-order policy yet (Idle/oldest-Released/oldest-
+            // Playing is G7's job, DESIGN.md §10.3) -- if every slot is
+            // active and none matches this note, this minimal path just
+            // reuses slot 0. Not tested by any G3 AC.
+            if (slot < 0) slot = 0;
+
+            Voice& v = mVoices[slot];
+            v.note = ev.note;
+            // DESIGN.md §3.2: "both oscillators reset to 0" at note-on --
+            // PHASE only (resetPhase()), not the full reset() SynthCore::
+            // reset()/init() use, which would also clear the triangle
+            // leaky-integrator's running state. G2's own note left this
+            // exact choice ("resetPhase() vs reset() at note-on") open for
+            // "G7's voice design" -- G3 is in fact the first gate to build a
+            // voice, so the choice is made here instead, against DESIGN.md
+            // §3.2's literal wording (a decision the plan did not name G3
+            // for, flagged in this gate's report per R11).
+            v.osc1.resetPhase();
+            v.osc2.resetPhase();
+            v.sub.reset();  // keep the sub's wrap-index counter consistent with osc1's fresh phase=0
+            // Noise is deliberately NOT reset at note-on (only reset()/
+            // init() reseed it) -- a real analogue noise source runs
+            // continuously; DESIGN.md/R13 only require voice-index seeding
+            // at init()/reset(), not at every note-on.
+            v.envF.noteOn();
+            v.envA.noteOn();
+            if (!v.active) {
+                v.active = true;
+                ++mActiveVoiceCount;
+                if (mActiveVoiceCount == 1) mLfo.noteOnEdge();  // DESIGN.md §7: only 0->1
+            }
+            break;
+        }
+        case NoteEvent::NoteOff: {
+            for (int i = 0; i < kG3Voices; ++i) {
+                if (mVoices[i].active && mVoices[i].note == ev.note) {
+                    mVoices[i].envF.noteOff();
+                    mVoices[i].envA.noteOff();
+                    break;  // first match only -- G7.2's oldest/allocation-order policy is out of scope
+                }
+            }
+            break;
+        }
+        case NoteEvent::AllNotesOff: {
+            // DESIGN.md §10.3: "releases every voice normally." Real CC 123
+            // handling (this event's own G7.7 AC) is G7's job; releasing
+            // every sounding voice via noteOff() is a correct subset of that
+            // and free to add now.
+            for (int i = 0; i < kG3Voices; ++i) {
+                if (mVoices[i].active) {
+                    mVoices[i].envF.noteOff();
+                    mVoices[i].envA.noteOff();
+                }
+            }
+            break;
+        }
+        case NoteEvent::AllSoundOff: {
+            // DESIGN.md §10.4's click-free fade-out slots are G7's job; this
+            // minimal path just hard-silences every voice immediately
+            // (provisional -- not G7.7's precise 2.8 ms bound).
+            for (int i = 0; i < kG3Voices; ++i) {
+                if (mVoices[i].active) {
+                    mVoices[i].envF.reset();
+                    mVoices[i].envA.reset();
+                    mVoices[i].active = false;
+                    --mActiveVoiceCount;
+                    mVoices[i].vcaGainStart = 0.0;
+                    mVoices[i].vcaGainEnd = 0.0;
+                }
+            }
+            break;
+        }
+        case NoteEvent::PitchBend:
+        case NoteEvent::Sustain:
+        default:
+            // G7's job (DESIGN.md §10.3/§10.6/§7.6) -- no-op at G3, but
+            // accepted (not a crash/UB) so G0.8's "every event type" grid
+            // stays green (R1).
+            break;
+    }
+}
+
+// ===== G3: the control-rate update point (DESIGN.md §2) =====
+
+void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
+    // mLfo.wave/rate/delay are already configured for this host block by
+    // process() itself, BEFORE any event was applied at this control-rate
+    // update point (see process()'s own comment) -- only the per-control-
+    // block step happens here.
+    mLastLfoValue = mLfo.step(snapshot.fsControl);
+
+    // [ref] DESIGN.md §7: pitch +-50 cents (=0.5 semitone) at 100% amount;
+    // PWM +-45% at 100% amount. Shared across BOTH oscillators of EVERY
+    // active voice this control block (DESIGN.md §7 [PERF-4]: one global
+    // LFO) -- this is the ONE local variable G3.10's getDebugVoiceLfoPitchModSemis()
+    // proves every active voice reads identically.
+    const double lfoPitchModSemis = (static_cast<double>(snapshot.lfoPitchAmountPercent) * 0.01) *
+                                     mLastLfoValue * 0.5;
+    const double lfoPwmModPercent = (static_cast<double>(snapshot.lfoPwmAmountPercent) * 0.01) *
+                                     mLastLfoValue * 45.0;
+
+    for (int i = 0; i < kG3Voices; ++i) {
+        Voice& v = mVoices[i];
+
+        v.envF.aCoeff = snapshot.envFAttackCoeff;
+        v.envF.dCoeff = snapshot.envFDecayCoeff;
+        v.envF.rCoeff = snapshot.envFReleaseCoeff;
+        v.envF.sustainLevel = snapshot.envFSustainLevel;
+        v.envF.step();
+
+        v.envA.aCoeff = snapshot.envAAttackCoeff;
+        v.envA.dCoeff = snapshot.envADecayCoeff;
+        v.envA.rCoeff = snapshot.envAReleaseCoeff;
+        v.envA.sustainLevel = snapshot.envASustainLevel;
+        v.envA.step();
+
+        if (v.active && v.envA.isIdle()) {
+            v.active = false;
+            --mActiveVoiceCount;
+        }
+
+        v.vcaGainStart = v.vcaGainEnd;
+        v.vcaGainEnd = mDebugForceUnityVca ? 1.0 : v.envA.y;  // G3.5: unity-gain reference render
+
+        if (!v.active) continue;  // idle voices don't need pitch/PW recomputed (nor rendered, see process())
+
+        v.debugLfoPitchModSemis = lfoPitchModSemis;
+
+        v.osc1.wave = static_cast<Osc::Wave>(snapshot.osc1Wave);
+        v.osc2.wave = static_cast<Osc::Wave>(snapshot.osc2Wave);
+        v.sub.octave = static_cast<SubOsc::Octave>(snapshot.subOctave);
+
+        // [voicing] kOsc2KeyTrack off -> VCO2 ignores the played note and
+        // sits at a fixed reference pitch (note 60, middle C) instead --
+        // DESIGN.md §11 names this param but does not spell out its
+        // behaviour; this is the conventional Prophet/Jupiter-family reading
+        // of an oscillator "key track" switch (a fixed-pitch drone/FM-
+        // operator use case), and no G3 AC exercises it either way. Flagged
+        // per R11 as a decision the plan did not cover.
+        const double noteForOsc2 = snapshot.osc2KeyTrack ? static_cast<double>(v.note) : 60.0;
+
+        const double osc1Semis = static_cast<double>(v.note) + lfoPitchModSemis +
+                                  octaveOffsetSemis(static_cast<Octave>(snapshot.osc1Octave)) +
+                                  static_cast<double>(snapshot.osc1FineCents) * 0.01;
+        const double osc2Semis = noteForOsc2 + lfoPitchModSemis +
+                                  octaveOffsetSemis(static_cast<Octave>(snapshot.osc2Octave)) +
+                                  static_cast<double>(snapshot.osc2Semi) +
+                                  static_cast<double>(snapshot.osc2FineCents) * 0.01;
+
+        // [dsp] DESIGN.md §3.2: f = 440 * 2^((semitones-69)/12), phaseInc clamped to 0.49.
+        const double f1 = 440.0 * std::exp2((osc1Semis - 69.0) / 12.0);
+        const double f2 = 440.0 * std::exp2((osc2Semis - 69.0) / 12.0);
+        v.osc1.setDt(std::clamp(f1 / std::max(fs, 1.0), 0.0, 0.49));
+        v.osc2.setDt(std::clamp(f2 / std::max(fs, 1.0), 0.0, 0.49));
+
+        v.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent);
+        v.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent);
+    }
+}
+
+double SynthCore::octaveOffsetSemis(Octave o) {
+    switch (o) {  // [ref] DESIGN.md §3.2: 16'/8'/4'/2' -> 220/440/880/1760 Hz at note 69
+        case Octave::Ft16: return -12.0;
+        case Octave::Ft8:  return 0.0;
+        case Octave::Ft4:  return 12.0;
+        case Octave::Ft2:  return 24.0;
+    }
+    return 0.0;
 }
 
 // ===== Parameter setters =====

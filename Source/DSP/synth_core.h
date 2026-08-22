@@ -2,6 +2,16 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdint>
+
+// G3 (docs/GATES.md): SynthCore now wires a real (minimal, provisional --
+// see the kG3Voices comment below) voice section together from the
+// primitives G1/G2 already proved: synth_dsp.h's AdsrEnv/Lfo and
+// synth_osc.h's Osc/SubOsc/NoiseSource/MixerBlock. Both are R2-legal,
+// dependency-free siblings within Source/DSP/ (no SDK/IPlug2 dependency,
+// ever) so this include does not touch R2's framework-free guarantee.
+#include "synth_dsp.h"
+#include "synth_osc.h"
 
 /**
  * NoteEvent — the framework-free MIDI-event wire format SynthCore::process()
@@ -323,6 +333,85 @@ public:
     /// from audible output (which, before G3, does not yet depend on it).
     int getDebugControlPhase() const { return mControlPhase; }
 
+    // ===== Test-only debug accessors (G3, docs/GATES.md) =====
+
+    /// G3.1: exactly one ParamSnapshot built per host block, every one of its
+    /// 53 atomics loaded exactly once. Incremented once per atomic .load()
+    /// INSIDE buildSnapshot() only (not mSampleRate, not mControlPhase --
+    /// those are not part of the "53 params" DESIGN.md §11 table this AC
+    /// counts, see buildSnapshot()'s own comment). Test-only: reset before
+    /// measuring, read after.
+    long long getDebugAtomicLoadCount() const { return mDebugAtomicLoadCount; }
+    void resetDebugAtomicLoadCount() { mDebugAtomicLoadCount = 0; }
+
+    /// G3.5: force every voice's VCA gain to a constant 1.0 (bypassing ENV-A
+    /// entirely), so a render with this set is "a separately-rendered
+    /// unity-VCA render of the same note" -- dividing a normal render by one
+    /// of these demodulates the gain envelope back out of the raw (saw-wrap-
+    /// dominated) waveform. Test-only, not safe concurrently with process().
+    void setDebugForceUnityVca(bool enabled) { mDebugForceUnityVca = enabled; }
+
+    /// G3.5: skip the per-sample linear interpolation of vcaGain and just
+    /// hold vcaGainEnd for the whole control block -- "a reference build
+    /// with the interpolation disabled", built from the SAME snapshot/
+    /// envelope math as the real path so the comparison isolates exactly the
+    /// interpolation, nothing else. Test-only, not safe concurrently with
+    /// process().
+    void setDebugDisableVcaInterpolation(bool enabled) { mDebugDisableVcaInterpolation = enabled; }
+
+    /// G3.10/G3.7: the LFO's raw output (post depth-gate, [-1,1]) as of the
+    /// most recent control-rate step -- the SAME single value every active
+    /// voice's pitch/PW recompute reads that control block (DESIGN.md §7
+    /// [PERF-4]: one global LFO, not one per voice).
+    double getDebugLfoValue() const { return mLastLfoValue; }
+
+    /// G3.11: the Lfo's own internal delay/ramp-in depth multiplier (0 at
+    /// note-on with a pending delay, ramping linearly to 1 -- DESIGN.md §7).
+    /// Exposed directly so G3.11 can assert "does not reset under a held
+    /// chord" exactly, rather than trying to infer it from audio alone.
+    double getDebugLfoDepthGain() const { return mLfo.depthGain; }
+
+    /// G3.10: per-voice-slot readback of the shared LFO->pitch modulation
+    /// term (semitones) applied to that slot's oscillators as of the most
+    /// recent control-rate step it was active for -- 0 for a slot that is
+    /// not active. Mirrors the getDebugEnvF()/getDebugEnvA() "exactly one
+    /// value per voice, not one per chain" pattern DESIGN.md/docs/GATES.md
+    /// already uses for the analogous G8.5 shared-modulation AC.
+    double getDebugVoiceLfoPitchModSemis(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugLfoPitchModSemis;
+    }
+
+    /// G3.10 (and generally useful for driving deterministic multi-voice
+    /// tests): true iff voice slot `voiceIndex` currently has a sounding
+    /// note (Attack/Decay/Sustain/Release, not Idle).
+    bool getDebugVoiceActive(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return false;
+        return mVoices[voiceIndex].active;
+    }
+
+    /// Number of voice slots this GATE's minimal, provisional multi-voice
+    /// path provides (see kG3Voices's own comment below) -- NOT DESIGN.md
+    /// §10.3's kMaxVoices=16 (+2 fade slots), which is G7's job.
+    static int getDebugNumVoiceSlotsG3() { return kG3Voices; }
+
+    /// G3.6: ENV-F has no audible destination until G4/G5 (it does not drive
+    /// the filter yet), so its own zipper-freedom cannot be measured from
+    /// OUTPUT AUDIO the way ENV-A's can (R6) -- there is nothing for it to
+    /// modulate yet. These two expose the raw envelope value (`y`, DESIGN.md
+    /// §6) directly per voice slot instead, at CONTROL rate, which is the
+    /// same underlying quantity that will reach audio once a filter exists
+    /// to read it. Also anticipates G8.5's "getDebugEnvF()/getDebugEnvA()
+    /// per voice" pattern.
+    double getDebugEnvFValue(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].envF.y;
+    }
+    double getDebugEnvAValue(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].envA.y;
+    }
+
 private:
     // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
     // Built exactly once per process() call: every atomic is loaded exactly
@@ -387,14 +476,113 @@ private:
         bool  stereoMode;
         float stereoDetuneCents;
         float stereoSpreadPercent;
+
+        // ---- G3: derived, BLOCK-RATE constants (DESIGN.md §2.2) ----
+        // NOT loaded from atomics -- filled in by finishSnapshot() AFTER
+        // buildSnapshot() returns, from the raw fields above plus fs and
+        // mControlBlock (each read exactly once elsewhere in process(), see
+        // its own comment). Kept OUT of buildSnapshot() specifically so they
+        // do not count against G3.1's "exactly 53 atomic loads" instrumented
+        // figure -- these three (fsControl, the 6 ADSR coefficients x2, the
+        // LFO increment) involve std::log/std::exp (AdsrEnv::coeffForMs),
+        // which is fine here (block rate, R12) but must never run per
+        // control block or per sample.
+        double fsControl = 1.0;
+        double envFAttackCoeff = 0.0, envFDecayCoeff = 0.0, envFReleaseCoeff = 0.0, envFSustainLevel = 0.0;
+        double envAAttackCoeff = 0.0, envADecayCoeff = 0.0, envAReleaseCoeff = 0.0, envASustainLevel = 0.0;
+        double lfoIncrement = 0.0;    ///< cycles/control-step, DESIGN.md §7
+        double lfoDelaySeconds = 0.0;
     };
 
     /// Loads every one of the 53 atomics exactly once (relaxed ordering — a
     /// single scalar with no ordering dependency on other memory, R3/G0.9,
     /// same convention as nassau-zermatt's AmpCore). No clamping is applied
     /// here at G0: clamping arrives with each param's owning gate, alongside
-    /// the derived math that actually needs the clamped value.
+    /// the derived math that actually needs the clamped value. G3: every
+    /// `.load()` call in the .cpp implementation goes through a small
+    /// counting wrapper feeding mDebugAtomicLoadCount (G3.1) -- see the .cpp.
     ParamSnapshot buildSnapshot() const;
+
+    /// G3 (DESIGN.md §2.2): fills in ParamSnapshot's block-rate derived
+    /// fields (ADSR coefficients, LFO increment/delay) from the raw fields
+    /// buildSnapshot() already loaded, plus `fsControl` (fs/mControlBlock,
+    /// itself computed once per host block in process()). No atomic loads
+    /// here (fsControl is passed in, not re-read) — see the field comment
+    /// above for why this is a SEPARATE function from buildSnapshot().
+    static void finishSnapshot(ParamSnapshot& s, double fsControl);
+
+    // ===== G3: minimal, provisional per-voice state =====
+    // Osc/SubOsc/NoiseSource (synth_osc.h, G2) + AdsrEnv x2 (synth_dsp.h, G1)
+    // per voice, driven by the control-rate loop in process().
+    struct Voice {
+        Osc osc1, osc2;
+        SubOsc sub;
+        NoiseSource noise;
+        AdsrEnv envF, envA;    ///< ENV-F (filter, not yet routed anywhere -- G4/G5) / ENV-A (VCA)
+        bool active = false;   ///< sounding (Attack/Decay/Sustain/Release), not Idle
+        int note = -1;
+        double vcaGainStart = 0.0;   ///< interpolation endpoints for THIS control block
+        double vcaGainEnd = 0.0;     ///< (DESIGN.md §2: vcaGain is one of the 3 interpolated scalars)
+        double debugLfoPitchModSemis = 0.0;  ///< test-only readback, G3.10
+    };
+
+    /// Minimal, PROVISIONAL voice count for this gate only. DESIGN.md §10.3's
+    /// real allocator (kMaxVoices=16 + 2 fade-out slots, Idle/oldest-Released/
+    /// oldest-Playing allocation order, click-free stealing, sustain pedal,
+    /// unison/mono voice modes, kPolyphony honoured) is G7's job (docs/
+    /// GATES.md), not G3's -- G3's job is ENV-F/ENV-A/LFO/control-rate wiring.
+    /// 8 fixed slots with a trivial "reuse same note, else first idle, else
+    /// slot 0" policy is enough to prove ENV-A genuinely drives the VCA and
+    /// that the LFO is genuinely global/shared (G3.10) without building G7's
+    /// machinery early (scope discipline, docs/GATES.md's own "G3 only" note
+    /// for this gate). [voicing] chosen only as "comfortably more than the
+    /// 1-2 voices any G3 AC exercises simultaneously".
+    static constexpr int kG3Voices = 8;
+    Voice mVoices[kG3Voices];
+    int mActiveVoiceCount = 0;   ///< DESIGN.md §7: LFO delay retriggers only on 0->1 of this
+    Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
+                                  ///< control block, read by every voice -- never per-voice.
+    double mLastLfoValue = 0.0;  ///< test-only readback of the most recent mLfo.step() result (G3.10)
+
+    static constexpr uint32_t kLfoShSeed = 0x5EED1234u;  // [voicing] fixed S&H seed, R8/R13
+
+    /// Applies a single note-scoped event to the voice array / mLfo (NoteOn/
+    /// NoteOff/AllNotesOff/AllSoundOff). PitchBend/Sustain are no-ops at G3
+    /// (G7's job, DESIGN.md §10.3/§10.6/§7.6) -- accepted (not touched) so
+    /// they do not crash, matching G0.8's existing "every event type, no
+    /// crash" coverage.
+    void applyEvent(const NoteEvent& ev);
+
+    /// The DESIGN.md §2 "control-rate update point": steps both envelopes
+    /// and the LFO one control step, and recomputes each active voice's
+    /// pitch (dt) and pulse width from `snapshot` + the freshly-stepped LFO
+    /// value. Called once per control block boundary crossed by process().
+    void controlRateUpdate(const ParamSnapshot& snapshot, double fs);
+
+    /// [ref] DESIGN.md §3.2: 16'/8'/4'/2' -> 220/440/880/1760 Hz at note 69,
+    /// i.e. -12/0/+12/+24 semitones relative to 8'.
+    static double octaveOffsetSemis(Octave o);
+
+    // ===== G3: pending-event queue (DESIGN.md §10.2) =====
+    // An event whose target control-block boundary is not reached within the
+    // process() call it arrived in (a small host block size can make this
+    // common, e.g. a 1-sample-block host against a 32-sample control block)
+    // must still take effect at that boundary once a LATER process() call
+    // finally reaches it -- but that event's OWN `events` array is only
+    // valid for the call it arrived in (DESIGN.md §10.1). So any such
+    // trailing, not-yet-applied events are copied into this small FIXED
+    // (R3: no allocation) queue at the end of process(), and drained (in
+    // order, before that call's own events) at the very first control-block
+    // boundary a subsequent call reaches. This is what makes G3.3's block-
+    // size invariance hold for EVENT timing, not just for modulation.
+    static constexpr int kMaxPendingEvents = 256;  // [voicing] generous fixed bound, see .cpp
+    NoteEvent mPendingEvents[kMaxPendingEvents];
+    int mPendingCount = 0;
+
+    // ===== G3: test-only instrumentation / debug hooks =====
+    mutable long long mDebugAtomicLoadCount = 0;  ///< G3.1, see buildSnapshot()'s .cpp body
+    bool mDebugForceUnityVca = false;             ///< G3.5, see the public setter's comment
+    bool mDebugDisableVcaInterpolation = false;   ///< G3.5, see the public setter's comment
 
     // ===== Configuration =====
     std::atomic<float> mSampleRate{44100.0f};

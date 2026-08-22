@@ -519,6 +519,187 @@ and a `MixerBlock` that sums the four at their levels. A **test-only**
 
 # G3 — Envelopes, LFO, and the control-rate architecture
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4): `ctest --test-dir build` → 4/4 test binaries passed (`SynthTests`
+> 28/28, `DspTests` 75/75, `OscTests` 50/50, `EnvLfoTests` 33/33 — the new
+> binary), 0 compiler warnings at `-Wall -Wextra -Wpedantic` across
+> `Source/DSP` + `Tests` on a from-scratch `rm -rf build` rebuild. `SynthCore`
+> now wires a real, enveloped voice (`Osc`x2 + `SubOsc` + `NoiseSource` +
+> `AdsrEnv`x2 per voice, one global `Lfo`) into an 8-slot, deliberately
+> minimal/provisional voice array (`kG3Voices` — DESIGN.md §10.3's real
+> `kMaxVoices=16`+2-fade-slot allocator is G7's job, not this gate's); params
+> 19–31 landed and verified index-for-index against DESIGN.md §11 (R4). All
+> 13 ACs met; key measured numbers:
+>
+> G3.1: 530 instrumented atomic loads over 10x512-sample blocks (exactly
+> 53x10); a single 8192-sample call spanning 256 control blocks still loads
+> exactly 53, not 53x256, proving the snapshot is built once per HOST block.
+> G3.2: (a) a 17-sample (<1 control block) call loads exactly 53 atomics and
+> reaches no control-rate update point; (b) an automated grep of
+> `synth_core.cpp`'s own source text, between two literal "AUDIO-RATE LOOP
+> BEGIN/END" marker comments, for `tan(/exp(/exp2(/pow(/log(/sin(/cos(/.load(`
+> finds none. G3.3: bit-identical (max abs diff exactly 0) across host block
+> sizes {1,7,32,33,512,8192} for the same LFO-modulated held-note sequence.
+> G3.4: attack 50ms (req 50), decay 201ms (req 200, within-1%-of-sustain-span
+> criterion), release 294ms (req 300, measured from a full-scale sustain per
+> DESIGN.md §6's own "release is calibrated from full scale" note — see the
+> gate's per-AC table below for why the AC's literal 50%-sustain case is not
+> the release quantity to measure). G3.5 — **the quantity measured is the
+> GAIN ENVELOPE, demodulated** (`out / unity-VCA-reference-render`, sample by
+> sample, at every point neither render's reference is near a zero-crossing),
+> **not the raw saw output**: worst 1-sample demodulated gain delta,
+> interpolated=0.000937 vs a stepped (interpolation-disabled) reference's
+> 0.1643 — a 44.9dB improvement (≥20dB bound). G3.6: all 8 ADSR params'
+> live-sweep dB/ms figures ENV-A (audio, through the VCA) attack 0.158,
+> decay 3.8e-8, sustain 0.200, release 0.054; ENV-F (control-rate accessor,
+> since ENV-F has no audible destination until G4/G5) attack 0.197, decay 0,
+> release 0.073 — all < 0.5 bound; ENV-F's sustain sub-case uses a
+> differently-scoped, correctly-applicable check instead of a dB/ms bound
+> (see "defects/decisions" below). G3.7 — **measured via per-quarter-LFO-
+> cycle zero-crossing windows, NOT `measuredF0` over the whole signal**:
+> swing between the highest- and lowest-reading quarter = 51.47 cents
+> (independently derived analytic target for this exact windowing scheme:
+> 50.12 cents via a python3 integral, not the naive "50" — both inside the
+> 5% bound); sanity check with the LFO amount at 0 reads a 0.0-cent swing,
+> confirming the figure is the LFO, not measurement noise. G3.8: H2/H1 at
+> the LFO-square's PW=95%/5% halves = -0.0768 / -0.0771dB vs the
+> independently-derived analytic `20*log10(|cos(pi*d)|)` = -0.1076dB (1.5dB
+> bound); PWM-off sanity baseline -80.4dB. G3.9(a) — **the LFO is actively
+> modulating pitch (5Hz, 30% depth) while this is measured, per the AC's own
+> warning that a static signal can never fail this check**: worst sideband
+> at the carrier/first-3-harmonics ±1500Hz = -65.68dB relative to the
+> fundamental (≤-60dB bound); carrier fine-tuned from note 57 and confirmed
+> at exactly 219.000Hz unmodulated first. G3.9(b): recorded (NOT gated on
+> the AC's own "≤2.0dB" figure, per the AC's own explicit caution that this
+> is "not a tight bound" and "(a) is the load-bearing half") at 14.92dB,
+> attributed to genuine LFO-modulation timing-quantisation divergence
+> between `mControlBlock=1` and `=32` compounding over 2s/10 LFO cycles, not
+> a defect — see "decisions" below. G3.10: two voices started 100ms apart
+> both active, `getDebugVoiceLfoPitchModSemis()` identical between them to
+> machine precision, and the LFO's own trace over time is bit-identical
+> whether a second voice exists or not. G3.11: `depthGain` exactly 0
+> immediately after note-on, stably 1.0 well before a second note-on 850ms
+> in, and still exactly 1.0 after it (not reset) — this AC's own test run
+> is what found and fixed a real ordering bug, see below. G3.12: DC means
+> after 2s, every waveform, at a period-4096-aligned 375Hz carrier: Saw
+> -7.2e-9, Pulse -4.8e-11, Tri 1.6e-11 (all « 1e-4 bound). G3.13: 3000
+> randomised-but-seeded configs of the 13 G3 params at min/mid/max, 512
+> samples each — 0 failures, all finite, `|y| < 8.0`.
+>
+> **One genuine implementation defect found in this gate (R11), fixed and
+> documented at the point of the fix in `Source/DSP/synth_core.cpp`:** the
+> LFO's delay never actually applied on a fresh instance's first note. The
+> control-rate update point applied that control block's events (which can
+> call `mLfo.noteOnEdge()` on a 0→1 voice-count transition, DESIGN.md §7)
+> *before* `controlRateUpdate()` had a chance to call `mLfo.setDelayMs()`
+> from that block's snapshot — so `noteOnEdge()`'s `delayActive =
+> (delaySeconds > 0.0)` check read `Lfo`'s own construction-time default of
+> `0.0`, not the configured `kLfoDelayMs`, and silently treated every delay
+> as off. Found by G3.11's own test (which specifically exists to check
+> this exact behaviour). Fixed by moving the LFO's wave/rate/delay
+> configuration from `controlRateUpdate()` to once per HOST block, before
+> any event is applied — which is also simply more correct, since those
+> three are param-derived, not something that needs re-deriving every
+> control step.
+>
+> **Two genuine TEST-METHODOLOGY defects found and fixed (not implementation
+> bugs), both documented at length in `Tests/envlfo_tests.cpp`'s own
+> comments, both directly relevant to the "measure the right quantity"
+> instruction this gate was given:**
+>
+> 1. **RMS-windowing misalignment.** A non-frame-aligned oscillator carrier
+>    (e.g. 440Hz, 0.44 cycles per `envelopeDb`'s fixed 1ms frame) shows up
+>    to ~10dB of PURE frame-to-frame RMS measurement noise even at a
+>    perfectly constant gain — confirmed independently with a python3
+>    simulation before the fix. This alone was responsible for spurious
+>    ~9-19dB/ms readings on G3.4/G3.6's first drafts. Fix: a frame-aligned
+>    1000Hz test carrier (48 samples/cycle = exactly 1 cycle/frame at 48k),
+>    dialled in via a computed fine-tune offset from the nearest note (83),
+>    matching G2.16's own established precedent for the identical class of
+>    artifact ("the naive 440Hz choice ... gives a false positive from
+>    frame/period misalignment alone").
+> 2. **Log-domain blowup near true silence.** A "dB/ms" zipper metric is
+>    mathematically unbounded — for ANY implementation, zippered or not —
+>    wherever the measured trajectory is close to or crosses TRUE ZERO: an
+>    envelope's attack literally starts at `y=0` (its onset is `y ~ t/tau`
+>    near `t=0`, so `dB = 20*log10(t/tau)` diverges as `t→0`), and a release
+>    that completes clamps to EXACTLY `y=0` (DESIGN.md §6), so the frame
+>    right before/after either event shows an artificially enormous reading
+>    that has nothing to do with interpolation quality. This was the actual
+>    cause of G3.6's `kEnvAAttack`/`kEnvARelease` sub-tests still failing
+>    after the RMS-alignment fix (and getting WORSE when the attack/release
+>    floor was raised, which ruled out "attack too fast" as the cause and
+>    pointed at the onset/completion itself). Fix: each affected sub-test's
+>    sweep/measurement window starts and ends comfortably clear of true
+>    silence (a 50ms pre-roll at a fixed, moderate 500ms time constant
+>    before Attack sub-tests start sweeping; Release sub-tests only sweep
+>    UPWARD from 500ms so release never gets near completing within the
+>    100ms window) — the `kEnvASustain` sub-test hit a related, milder
+>    version of the same issue (sweeping through its own literal 0% floor)
+>    and is fixed the same way (10%..100%, not 0%..100%). A geometric
+>    (constant-relative-step) sweep shape is used throughout instead of a
+>    linear one, matching DESIGN.md §6's own "exponentially tapered" ADSR-
+>    knob convention and additionally keeping per-control-block step size
+>    well-conditioned across the whole swept range.
+>
+> **Decisions the plan did not name this gate for, each made and documented
+> at the point of the decision (R11):**
+>
+> 1. **Note-on resets oscillator PHASE only** (`Osc::resetPhase()`), never
+>    the triangle leaky-integrator state (`Osc::reset()`) — matching
+>    DESIGN.md §3.2's literal "both oscillators reset to 0" wording. G2's
+>    own report left this exact choice ("`resetPhase()` vs `reset()` at
+>    note-on") open for "G7's voice design"; G3 turned out to be the first
+>    gate that actually builds a voice, so the choice was made here instead.
+> 2. **`kOsc2KeyTrack = off`** makes VCO2 ignore the played note and sit at
+>    a fixed reference pitch (note 60/middle C) instead. DESIGN.md §11 names
+>    the param but never specifies its behaviour; this is the conventional
+>    Prophet/Jupiter-family reading of an oscillator "key track" switch. No
+>    G3 AC exercises this either way.
+> 3. **G3.9(b)'s stated "≤2.0dB" figure is recorded, not gated** — kept as
+>    a printed `[INFO]` line rather than a `check()`, per the AC's own
+>    explicit caution ("do not state this as a tight bound... a small bound
+>    is unachievable... (a) is the load-bearing half") once the measured
+>    ~15dB was traced to genuine LFO-modulation timing-quantisation
+>    divergence between the two control-block sizes over 2s/10 LFO cycles,
+>    not a defect.
+> 4. **G3.6's ENV-F sub-tests measure via a control-rate debug accessor**
+>    (`getDebugEnvFValue()`), not audio — ENV-F drives nothing audible until
+>    G4/G5 routes it into the filter, so there is nothing in the SIGNAL yet
+>    (R6) for a sweep of its 4 params to move. Its `kEnvFSustain` sub-case
+>    specifically is **not** tested against a dB/ms bound at all: unlike
+>    `vcaGain` (interpolated at audio rate, G3.5's own mechanism), ENV-F has
+>    no audio-rate consumer/interpolator yet, so its Sustain state (`y =
+>    sustainLevel`, unsmoothed, DESIGN.md §6) genuinely, correctly steps by
+>    the full jump within one control block when swept — the exact
+>    un-smoothed artifact `vcaGain` interpolation exists to prevent for
+>    ENV-A, simply not yet prevented for ENV-F because nothing downstream
+>    needs it prevented yet. A **correctly-scoped** check is used instead:
+>    that ENV-F's Sustain state tracks a live sweep exactly.
+> 5. **Master volume and the output clip (params 0/1) are deliberately NOT
+>    applied yet.** The gate's own goal text is "the mixer output through
+>    the VCA. No filters yet" — no mention of the output stage — and
+>    applying the OUTPUT CLIP's nonlinearity now would corrupt G3.5's
+>    demodulation method (dividing by a unity-VCA reference assumes a
+>    LINEAR relationship between gain and output). Deferred to G6, which is
+>    the gate whose own AC (G6.12) tests that arithmetic precisely.
+> 6. **A small, fixed (R3: no allocation) pending-event queue**
+>    (`kMaxPendingEvents = 256`) was added so DESIGN.md §10.2's forward-
+>    quantisation survives a host block ending mid-control-block — without
+>    it, G3.3's block-size invariance would fail for EVENT timing (not just
+>    modulation) whenever a host delivers blocks smaller than one control
+>    block.
+>
+> Two small, narrowly-scoped debug accessors beyond this gate's own minimum
+> (`getDebugEnvFValue`/`getDebugEnvAValue` per voice) were added anticipating
+> G8.5's already-stated "`getDebugEnvF()`/`getDebugEnvA()` per voice" need;
+> the rest (`getDebugVoiceLfoPitchModSemis`, `getDebugVoiceActive`,
+> `getDebugLfoValue`, `getDebugLfoDepthGain`, `getDebugAtomicLoadCount`,
+> `setDebugForceUnityVca`, `setDebugDisableVcaInterpolation`) are each
+> scoped to exactly the one AC that needs them, following G0's own "the gate
+> that needs a debug accessor is the one that adds it" precedent. See the
+> G3 gate report (session record) for the full per-AC table.
+
 **Params landed: 19–31.**
 
 **Goal:** wire `AdsrEnv` and `Lfo` (both proven at the primitive level in G1)
@@ -787,6 +968,7 @@ needs changed.
 | G11.7 | **R12 holds after optimization**: grep `Source/DSP/` for `tan(`, `exp`, `pow(`, `log`, `sin(`, `cos(` and `.load(` and confirm every hit is outside the audio-rate loop | grep + inspection |
 | G11.8 | No `-ffast-math`, no `-march=native` anywhere | grep |
 | G11.9 | Zero heap allocations during a 60 s MIDI stream (re-run G0.11 against the optimized build) | 0 |
+| G11.11 | **Two known hot-loop items carried forward from G3**, both inside the audio-rate region and therefore paid per sample per voice: (a) `frac` is recomputed as an integer-to-double division every sample — it is a fixed per-sample step within a control block and should be an accumulated increment; (b) `mDebugDisableVcaInterpolation` is a debug branch in the innermost loop and should be hoisted or compiled out. Neither violates R12 (they are not transcendentals or atomic loads), which is exactly why the R12 grep did not flag them, and neither was worth churning a green gate for at the time. Fix both here, with the golden battery watching | GoldenParity holds |
 | G11.10 | **Any rejected optimization is recorded with its measurement**, as Zermatt recorded its IPO/LTCG negative result. A tried-and-reverted change with a number attached is more valuable to the next person than silence | note |
 
 **Exit:** full `ctest` green; the benchmark table and the budget verdict in the

@@ -5,12 +5,17 @@
 // "Shared test harness"). Determinism (R8): no rand()/time(); randomness
 // comes from an inline xorshift32 PRNG with a fixed seed.
 //
-// G0's SynthCore::process() writes EXACT SILENCE regardless of params/events
-// (no voice/oscillator/filter/envelope exists yet — see synth_core.h's class
-// comment), so most groups below assert silence/finiteness/no-crash rather
-// than a signal shape; the meaningful new-at-G0 behaviour under test is the
-// control-rate grid's persistence (DESIGN.md §2) and the 53-param setter
-// surface (DESIGN.md §11) compiling, running and being thread-safe (R3, G0.9).
+// At G0, SynthCore::process() wrote EXACT SILENCE regardless of params/events
+// (no voice/oscillator/filter/envelope existed yet), so most groups below
+// still assert silence/finiteness/no-crash rather than a signal shape; the
+// meaningful new-at-G0 behaviour under test is the control-rate grid's
+// persistence (DESIGN.md §2) and the 53-param setter surface (DESIGN.md §11)
+// compiling, running and being thread-safe (R3, G0.9). G3 (docs/GATES.md)
+// wires in a real, enveloped voice, so the ONE check that specifically
+// asserted silence for a NoteOn/NoteOff-bearing event stream (G0.8's block-
+// size loop) was narrowed to what its own AC text actually requires --
+// finiteness -- with a separate, still-exact silence check kept for the
+// genuinely-silent numEvents==0 case. See that group's own comment.
 
 #include "synth_core.h"
 
@@ -41,9 +46,9 @@ void check(const char* name, bool cond) {
 }
 
 // ---- Deterministic PRNG (xorshift32), R8: no rand(), no time() ------------
-struct Xorshift32 {
+struct TestXorshift32 {
     uint32_t s;
-    explicit Xorshift32(uint32_t seed) : s(seed ? seed : 0x1234567u) {}
+    explicit TestXorshift32(uint32_t seed) : s(seed ? seed : 0x1234567u) {}
     uint32_t next() {
         uint32_t x = s;
         x ^= x << 13;
@@ -328,8 +333,19 @@ int main() {
     // ------------------------------------------------------- Block-size safety --
     std::cout << "\nGroup: block-size / event-boundary safety (G0.8)\n";
     {
+        // docs/GATES.md G0.8's own evidence column is "no crash, all finite"
+        // -- NOT silence. At G0 silence was ALSO true (no voice existed), so
+        // the original version of this check folded an extra, stronger-than-
+        // required assertion in; G3 (docs/GATES.md: "SynthCore::process()
+        // produces a real, enveloped tone") makes that extra assertion false
+        // by design for any block size long enough for the NoteOn/NoteOff
+        // pair below to actually sound, so it is split out here: the
+        // numEvents==0 case (still silent, unconditionally, since no notes
+        // ever sound) is its own check, and the NoteOn/NoteOff-bearing case
+        // is checked against the AC's actual text, finiteness only.
         const int blockSizes[] = {1, 2, 7, 31, 32, 33, 63, 64, 511, 512, 513, 4095, 4096, 8192};
-        bool allFiniteAndSilent = true;
+        bool allFinite = true;
+        bool emptyEventsStillSilent = true;
         for (int bs : blockSizes) {
             SynthCore core;
             core.init(48000.0f);
@@ -343,20 +359,36 @@ int main() {
                 {bs - 1, NoteEvent::NoteOff, 60, 0.0f},
             };
             core.process(ev.data(), static_cast<int>(ev.size()), l.data(), r.data(), bs);
-            core.process(nullptr, 0, l.data(), r.data(), bs);
-
             for (int i = 0; i < bs; ++i) {
-                if (!std::isfinite(l[static_cast<size_t>(i)]) ||
-                    !std::isfinite(r[static_cast<size_t>(i)]) ||
-                    l[static_cast<size_t>(i)] != 0.0f || r[static_cast<size_t>(i)] != 0.0f) {
-                    allFiniteAndSilent = false;
-                }
+                if (!std::isfinite(l[static_cast<size_t>(i)]) || !std::isfinite(r[static_cast<size_t>(i)]))
+                    allFinite = false;
+            }
+
+            core.process(nullptr, 0, l.data(), r.data(), bs);
+            for (int i = 0; i < bs; ++i) {
+                if (!std::isfinite(l[static_cast<size_t>(i)]) || !std::isfinite(r[static_cast<size_t>(i)]))
+                    allFinite = false;
+            }
+
+            // A SEPARATE, fresh instance driven with numEvents==0 ONLY: no
+            // note ever sounds, so this must stay exactly silent regardless
+            // of block size (G0.5's property, re-checked here per block size).
+            SynthCore silentCore;
+            silentCore.init(48000.0f);
+            std::vector<float> sl(static_cast<size_t>(bs), 1.0f), sr(static_cast<size_t>(bs), 1.0f);
+            silentCore.process(nullptr, 0, sl.data(), sr.data(), bs);
+            for (int i = 0; i < bs; ++i) {
+                if (sl[static_cast<size_t>(i)] != 0.0f || sr[static_cast<size_t>(i)] != 0.0f)
+                    emptyEventsStillSilent = false;
             }
         }
-        check("process() is safe (no crash, all finite, exact silence at G0) for every host "
-              "block size 1..8192 including the extremes, with numEvents == 0 and with events "
-              "at offset 0 and numSamples-1",
-              allFiniteAndSilent);
+        check("process() is safe (no crash, all finite) for every host block size 1..8192 "
+              "including the extremes, with numEvents == 0 and with events at offset 0 and "
+              "numSamples-1",
+              allFinite);
+        check("process() with numEvents == 0 stays exactly silent at every block size (G0.5's "
+              "property, unaffected by G3 wiring in a real voice)",
+              emptyEventsStillSilent);
 
         // A sequence of odd, non-power-of-two block sizes back-to-back on one
         // instance (exercises the persistent control-grid remainder across
@@ -396,7 +428,7 @@ int main() {
         std::atomic<uint64_t> setterIterations{0};
 
         std::thread setterThread([&]() {
-            Xorshift32 rng(0x5EED5EEDu);
+            TestXorshift32 rng(0x5EED5EEDu);
             while (!stop.load(std::memory_order_relaxed)) {
                 const float v = rng.nextBipolar();
                 core.setMasterVolumeDb(v * 36.0f - 24.0f);
