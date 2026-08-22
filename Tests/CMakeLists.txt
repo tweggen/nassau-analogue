@@ -84,7 +84,19 @@ target_compile_options(synth_golden PRIVATE ${NASSAU_WARNING_FLAGS})
 target_compile_definitions(synth_golden PRIVATE
     GOLDEN_FIXTURE_PATH_G5="${SYNTH_GOLDEN_FIXTURE_G5}")
 
-add_test(NAME GoldenParityG5 COMMAND synth_golden verify "${SYNTH_GOLDEN_FIXTURE_G5}")
+add_test(NAME GoldenParityG5 COMMAND synth_golden verify g5 "${SYNTH_GOLDEN_FIXTURE_G5}")
+
+# ---- G11.1/G11.3/G11.3b: the FULL golden battery (>= 24 configs x 6
+# deterministic MIDI sequences, DESIGN.md real defaults, drive/clip/volume
+# covered) -- same synth_golden binary, `g11` battery, its own fixture.
+# GENERATE (docs/GATES.md G11.1): captured from the unmodified post-G8 core,
+# in its own commit, before any G11 optimization work -- `synth_golden
+# generate g11 "<abs path>"`, never invoked by ctest itself.
+set(SYNTH_GOLDEN_FIXTURE_G11 "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/golden.bin")
+target_compile_definitions(synth_golden PRIVATE
+    GOLDEN_FIXTURE_PATH_G11="${SYNTH_GOLDEN_FIXTURE_G11}")
+
+add_test(NAME GoldenParity COMMAND synth_golden verify g11 "${SYNTH_GOLDEN_FIXTURE_G11}")
 
 # ---- G6: HPF, drive, Poly-Mod, output stage, complete voice ---------------
 # Links nassau_synth_core: the HPF's static-response ACs (G6.1/G6.2/G6.3/
@@ -126,3 +138,14 @@ target_include_directories(stereo_tests PRIVATE
 target_compile_options(stereo_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME StereoTests COMMAND stereo_tests)
+
+# ---- G11.4/G11.5/G11.6: throughput benchmark (Tests/synth_bench.cpp) ------
+# Deliberately NOT wired to add_test(): a wall-clock number is load-sensitive
+# and makes a bad pass/fail signal (docs/GATES.md G11's own file-header
+# instruction, mirroring nassau-zermatt/Tests/amp_bench.cpp's identical
+# reasoning). Run manually: build/Tests/synth_bench [totalSamples] [trials].
+add_executable(synth_bench synth_bench.cpp)
+target_link_libraries(synth_bench nassau_synth_core)
+target_include_directories(synth_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(synth_bench PRIVATE ${NASSAU_WARNING_FLAGS})

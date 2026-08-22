@@ -981,12 +981,33 @@ its target, and resets the LFO phase — **without touching any parameter**.
 build, best of 7 — **≥ 10× realtime, i.e. ≤ 10 % of one core.** Stereo mode
 ≤ 2.0× the mono cost. An all-idle instance ≤ 5 % of the 8-active cost.
 
-The 10× is a **floor, deliberately set below the expectation**. A rough op count
-for one voice — 2 PolyBLEP oscillators, a sub, noise, mixer, drive, 4 HP poles,
-a 4-pole ZDF ladder with one division, VCA — is on the order of 100 flops per
-sample, which at this box's clock should land the 8-voice instance somewhere
-near 50–100× realtime. G10 must **record the real number**, not just tick the
-floor. NassauZermatt's G9.5 is the cautionary tale: a target invented before any
+The 10× is a **floor, deliberately set below the expectation**.
+
+**MEASURED (G11, Xeon E5-1650 v3 @ 3.5 GHz, 48 kHz, Release, best of 7):**
+
+| config | ns/sample | ×realtime |
+|---|---|---|
+| idle (0 voices) | 18.3 | 1141× |
+| 1 voice | 81.4 | 256× |
+| **8 voices mono** | **516.5** | **40.3×** |
+| 8 voices stereo | 930.2 | 22.4× |
+| 16 voices unison | 1014.1 | 20.5× |
+
+**The budget is met with a 4× margin**, and it was already met *before* any
+optimization (40.0×), so §12's escape hatches were correctly never used.
+
+**The 50–100× estimate this section used to carry was optimistic by about 2×,
+and is corrected here rather than left standing.** The measured marginal cost is
+**~62 ns per voice per sample** — confirmed linear across the range (62.9 ns
+from idle to 1 voice, 62.2 from 1 to 8, 62.6 from 8 to 16, which is also what
+proves the benchmark is processing real voices rather than skipping them). At
+3.5 GHz that is ~218 cycles per voice per sample, against an op-count guess of
+~100 flops. The gap is everything an op count omits: three DC blockers, four HPF
+poles, four ladder poles plus a division, the unpredictable branches inside
+PolyBLEP, the slope-structure branch, and the per-sample lerps. Op counts
+under-predict real DSP cost by roughly this factor as a rule; the floor was set
+low precisely because the estimate could not be trusted, and that judgement was
+correct. NassauZermatt's G9.5 is the cautionary tale: a target invented before any
 code existed (50× realtime) was missed by 18 %, and the honest thing turned out
 to be recording the shortfall rather than moving the target. Setting a floor
 that is defensible from an op count, and recording the actual, avoids repeating

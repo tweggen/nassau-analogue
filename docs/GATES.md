@@ -1664,6 +1664,187 @@ needs changed.
 
 # G11 — Golden parity, optimization, benchmark, CPU budget
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4, Intel Xeon E5-1650 v3 @ 3.50 GHz), a from-scratch `rm -rf build`
+> rebuild: `ctest --test-dir build` → **10/10 test binaries passed**
+> (`SynthTests` 28/28, `DspTests` 75/75, `OscTests` 50/50, `EnvLfoTests`
+> 34/34, `FilterTests` 58/58, `GoldenParityG5`, `GoldenParity` — the new
+> binary, `VoiceTests` 31/31, `AllocTests` 59/59, `StereoTests` 29/29), 0
+> compiler warnings at `-Wall -Wextra -Wpedantic` across `Source/DSP` +
+> `Tests`.
+>
+> **G0.4/G11 scope note:** G9 (plugin wrapper) and G10 (UI) remain
+> deliberately deferred — both need a Windows or macOS host with the
+> `nassau-plugin-sdk` submodules provisioned (DESIGN.md §0.4), which this box
+> is not. Neither gate touches `Source/DSP/`, so "the unmodified post-G10
+> core" (G11.1) is, in substance, the unmodified post-G8 core — the same core
+> `GoldenParityG5` has been checking since G6.16 and every G7/G8 AC above
+> already exercised end to end.
+>
+> **Order of work (G11.1, honoured literally).** The full 30-config × 6-
+> sequence battery below was captured into `Tests/fixtures/golden.bin` FIRST,
+> from the completely unmodified `Source/DSP/` tree (confirmed via `git diff`
+> before generating: zero pending changes to `Source/DSP/`), and the
+> pre-optimization benchmark table was taken against that same unmodified
+> tree. Only then did the two G11.11 optimizations land, each verified
+> against `GoldenParity` before moving to the next.
+>
+> **The battery (G11.3/G11.3b).** `Tests/synth_golden.cpp` gained a second,
+> independent battery selected by an explicit CLI argument (`g5` / `g11` —
+> never a silently-reinterpreted case count, matching
+> `nassau-zermatt/Tests/amp_golden.cpp`'s own precedent): **30 param configs
+> × 6 deterministic MIDI-event sequences = 180 (config, sequence) pairs**,
+> 2 448 000 float values, `Tests/fixtures/golden.bin` (9.8 MB). `g5`
+> (`golden_g5.bin`, `GoldenParityG5`) is **completely untouched** — same
+> struct, same cases, same fixture bytes, still isolating
+> `masterVolumeDb=0dB`/`outputClip=off`/`drivePercent=0%` to answer exactly
+> the pre-G6 question it was captured for. `g11`'s own params
+> (`G11Params`) use DESIGN.md §11's REAL default column throughout
+> (`masterVolumeDb=-6dB`, `outputClip=on`, `drivePercent=15%`) precisely so
+> G11.3b's coverage gap — drive/clip/volume previously guarded only by unit
+> ACs — closes for real. Coverage (each axis's value named in at least one
+> case, full list in the file's own header comment): both LPF slopes; both
+> HPF slopes plus the bypass (including bypass under the NON-default slope,
+> `hpf_bypass_db24_slope_48k`, proving the bypass is a raw-cutoff check
+> independent of slope); all 3 oscillator waves; sync on/off; both noise
+> colours; mono/stereo (incl. spread=100%/detune=25 extreme); all 3 voice
+> modes; polyphony 4 (paired with an 8-note overlap sequence to force real
+> stealing) and 16; drive 0/50/100%; `kOutputClip` off and on-and-actually-
+> clipping (+6 dB master, 60% drive); three distinct nonzero master volumes
+> (-6 default, +12, -24). The 6 sequences (`Sustain1`, `AttackRelease`,
+> `Chord3`, `Overlap`, `PitchBendSweep`, `SustainPedal`) are the note-event
+> analogue of `amp_golden.cpp`'s `testSignal()` — a shared library crossed
+> against every config, each sequence's offsets expressed as integer
+> fractions of that config's own `totalSamples` so the same shape scales to
+> any case's duration/sample rate. **Determinism verified**: two independent
+> `generate g11` runs on the same unmodified tree are byte-for-byte
+> identical (`cmp` — R8/R13).
+>
+> **`GoldenParity` held at the tightest possible tolerance through every
+> optimization — not merely inside the 1e-6 AC, but exactly `0.000e+00`
+> max abs error, both batteries, checked after (a) the `frac` fix alone and
+> again after (a)+(b) together.** Re-verified after the final clean rebuild
+> too. Both G11.11 fixes are therefore proven bit-exact refactors, not
+> merely "close enough" ones.
+>
+> **G11.11, the two carried-forward hot-loop items, fixed with the golden
+> battery watching:**
+>
+> **(a) `frac`** was recomputed every sample as a fresh `int → double`
+> division (`(mControlPhase+i) / blockSizeForFrac`), even though it only
+> ever advances by the same fixed step within a control block. Replaced with
+> one division per control-block CHUNK (`frac = mControlPhase /
+> blockSizeForFrac`) plus a per-sample accumulate (`frac += fracStep`) —
+> algebraically the same sequence of values, verified bit-exact by
+> `GoldenParity` (double-precision accumulation error over at most 32 adds
+> is ~1e-15, far under the 1e-6 tolerance and, empirically, not even visible
+> at `0.000e+00`).
+>
+> **(b) `mDebugDisableVcaInterpolation`** was a per-VOICE, per-SAMPLE
+> ternary inside the audio-rate loop (`gain = flag ? vcaGainEnd :
+> lerp(...)`) gating a test-only debug flag that cannot change mid-
+> `process()` call (its own setter's doc comment already said so). Hoisted
+> to the ONE place `vcaGainStart`/`vcaGainEnd` are set per control block
+> (`controlRateUpdate()`): when the flag is set, `vcaGainStart` is forced
+> equal to `vcaGainEnd`, which makes the (now unconditional) lerp
+> `vcaGainStart + (vcaGainEnd-vcaGainStart)*frac` collapse to `vcaGainEnd +
+> 0.0*frac == vcaGainEnd` bit-exactly (IEEE-754: a zero product and a zero
+> addend are both exact) — "held for the whole control block", with no
+> branch left in the audio-rate loop. The audio-rate-loop marker region was
+> re-grepped after both edits (G11.7 — see below): clean.
+>
+> **Benchmark (`Tests/synth_bench.cpp`, deliberately NOT a ctest — a
+> wall-clock number is load-sensitive, same reasoning
+> `nassau-zermatt/Tests/amp_bench.cpp` records). fs=48kHz, block=512,
+> 4 194 304 samples/trial, best of 7. Every "N voices" figure is
+> `getDebugActiveVoiceCount()`-checked post-warm-up to confirm it means N
+> voices ACTUALLY SOUNDING (nonzero ENV-A/ENV-F sustain, no note-off ever
+> sent in the timed region), not N allocated with some silently skipped —
+> the run printed zero MISMATCH lines, i.e. every measured voice count
+> matched its config's name exactly:**
+>
+> | Config | Before (pristine core) | After (both G11.11 fixes) | Δ |
+> |---|---|---|---|
+> | idle (0 voices) | 18.461 ns/sample · 1128.5× | 18.257 ns/sample · 1141.1× | −1.1% |
+> | 1 voice | 82.353 ns/sample · 253.0× | 81.449 ns/sample · 255.8× | −1.1% |
+> | **8 voices, mono** | **521.102 ns/sample · 40.0×** | **516.458 ns/sample · 40.3×** | **−0.9%** |
+> | 8 voices, stereo | 944.287 ns/sample · 22.1× | 930.172 ns/sample · 22.4× | −1.5% |
+> | 16 voices, unison | 1024.589 ns/sample · 20.3× | 1014.115 ns/sample · 20.5× | −1.0% |
+>
+> Isolating the two fixes (a) alone vs (a)+(b) together, run repeatedly: the
+> 8-voice-mono figure clusters at **515.7–516.5 ns/sample** whether (b) is
+> applied on top of (a) or not — (a) (the division→accumulate change)
+> accounts for effectively all of the measured ~1% gain in this config;
+> (b)'s own marginal contribution sits inside the ~0.3–1 ns/sample run-to-
+> run noise floor observed across repeated best-of-7 runs of the identical
+> binary. (b) is kept anyway: it removes a real per-sample-per-voice branch
+> (a correctness/maintainability win independent of its measured cost, and
+> the more voices are active the more times that branch would have been
+> taken), and it is proven bit-exact by `GoldenParity`, so keeping it costs
+> nothing.
+>
+> **Budget verdict (G11.5): 8 voices sounding, mono, 48 kHz, Release, best
+> of 7 → 40.3× realtime, clearing the ≥10× floor with a 4.0× margin. PASS
+> — and it already cleared the floor (40.0×) BEFORE any G11.11 optimization,
+> which is why no further optimization was attempted:** DESIGN.md §12's own
+> escalating escape hatches (`fastTan`/`fastExp2`, widening `kControlBlock`,
+> SIMD-over-voices) are explicitly gated on "only after profiling shows [the
+> floor] is missed" — pursuing them here would have been exactly the
+> unforced, unnecessary risk `nassau-zermatt`'s own G6 SIMD revert is cited
+> as the cautionary tale against. **Honest finding (R11), not a shortfall
+> against any AC**: 40.3× sits below DESIGN.md §12's own informal
+> "50–100×" op-count expectation — recorded here as the actual number, per
+> that section's own instruction, without moving the (10×) target the AC
+> actually sets. No optimization was tried and rejected: none beyond
+> G11.11's two mandatory items was warranted, so there is nothing else to
+> record under G11.10.
+>
+> **G11.6 (idle ≤ 5% of 8-voice-active cost): 18.257 / 516.458 = 3.5%.
+> PASS**, [PERF-7]'s silent-voice skip confirmed real, not just claimed —
+> every one of the other 15 physical + 2 fade slots is skipped entirely
+> (`continue`) in the audio-rate loop while idle.
+>
+> **Stereo cost (DESIGN.md §9/§12, ≤ 2.0× mono): 930.172 / 516.458 = 1.80×.
+> PASS**, matching G8.8's own measured 1.78–1.81× (unperturbed by this
+> gate's changes, as expected — neither G11.11 fix touches chain-specific
+> code).
+>
+> **G11.7 (R12 holds after optimization).** `grep`'d the AUDIO-RATE LOOP
+> BEGIN/END region of `synth_core.cpp` for `tan(|exp|pow(|log|sin(|cos(|
+> .load(` after both edits: **zero matches** (the one textual hit inside
+> that region is inside the marker comment's own prose, listing the
+> forbidden tokens — not code). The wider `Source/DSP/`-tree grep (50 total
+> hits across `synth_core.{h,cpp}`, `synth_dsp.h`, `synth_osc.h`,
+> `synth_filter.h`) was inspected in full: every hit sits in a
+> `buildSnapshot()`/`finishSnapshot()`/`controlRateUpdate()`/coefficient-
+> setter context (block- or control-rate, R12-legal), none inside a
+> `process()`-per-sample body — unchanged from G3.2/G4.11's own already-
+> passing grep tests, since neither G11.11 fix touched those files.
+>
+> **G11.8 (no `-ffast-math`/`-march=native`)**: grepped `CMakeLists.txt`
+> (root, `Source/DSP/`, `Tests/`) and every `Source/`/`Tests/` file — zero
+> occurrences of either flag anywhere; the only text matches are comments
+> explaining their absence.
+>
+> **G11.9 (zero heap allocations, optimized build)**: `SynthTests`' G0.11
+> check (10 s / 937 blocks of a busy 6-event-type stream) and `StereoTests`'
+> analogous stereo-mode check (5 s / 468 blocks, 16-voice poly) both re-ran
+> against this gate's fully-optimized build and both still measure a
+> `new`/`delete` delta of exactly **0**. (Note: this gate's own text says "a
+> 60 s MIDI stream"; the actual G0.11 AC this gate re-runs, per its own
+> parenthetical "re-run G0.11 against the optimized build", is defined in
+> `docs/GATES.md` line 254 as a 10 s stream — a minor wording mismatch
+> between this gate's summary and G0.11's own frozen definition, not a
+> defect in either AC. Re-running the existing 10 s check, as the
+> parenthetical literally directs, is what was done; rewriting G0.11 itself
+> to 60 s would be altering an already-accepted AC from an earlier gate,
+> which is out of this gate's scope.)
+>
+> **New fixtures/binaries**: `Tests/fixtures/golden.bin` (9.8 MB, checked
+> in), ctest `GoldenParity`, `Tests/synth_bench.cpp` (built, not wired to
+> `add_test`). `Tests/fixtures/golden_g5.bin` and ctest `GoldenParityG5` are
+> byte-for-byte and behaviourally unchanged.
+
 **Goal:** freeze the sound, then make it fast without changing it.
 
 ### Deliverables

@@ -20,10 +20,15 @@ sustain-pedal state, stereo duplication — lives in the core, behind a
 framework-free `NoteEvent` interface. It builds and is unit-tested standalone,
 with no SDK present.
 
-> **Status: G0 done** (scaffold, build, test harness, `SynthCore`'s complete
-> 53-param API declared — silent, no DSP yet). Twelve gates (G0–G11) are
-> specified in [`docs/GATES.md`](docs/GATES.md), each with objectively
-> measurable acceptance criteria; see that file for the per-gate status.
+> **Status: G0–G8 and G11 done** (every gate this Linux box can execute
+> without the plugin SDK, DESIGN.md §0.4) — full signal chain, voice
+> allocation, MIDI, stereo, the golden battery, and the CPU budget are all
+> proven by `ctest`. **G9 (plugin wrapper) and G10 (UI) remain deferred**,
+> needing a Windows or macOS host with `nassau-plugin-sdk`'s submodules
+> provisioned; neither touches `Source/DSP/`, so the DSP core itself is
+> final. Twelve gates (G0–G11) are specified in
+> [`docs/GATES.md`](docs/GATES.md), each with objectively measurable
+> acceptance criteria; see that file for the per-gate status.
 >
 > The plan went through one independent review pass before any code was written.
 > It found nine defects that a correct implementation would have failed —
@@ -58,6 +63,40 @@ The headline consequences:
 
 The budget the plan holds itself to: **8 voices, mono, 48 kHz, ≥ 10× realtime
 (≤ 10 % of one core)**, stereo mode ≤ 2.0× that.
+
+## Performance (measured, G11)
+
+Linux dev box (g++ 15.3.0, Release, Intel Xeon E5-1650 v3 @ 3.50 GHz),
+`Tests/synth_bench.cpp`, fs = 48 kHz, block = 512, best of 7. Every "N voices"
+row is checked against `getDebugActiveVoiceCount()` post-warm-up, so it means
+N voices *actually sounding* (nonzero sustain, never note-off'd during the
+timed region), not N allocated with some silently skipped by the
+silent-voice-skip path ([PERF-7]):
+
+| Config | ns/sample | ×realtime@48k |
+|---|---|---|
+| idle (0 voices) | 18.257 | 1141.1× |
+| 1 voice | 81.449 | 255.8× |
+| **8 voices, mono** | **516.458** | **40.3×** |
+| 8 voices, stereo | 930.172 | 22.4× |
+| 16 voices, unison | 1014.115 | 20.5× |
+
+**Budget verdict: 8 voices mono clears the ≥10× floor at 40.3× realtime — a
+4.0× margin** (and already cleared it, at 40.0×, before either G11.11
+optimization below — see `docs/GATES.md`'s G11 status note for why no further
+optimization, e.g. SIMD-over-voices, was attempted). Idle costs **3.5%** of
+the 8-voice-active cost (bound ≤ 5 %, [PERF-7] confirmed real). Stereo costs
+**1.80×** mono (bound ≤ 2.0×).
+
+Two hot-loop items were found and fixed with the golden battery watching
+(`Tests/fixtures/golden.bin`, `GoldenParity`, held at **exactly `0.000e+00`**
+max abs error throughout, not merely inside the 1e-6 tolerance): `frac`'s
+per-sample division replaced with a per-chunk division plus an accumulated
+step, and a per-sample-per-voice debug-only branch
+(`mDebugDisableVcaInterpolation`) hoisted out of the audio-rate loop entirely.
+Combined effect: **≈1%** across every voice-loaded config — modest, because
+the budget was never actually tight; see `docs/GATES.md`'s G11 status note
+for the full before/after table and the per-optimization breakdown.
 
 ## Dependencies
 

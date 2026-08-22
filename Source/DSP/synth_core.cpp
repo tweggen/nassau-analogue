@@ -288,6 +288,21 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
         const int chunk = std::min(samplesToBoundary, samplesRemaining);
         const int blockSizeForFrac = std::max(1, mControlBlock);
 
+        // G11.11(a): `frac` (posInBlock/blockSizeForFrac) is a FIXED per-
+        // sample step within a control block -- it was previously
+        // recomputed as a fresh integer->double DIVISION every sample
+        // (`posInBlock / blockSizeForFrac`), even though posInBlock only
+        // ever increases by exactly 1 between samples. One division per
+        // CHUNK (not per sample) plus a per-sample ADD produces the
+        // identical sequence of values: frac(i) = mControlPhase/block +
+        // i*(1/block) is exactly what the division form computed, just
+        // accumulated instead of re-divided (both are plain IEEE-754
+        // double arithmetic, R12-legal either way -- this was never a
+        // TRANSCENDENTAL, which is exactly why the R12 grep never flagged
+        // it, docs/GATES.md G11.11).
+        const double fracStep = 1.0 / static_cast<double>(blockSizeForFrac);
+        double frac = static_cast<double>(mControlPhase) / static_cast<double>(blockSizeForFrac);
+
         // ---- AUDIO-RATE LOOP BEGIN (R12/R3: no transcendentals, no atomic
         // loads anywhere between this marker and AUDIO-RATE LOOP END --
         // G3.2's grep-based inspection test (Tests/envlfo_tests.cpp) checks
@@ -296,8 +311,6 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
         // sin/cos/.load(). The three DESIGN.md §2 interpolated scalars
         // (gLpf, gHpf, vcaGain) are a lerp -- add/sub/mul/div only. ----
         for (int i = 0; i < chunk; ++i) {
-            const int posInBlock = mControlPhase + i;
-            const double frac = static_cast<double>(posInBlock) / static_cast<double>(blockSizeForFrac);
 
             // G5 (DESIGN.md §5.1's 20ms slope crossfade): this SAMPLE's
             // crossfade mix position, shared by every voice (the crossfade
@@ -356,9 +369,13 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 // SHARED across chains ([PERF-5], ENV-A is one Voice-level
                 // field, not per-chain) -- computed ONCE per sample here,
                 // used identically by every chain's contribution below.
-                const double gain = mDebugDisableVcaInterpolation
-                                         ? v.vcaGainEnd
-                                         : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
+                // G11.11(b): the mDebugDisableVcaInterpolation branch that
+                // used to live here is gone -- controlRateUpdate() now
+                // forces vcaGainStart==vcaGainEnd for that whole control
+                // block when the flag is set, so this single lerp already
+                // produces the "held" value bit-exactly (see that call
+                // site's own comment).
+                const double gain = v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
 
                 // G8: this voice's per-CHANNEL contribution this sample,
                 // panned per DESIGN.md §9's linear law (snapshot.panGainL0/
@@ -584,6 +601,11 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
             }
             outL[n + i] = static_cast<float>(outSampleL);
             outR[n + i] = static_cast<float>(outSampleR);
+
+            // G11.11(a): accumulate `frac` for the NEXT sample instead of
+            // re-dividing (see the fracStep comment above this loop) -- a
+            // plain add, R12-legal.
+            frac += fracStep;
         }
         // ---- AUDIO-RATE LOOP END ----
 
@@ -1261,6 +1283,24 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // comment) -- x*1.0 is a bit-exact IEEE-754 identity, so this does
         // not perturb any existing vel==1.0f test/golden case.
         v.vcaGainEnd = mDebugForceUnityVca ? 1.0 : (v.envA.y * v.velVcaGain);  // G3.5: unity-gain reference render
+
+        // G11.11(b): `mDebugDisableVcaInterpolation` (G3.5) used to be a
+        // per-VOICE, per-SAMPLE branch inside the audio-rate loop ("hold
+        // vcaGainEnd for the whole control block instead of interpolating").
+        // The flag is a plain (non-atomic) member that cannot change mid-
+        // process() call (its own setter's doc comment: "not safe to call
+        // concurrently with process()"), so branching on it once per sample
+        // per voice was pure overhead -- exactly the kind of thing R12 does
+        // NOT catch (it is neither a transcendental nor an atomic load,
+        // docs/GATES.md G11.11's own note). Hoisted out to HERE, the one
+        // place vcaGainStart/vcaGainEnd are set per control block: forcing
+        // vcaGainStart equal to vcaGainEnd makes the audio-rate lerp
+        // `vcaGainStart + (vcaGainEnd-vcaGainStart)*frac` collapse to
+        // `vcaGainEnd + 0.0*frac == vcaGainEnd` bit-exactly (IEEE-754: a
+        // zero product and a zero addend are both exact) for every sample of
+        // this control block -- precisely "hold vcaGainEnd for the whole
+        // control block", with no branch left in the audio-rate loop at all.
+        if (mDebugDisableVcaInterpolation) v.vcaGainStart = v.vcaGainEnd;
 
         // G7/DESIGN.md §10.7 [PERF-7]: fold this control block's
         // accumulated peak into `peakPrevBlock` (the quantity the AC names,
