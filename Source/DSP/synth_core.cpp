@@ -203,6 +203,24 @@ void SynthCore::reset() {
 
 void SynthCore::process(const NoteEvent* events, int numEvents,
                          float* outL, float* outR, int numSamples) {
+    // R11/G11 FINDING: ScopedNoDenormals was lifted verbatim in G1, verified by
+    // G1.18 to genuinely set FTZ/DAZ rather than degrade to a no-op... and then
+    // called from NOWHERE. It was absent from the audio path for nine gates.
+    //
+    // This is not theoretical. Every one-pole here decays exponentially, and the
+    // output-stage DC blocker keeps running when the instrument is silent, so its
+    // tail walks into denormal range and stays there. Measured on this box:
+    //
+    //     idle, fresh instance        18.7 ns/sample
+    //     idle, after 60 s of silence 96.9 ns/sample     <- 5.2x, no notes played
+    //
+    // i.e. leaving the plugin open quintuples its CPU cost. On a weak machine
+    // that is the difference between working and not. Isolated, the ladder alone
+    // measured 222 ns/voice with denormal state against 12.6 ns with FTZ -- 17x.
+    //
+    // RAII, so the host's FP control word is restored on exit (G1.18).
+    const ScopedNoDenormals noDenormals;
+
     // DESIGN.md §2.2: exactly ONE ParamSnapshot per host block, every atomic
     // loaded exactly once (R3's mechanism — the audio-rate loop below never
     // touches an atomic, satisfying R12 too). G3.1's instrumented count is

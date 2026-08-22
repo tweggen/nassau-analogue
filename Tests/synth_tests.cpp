@@ -341,6 +341,65 @@ int main() {
               used.getDebugControlPhase() == fresh.getDebugControlPhase());
     }
 
+    // -------------------------------------------- Denormal protection (G11.12) --
+    // R11/G11 FINDING: ScopedNoDenormals existed from G1 and was called from
+    // NOWHERE for nine gates. Every one-pole here decays exponentially and the
+    // output DC blocker keeps running while the instrument is silent, so its
+    // tail reaches denormal range and every later sample pays the penalty.
+    // Measured before the fix: idle cost 18.7 -> 96.9 ns/sample after 60 s of
+    // silence, with no notes played at all.
+    //
+    // QUANTITY MEASURED: wall-clock cost of processing silence on a FRESH core
+    // vs the SAME core after its one-pole tails have had time to go denormal.
+    // A ratio, not an absolute -- absolute timings are load-sensitive (which is
+    // why the benchmark is not a ctest), but a 5x self-relative blow-up is not
+    // something machine load produces. Bound is deliberately loose (2.5x) so
+    // this fails only on a real denormal stall, not on scheduling noise.
+    std::cout << "\nGroup: denormal protection in the audio path (G11.12)\n";
+    {
+        const int blk = 512;
+        std::vector<float> l(blk), r(blk);
+        auto costOf = [&](SynthCore& c) {
+            double best = 1e30;
+            volatile double sink = 0;
+            for (int rep = 0; rep < 5; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                double a = 0;
+                for (int i = 0; i < 400; ++i) { c.process(nullptr, 0, l.data(), r.data(), blk); a += l[0]; }
+                const auto t1 = std::chrono::steady_clock::now();
+                sink += a;
+                const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / (400.0 * blk);
+                if (ns < best) best = ns;
+            }
+            (void) sink;
+            return best;
+        };
+
+        SynthCore fresh;
+        fresh.init(48000.0f);
+        const double costFresh = costOf(fresh);
+
+        SynthCore aged;
+        aged.init(48000.0f);
+        NoteEvent on{0, NoteEvent::NoteOn, 60, 1.0f};
+        NoteEvent off{0, NoteEvent::NoteOff, 60, 0.0f};
+        aged.process(&on, 1, l.data(), r.data(), blk);
+        for (int i = 0; i < 200; ++i) aged.process(nullptr, 0, l.data(), r.data(), blk);
+        aged.process(&off, 1, l.data(), r.data(), blk);
+        // 60 s of silence: long enough for a 5 Hz one-pole's tail to reach
+        // denormal range from a musical starting amplitude.
+        const int silentBlocks = static_cast<int>(60.0 * 48000.0 / blk);
+        for (int i = 0; i < silentBlocks; ++i) aged.process(nullptr, 0, l.data(), r.data(), blk);
+        const double costAged = costOf(aged);
+
+        const double ratio = costAged / costFresh;
+        std::cout << "    fresh " << costFresh << " ns/sample, after 60 s silence "
+                  << costAged << " ns/sample, ratio " << ratio << "\n";
+        check("G11.12: idle cost after 60 s of silence stays within 2.5x of a fresh core "
+              "(without ScopedNoDenormals in process() this measured 5.2x)",
+              ratio < 2.5);
+    }
+
     // ------------------------------------------------------- Block-size safety --
     std::cout << "\nGroup: block-size / event-boundary safety (G0.8)\n";
     {
