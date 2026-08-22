@@ -763,18 +763,59 @@ int main() {
       return true;
     };
 
-    const std::string ladderPerSample = regionBetween("PER-SAMPLE PROCESS BEGIN", "PER-SAMPLE PROCESS END");
+    // Strip // comments before scanning. Without this the check is hostage to
+    // its own documentation -- any explanatory comment containing a slash (or
+    // the "//" that starts it) reads as a division. G11 hit exactly that.
+    auto stripComments = [](const std::string& in) {
+      std::string out;
+      size_t i = 0;
+      while (i < in.size()) {
+        if (in[i] == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+          while (i < in.size() && in[i] != '\n') ++i;
+        } else {
+          out += in[i++];
+        }
+      }
+      return out;
+    };
+
+    const std::string ladderPerSample =
+        stripComments(regionBetween("PER-SAMPLE PROCESS BEGIN", "PER-SAMPLE PROCESS END"));
     check("G4.11: found LadderFilter's PER-SAMPLE PROCESS BEGIN/END markers", !ladderPerSample.empty());
-    check("G4.11: LadderFilter::process()'s own source text contains no '/' and no transcendental/atomic call",
+    check("G4.11: LadderFilter::process()'s own arithmetic contains no '/' and no transcendental/atomic call",
           isClean(ladderPerSample));
+
+    // R11 FINDING (G11): this grep is NECESSARY BUT NOT SUFFICIENT, and the
+    // AC's original wording ("the per-sample loop contains no division") was
+    // simply false. It scans literal characters, so it cannot see a division
+    // inside a CALLEE -- and LadderFilter::process() calls shapeTriodeK,
+    // which is `x / (1 + k*fabs(x))`. There has been exactly one division per
+    // sample in this filter since G4, and this check passed the whole time.
+    //
+    // It is not removable: it is the feedback saturator that bounds
+    // self-oscillation (DESIGN §5.2), and replacing it with an
+    // rcp+Newton reciprocal measured 31.91 vs 20.97 ns/sample -- 52% SLOWER,
+    // because three Newton steps cost more than one divsd. Recorded under
+    // G11.10. So the honest statement is: one intrinsic division, in the
+    // saturator, by design. Assert exactly that, so the count cannot grow
+    // silently.
+    {
+      size_t calls = 0, from = 0;
+      while ((from = ladderPerSample.find("shapeTriodeK", from)) != std::string::npos) { ++calls; from += 12; }
+      check("G4.11: LadderFilter::process() makes EXACTLY ONE shapeTriodeK call -- the single "
+            "intrinsic division per sample (DESIGN §5.2's feedback saturator), not zero as the "
+            "AC originally claimed",
+            calls == 1);
+    }
 
     // The SVF's own region is the SECOND occurrence of the same marker
     // pair -- find it by searching past the ladder's END marker.
     const size_t afterLadderEnd = src.find("PER-SAMPLE PROCESS END");
-    const std::string svfPerSample = (afterLadderEnd == std::string::npos)
-                                          ? std::string()
-                                          : regionBetween("PER-SAMPLE PROCESS BEGIN", "PER-SAMPLE PROCESS END",
-                                                           afterLadderEnd + 1);
+    const std::string svfPerSample =
+        (afterLadderEnd == std::string::npos)
+             ? std::string()
+             : stripComments(regionBetween("PER-SAMPLE PROCESS BEGIN", "PER-SAMPLE PROCESS END",
+                                            afterLadderEnd + 1));
     check("G4.11: found SvfFilter's own (second) PER-SAMPLE PROCESS BEGIN/END markers", !svfPerSample.empty());
     check("G4.11: SvfFilter::process()'s own source text contains no '/' and no transcendental/atomic call",
           isClean(svfPerSample));

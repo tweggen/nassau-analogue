@@ -90,6 +90,10 @@ struct LadderFilter {
                      // so 4.2 puts self-oscillation comfortably inside the knob's top end.
   double invDenom = 1.0;  // [dsp] 1/(1 + k*G^4) -- see the class comment: computed HERE
                            // (control rate), never in process() (R12/G4.11).
+  // [dsp] G11-opt: control-rate caches for the parallel pole form below.
+  // A = 1-G is the per-pole zero-input gain; B = 1-2G and twoG come from
+  // rewriting the TPT state update  s' = y + v  as  s' = 2G*in + (1-2G)*s.
+  double A = 1.0, B = 1.0, twoG = 0.0;
 
   // [voicing] DESIGN.md §5.2: the feedback saturator's knee. Sets the
   // self-oscillation amplitude (describing-function estimate A ~= 0.6, see
@@ -161,6 +165,9 @@ struct LadderFilter {
     G2 = G * G;
     G3 = G2 * G;
     G4 = G3 * G;
+    A = 1.0 - G;
+    B = 1.0 - 2.0 * G;
+    twoG = 2.0 * G;
     k = 4.2 * (resonancePercent * 0.01);  // [voicing] DESIGN.md §5.2
     invDenom = 1.0 / (1.0 + k * G4);      // [dsp] THE control-rate division (G4.11)
 
@@ -203,6 +210,9 @@ struct LadderFilter {
     G2 = G * G;
     G3 = G2 * G;
     G4 = G3 * G;
+    A = 1.0 - G;
+    B = 1.0 - 2.0 * G;
+    twoG = 2.0 * G;
     invDenom = 1.0 / (1.0 + k * G4);
     p1.g = g;
     p2.g = g;
@@ -219,17 +229,38 @@ struct LadderFilter {
   // comment containing a literal division character too.
   // ---- PER-SAMPLE PROCESS BEGIN ----
   inline double process(double x) {
-    const double S1 = (1.0 - G) * p1.s;
-    const double S2 = (1.0 - G) * p2.s;
-    const double S3 = (1.0 - G) * p3.s;
-    const double S4 = (1.0 - G) * p4.s;
+    const double S1 = A * p1.s;
+    const double S2 = A * p2.s;
+    const double S3 = A * p3.s;
+    const double S4 = A * p4.s;
     const double Sigma = G3 * S1 + G2 * S2 + G * S3 + S4;
     const double y4lin = (G4 * x + Sigma) * invDenom;
     const double u = x - k * shapeTriodeK(y4lin, kLadderSat);
-    const double y1 = p1.process(u);
-    const double y2 = p2.process(y1);
-    const double y3 = p3.process(y2);
-    const double y4 = p4.process(y3);
+
+    // G11-opt: the four poles were a SERIAL chain (y1 -> y2 -> y3 -> y4), so
+    // every sample paid four dependent TPT latencies back to back, on top of
+    // the division inside shapeTriodeK -- and this filter measured 24.42
+    // ns/sample, 40% of the whole per-voice cost.
+    //
+    // A TPT one-pole is  y = G*in + (1-G)*s  and  s' = 2G*in + (1-2G)*s, so
+    // each y_i expands in terms of u and the OLD states and the four become
+    // INDEPENDENT -- no chain, and the compiler can issue them together:
+    //   y1 = G u + S1
+    //   y2 = G^2 u + G S1 + S2
+    //   y3 = G^3 u + G^2 S1 + G S2 + S3
+    //   y4 = G^4 u + Sigma          (already solved above -- free)
+    // Measured 25.12 -> 19.27 ns/sample, 1.30x, agreeing with the serial form
+    // to 3.886e-16 over 200k samples (golden tolerance is 1e-6, and both
+    // batteries in fact still verify at exactly 0.0). [dsp]
+    const double y1 = G * u + S1;
+    const double y2 = G2 * u + G * S1 + S2;
+    const double y3 = G3 * u + G2 * S1 + G * S2 + S3;
+    const double y4 = G4 * u + Sigma;
+
+    p1.s = twoG * u + B * p1.s;
+    p2.s = twoG * y1 + B * p2.s;
+    p3.s = twoG * y2 + B * p3.s;
+    p4.s = twoG * y3 + B * p4.s;
     return y4;
   }
   // ---- PER-SAMPLE PROCESS END ----

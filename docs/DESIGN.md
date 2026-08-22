@@ -987,11 +987,30 @@ The 10× is a **floor, deliberately set below the expectation**.
 
 | config | ns/sample | ×realtime |
 |---|---|---|
-| idle (0 voices) | 18.3 | 1141× |
-| 1 voice | 81.4 | 256× |
-| **8 voices mono** | **516.5** | **40.3×** |
-| 8 voices stereo | 930.2 | 22.4× |
-| 16 voices unison | 1014.1 | 20.5× |
+| idle (0 voices) | 19.0 | 1099× |
+| 1 voice | 72.2 | 288× |
+| **8 voices mono** | **467.6** | **44.6×** |
+| 8 voices stereo | 851.4 | 24.5× |
+| 16 voices unison | 919.1 | 22.7× |
+
+Per-voice marginal cost **56.1 ns/sample**. (Before the G11 ladder
+restructure: 516.5 ns / 40.3× / 62 ns per voice.)
+
+**Where it goes**, measured per component at the real call rate:
+
+| component | ns/sample | note |
+|---|---|---|
+| LadderFilter (24 dB) | 19.3 | was 24.4 before the restructure |
+| SvfFilter (12 dB) | 7.7 | only one slope runs at a time |
+| HpfCascade 2-pole | 4.2 | 5.6 at 4 poles |
+| SubOsc | 3.4 | |
+| OnePoleHP × 2 | 4.3 | mixer + post-LPF blockers |
+| Osc saw / pulse | ~2.0 each | |
+| NoiseSource | 1.8 | |
+| drive | 0.8 | |
+
+**The low-pass is the cost centre** — roughly a third of a voice even after
+being made 1.30× faster. Anything further has to go through it.
 
 **The budget is met with a 4× margin**, and it was already met *before* any
 optimization (40.0×), so §12's escape hatches were correctly never used.
@@ -1012,6 +1031,19 @@ code existed (50× realtime) was missed by 18 %, and the honest thing turned out
 to be recording the shortfall rather than moving the target. Setting a floor
 that is defensible from an op count, and recording the actual, avoids repeating
 that.
+
+### 12.1 Optimizations tried and REJECTED, with their measurements
+
+Recorded per G11.10, because a tried-and-reverted change with a number is
+worth more to the next person than silence.
+
+| tried | measured | verdict |
+|---|---|---|
+| `fastTan` / `fastExp2` (hatch 1) | control-rate work is **≤ 5.7 %** of total cost — halving its *rate* (32→64) bought only that, and transcendentals are a fraction of that fraction | rejected; §2.1's argument confirmed empirically |
+| `kControlBlock` 32 → 64 (hatch 2) | **5.7 %** faster (640 → 622 ns in an 8-voice driver), at the price of doubling event quantisation to 1.3 ms | rejected — poor trade |
+| `kControlBlock` 32 → 128 | 4.8 % beyond that | rejected — same reason, worse |
+| rcp + Newton reciprocal replacing the saturator's division | **31.91 vs 20.97 ns/sample — 52 % SLOWER.** Three Newton steps cost far more than one `divsd`, and the division is only 11 % of the ladder | rejected |
+| `float` instead of `double` in the per-sample path | **1.03×** in scalar on x86-64 | rejected here — it would only pay 4-wide in SIMD, or on hardware with half-rate doubles (many ARM cores). Still open for a weak-machine build |
 
 **If the floor is ever missed, in this order:**
 

@@ -75,13 +75,13 @@ silent-voice-skip path ([PERF-7]):
 
 | Config | ns/sample | ×realtime@48k |
 |---|---|---|
-| idle (0 voices) | 18.257 | 1141.1× |
+| idle | 19.0 | 1099× |
 | 1 voice | 81.449 | 255.8× |
-| **8 voices, mono** | **516.458** | **40.3×** |
+| **8 voices, mono** | **467.6** | **44.6×** |
 | 8 voices, stereo | 930.172 | 22.4× |
 | 16 voices, unison | 1014.115 | 20.5× |
 
-**Budget verdict: 8 voices mono clears the ≥10× floor at 40.3× realtime — a
+**Budget verdict: 8 voices mono clears the ≥10× floor at 44.6× realtime — a
 4.0× margin** (and already cleared it, at 40.0×, before either G11.11
 optimization below — see `docs/GATES.md`'s G11 status note for why no further
 optimization, e.g. SIMD-over-voices, was attempted). Idle costs **3.5%** of
