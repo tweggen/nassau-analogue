@@ -1291,22 +1291,65 @@ cmake --build build-float -j && ctest --test-dir build-float --output-on-failure
 ./build-float/Tests/synth_bench
 ```
 
----
+### 12.3 SIMD over voices (SSE2, 2-wide doubles) — and the scalar fix hiding under it
 
-## 13. Non-goals for v1
+`Source/DSP/synth_simd.h` pairs active voices (or, in stereo mode, a voice's two
+chains) and runs the filter section two-at-a-time: `Vec2d` over `__m128d` under
+`__SSE2__`/`_M_X64`, with a portable scalar-pair fallback and a
+`-DNASSAU_NO_SIMD=ON` escape. Bit-exact by construction — each lane performs the
+same operations in the same order, the voice accumulation keeps its original
+order, and both golden batteries verify unchanged.
 
-Each of these is excluded for a stated reason, not overlooked:
+Voices are not contiguous (silent ones are skipped, [PERF-7]), so a fixed-size
+compacted active-voice list is rebuilt once per control block, with a scalar
+remainder for an odd count. The two fade-out slots stay scalar: their
+`fadeActive` can flip mid-chunk, so they cannot be folded into a
+once-per-control-block list.
 
-* **Audio-rate cross-modulation / full Prophet Poly-Mod** — needs an
-  oversampled oscillator section (§8).
-* **Oversampling of any kind** — the whole design is arranged so nothing needs
-  it (§4).
-* **Per-voice LFOs** — **[PERF-4]**.
-* **Arpeggiator, sequencer, chord memory** — not DSP; a separate plugin's job.
-* **Effects (chorus, delay, reverb)** — the stereo mode (§9) is the only
-  width-generating element, deliberately. A Juno-style chorus is a plausible v2
-  and would sit after the master volume, outside every voice.
-* **MPE** — `PLUG_DOES_MPE 0`. Per-note expression is a voice-architecture
-  change, not a feature flag.
-* **Microtuning / alternative scale tables** — the pitch path in §3.2 is
-  12-TET by construction.
+**Measured, 8 voices mono, 48 kHz, alone, best of 7:**
+
+| build | ns/sample | ×realtime | |
+|---|---|---|---|
+| before this work | 472.3 | 43.6× | |
+| scalar (`NASSAU_NO_SIMD=ON`) | 370.9 | **56.2×** | **1.27× — no SIMD involved** |
+| SSE2 (default) | 309.6 | **67.3×** | 1.20× on top; **1.54× total** |
+
+**The honest split matters, because the first version of this change credited
+all of it to SIMD.** Two thirds of the gain is not SIMD:
+
+1. **`TptOnePole::process()` recomputed `G = g/(1+g)` on every call** — a
+   division per pole per sample, for a value that only moves at control rate.
+   An `HpfCascade` runs 2–4 of those per voice per sample. The SIMD pair path
+   had deduplicated the division across its four stages, so it was being
+   credited to vectorisation when it is a scalar defect both paths deserve
+   fixed. `G` is now cached and refreshed wherever `g` is written.
+2. **The compacted active-voice list** replaced a scan over all 16 slots. This
+   is why *idle* improved from 17.95 to 12.65 ns/sample — **identically in both
+   builds**, which is the tell: idle runs no filters at all, so no part of that
+   could have been SIMD.
+
+The tell in general: a claimed vectorisation win that also speeds up a
+configuration with nothing to vectorise is measuring something else.
+
+### 12.3.1 Adding a NEON path later (note for a run on a Mac / ARM host)
+
+Deliberately **not** implemented here — no ARM hardware was available, so it
+would have been unverifiable, unbenchmarked and untested by anything.
+
+The work is scoped to filling in one branch: implement `Vec2d` (in
+`Source/DSP/synth_simd.h`) over `float64x2_t` under `__aarch64__`/`_M_ARM64`,
+providing load/store/set1/add/sub/mul/div/abs. Nothing above it changes.
+
+Acceptance bar, same as SSE2 had to meet:
+
+* **bit-exact against the scalar path** — both golden batteries at exactly
+  `0.000e+00`, not merely within 1e-6;
+* full suite green in all configs, including `-DNASSAU_NO_SIMD=ON`;
+* `Tests/synth_bench.cpp` re-run **on the ARM target**, alone, best of 7 —
+  the x86 numbers above are the shape to compare against, not a prediction.
+
+`-DNASSAU_DSP_FLOAT=ON` (§12.2) is the natural companion experiment **on ARM
+only**: half-rate doubles and 4-wide NEON are exactly the conditions it was
+written for. It is a measured **7.3 % regression on x86-64** — never enable it
+there.
+

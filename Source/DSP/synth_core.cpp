@@ -136,6 +136,15 @@ void SynthCore::reset() {
         v.curBlockPeakAccum = 0.0;
         v.peakPrevBlock = 0.0;
     }
+    // DESIGN.md §12.3: the compacted active-chain list is fully REBUILT every
+    // control block (controlRateUpdate()), never incrementally -- so leaving
+    // stale index values in mActiveVoiceList here would be harmless either
+    // way. Reset the count anyway (R13: a fresh instance and a reset()
+    // instance should agree on every observable field, not merely on every
+    // field something currently reads).
+    mActiveVoiceCount = 0;
+    for (int i = 0; i < kMaxVoices; ++i) mActiveVoiceList[i] = 0;
+
     mHeldVoiceCount = 0;
     mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
     mLastLfoValue = 0.0;
@@ -198,6 +207,151 @@ void SynthCore::reset() {
     // / harness configuration, not synth state (same precedent as
     // mControlBlock already being left alone by this function since G0).
 }
+
+// ===== DESIGN.md §12.3: SIMD-over-voices, per-chain filter section =====
+// This pair of functions is the ONE place the osc->mix->dcBlock->drive->
+// hpf->lpf->postLpfDcBlock sequence is written out (DESIGN.md §12.3's own
+// "same operations, same order" requirement is only checkable if there is
+// exactly one copy of the scalar sequence to check): processChainFilters()
+// below is a byte-for-byte extraction of the per-chain body every gate
+// through G11 already exercised (no behaviour change), and
+// processChainPairFilters() is its SIMD-paired twin, both declared in
+// synth_core.h next to runLpfStructure()/runLpfStructurePair().
+
+double SynthCore::processChainFilters(Voice::Chain& ch, double ynoise, const ParamSnapshot& snapshot,
+                                       double crossfadeT) {
+    const double prePhase1 = ch.osc1.phase;
+    const auto r1 = ch.osc1.step();
+    double y2 = ch.osc2.step().y;
+    if (snapshot.osc2Sync && r1.wrapped) {
+        y2 = ch.osc2.hardSync(r1.wrapFrac / ch.osc1.dt, y2);
+    }
+    const double ysub = ch.sub.step(prePhase1, ch.osc1.dt, r1.wrapped, true);
+
+    // DC blocker on the mixer output (DESIGN.md §4) -- see this file's
+    // pre-§12.3 per-chain loop comment (still present in synth_core.h's
+    // Voice::Chain::dcBlock field comment) for the full "why it must sit
+    // before the drive/filter" rationale.
+    const double mixRaw = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2, snapshot.osc2LevelPercent,
+                                           ysub, snapshot.subLevelPercent, ynoise, snapshot.noiseLevelPercent);
+    const double mix = ch.dcBlock.process(mixRaw);
+    ch.debugMixOut = mix;  // G6.7/G8 test-only readback, see Voice::Chain::debugMixOut
+
+    // DESIGN.md §4/§1 step 7: drive sits between the mixer DC blocker and the
+    // HPF. At Drive=0, snapshot.drivePre/driveKnee are EXACTLY 1.0/0.0, so
+    // this whole line is bit-exact identity (DESIGN.md §4, G6.7).
+    const double driven = shapeTriodeK(mix * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
+    ch.debugDriveOut = driven;  // G6.4/G8 test-only readback
+
+    // DESIGN.md §5.5: HPF, hard-bypassed (an ARCHITECTURAL skip, not a very
+    // low corner, G6.4) at kHpfCutoff's minimum.
+    double hpfOut;
+    if (mHpfBypassed) {
+        hpfOut = driven;
+    } else {
+        ch.hpf.advanceCoeff(ch.gHpfCur);
+        ch.gHpfCur += ch.gHpfStep;
+        hpfOut = ch.hpf.process(driven, mHpfNumPoles);
+    }
+    ch.debugHpfOut = hpfOut;  // G6.4/G8 test-only readback
+
+    // DESIGN.md §5.1/§5.4: the LPF -- single structure, or both blended
+    // during a 20ms slope crossfade (DESIGN.md §5.1 [PERF-8], G5.4).
+    double lpfOut;
+    if (mLpfCrossfadeActive) {
+        const double yFrom = runLpfStructure(ch, mLpfCrossfadeFromSlope, hpfOut);
+        const double yTo = runLpfStructure(ch, mLpfCrossfadeToSlope, hpfOut);
+        lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
+    } else {
+        lpfOut = runLpfStructure(ch, mLpfSlopeSettled, hpfOut);
+    }
+    ch.lastLpfOutput = lpfOut;  // G5.4's crossfade-seed source, see seedFromOutput()'s own comment
+
+    // DESIGN.md §5.6: the post-filter DC blocker. Caller applies gain/pan/
+    // fade-gain to this return value (DESIGN.md §12.3: this function stops
+    // here so the main-pool-paired path and the fade-slot/remainder scalar
+    // path, which apply those differently, share this one filter sequence).
+    return ch.postLpfDcBlock.process(lpfOut);
+}
+
+#if !defined(NASSAU_DSP_FLOAT)
+void SynthCore::processChainPairFilters(Voice::Chain& chA, double ynoiseA, Voice::Chain& chB, double ynoiseB,
+                                         const ParamSnapshot& snapshot, double crossfadeT, double& outA,
+                                         double& outB) {
+    // Phase 1 (osc/mix): scalar, per lane, unchanged shape -- DESIGN.md
+    // §12's own "vectorize?" table says no for oscillators/mixer (PolyBLEP
+    // is branchy and a poor SIMD fit, and each is only ~2ns/voice).
+    const double prePhase1A = chA.osc1.phase;
+    const auto r1A = chA.osc1.step();
+    double y2A = chA.osc2.step().y;
+    if (snapshot.osc2Sync && r1A.wrapped) {
+        y2A = chA.osc2.hardSync(r1A.wrapFrac / chA.osc1.dt, y2A);
+    }
+    const double ysubA = chA.sub.step(prePhase1A, chA.osc1.dt, r1A.wrapped, true);
+    const double mixRawA = MixerBlock::mix(r1A.y, snapshot.osc1LevelPercent, y2A, snapshot.osc2LevelPercent,
+                                            ysubA, snapshot.subLevelPercent, ynoiseA,
+                                            snapshot.noiseLevelPercent);
+
+    const double prePhase1B = chB.osc1.phase;
+    const auto r1B = chB.osc1.step();
+    double y2B = chB.osc2.step().y;
+    if (snapshot.osc2Sync && r1B.wrapped) {
+        y2B = chB.osc2.hardSync(r1B.wrapFrac / chB.osc1.dt, y2B);
+    }
+    const double ysubB = chB.sub.step(prePhase1B, chB.osc1.dt, r1B.wrapped, true);
+    const double mixRawB = MixerBlock::mix(r1B.y, snapshot.osc1LevelPercent, y2B, snapshot.osc2LevelPercent,
+                                            ysubB, snapshot.subLevelPercent, ynoiseB,
+                                            snapshot.noiseLevelPercent);
+
+    // Phase 2 (the SIMD-eligible middle, DESIGN.md §12's cost table): mixer
+    // DC block -> drive (scalar) -> HPF -> LPF -> post-LPF DC block, two
+    // chains at once via Source/DSP/synth_simd.h's pair functions. Bit-
+    // identical to two processChainFilters() calls -- see synth_simd.h's
+    // own header comment for the argument.
+    double mixA, mixB;
+    onePoleHpPairProcess(chA.dcBlock, chB.dcBlock, mixRawA, mixRawB, mixA, mixB);
+    chA.debugMixOut = mixA;
+    chB.debugMixOut = mixB;
+
+    const double drivenA = shapeTriodeK(mixA * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
+    const double drivenB = shapeTriodeK(mixB * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
+    chA.debugDriveOut = drivenA;
+    chB.debugDriveOut = drivenB;
+
+    // mHpfBypassed is a single, instrument-wide, control-rate flag (DESIGN.md
+    // §5.5) -- both lanes always take the SAME branch here, never diverge.
+    double hpfOutA, hpfOutB;
+    if (mHpfBypassed) {
+        hpfOutA = drivenA;
+        hpfOutB = drivenB;
+    } else {
+        hpfCascadePairProcess(chA.hpf, chB.hpf, chA.gHpfCur, chB.gHpfCur, drivenA, drivenB, mHpfNumPoles,
+                               hpfOutA, hpfOutB);
+        chA.gHpfCur += chA.gHpfStep;
+        chB.gHpfCur += chB.gHpfStep;
+    }
+    chA.debugHpfOut = hpfOutA;
+    chB.debugHpfOut = hpfOutB;
+
+    // mLpfCrossfadeActive/mLpfCrossfadeFromSlope/ToSlope/mLpfSlopeSettled are
+    // likewise single, instrument-wide, control-rate values -- both lanes
+    // always take the same branch here too.
+    double lpfOutA, lpfOutB;
+    if (mLpfCrossfadeActive) {
+        double yFromA, yFromB, yToA, yToB;
+        runLpfStructurePair(chA, chB, mLpfCrossfadeFromSlope, hpfOutA, hpfOutB, yFromA, yFromB);
+        runLpfStructurePair(chA, chB, mLpfCrossfadeToSlope, hpfOutA, hpfOutB, yToA, yToB);
+        lpfOutA = yFromA * (1.0 - crossfadeT) + yToA * crossfadeT;
+        lpfOutB = yFromB * (1.0 - crossfadeT) + yToB * crossfadeT;
+    } else {
+        runLpfStructurePair(chA, chB, mLpfSlopeSettled, hpfOutA, hpfOutB, lpfOutA, lpfOutB);
+    }
+    chA.lastLpfOutput = lpfOutA;
+    chB.lastLpfOutput = lpfOutB;
+
+    onePoleHpPairProcess(chA.postLpfDcBlock, chB.postLpfDcBlock, lpfOutA, lpfOutB, outA, outB);
+}
+#endif
 
 // ===== Audio Processing =====
 
@@ -353,182 +507,111 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
             // mStereoBlend are plain members, not atomics, R3/R12).
             const bool chain1Needed = mChain1Active || mStereoBlend > 0.0;
             const int numChains = chain1Needed ? 2 : 1;
-            for (int vi = 0; vi < kMaxVoices + kNumFadeSlots; ++vi) {
-                Voice& v = mVoices[vi];
-                // G7: main-pool voices [0,kMaxVoices) skip on Idle (DESIGN.md
-                // §10.7 [PERF-7] -- the VCA-after-filter chain ordering below
-                // pins vcaGain, and therefore this voice's WHOLE
-                // contribution, at exactly 0.0 the control block after ENV-A
-                // reaches Idle, which is exactly when `state` becomes Idle
-                // too (controlRateUpdate()) -- see getDebugActiveVoiceCount()
-                // 's own header comment for the full argument). Fade slots
-                // [kMaxVoices, kMaxVoices+kNumFadeSlots) skip on
-                // !fadeActive instead: DESIGN.md §10.4's 2ms fade is a
-                // property of the SLOT, independent of that copied voice's
-                // own envelope state.
-                const bool isMainPool = vi < kMaxVoices;
-                if (isMainPool ? (v.state == nassau_alloc::SlotState::Idle) : !v.fadeActive) continue;
 
-                // G8 (DESIGN.md §3.5/§9 [PERF-5]): ONE noise draw per voice
-                // per sample, SHARED by every chain -- not one per chain.
-                // Drawing it here, once, before the per-chain loop below, and
-                // feeding the SAME value into both chains' mixer is what (a)
-                // keeps a mono-mode render's noise sequence identical to a
-                // stereo-mode render's (both draw exactly once per sample),
-                // and (b) is one of the two things G8.2's bit-identity check
-                // depends on (the other being the linear pan law below) --
-                // an independently-seeded second draw per chain would
-                // desynchronise the RNG stream from mono mode's, and would
-                // also be a physically different (wider, hissier) sound
-                // DESIGN.md §3.5 explicitly rejects.
+            // DESIGN.md §12.3 (SIMD-over-voices): the MAIN POOL renders via
+            // the compacted `mActiveVoiceList` (controlRateUpdate(), same
+            // active/idle set and same ascending order the old plain
+            // `vi`-scan used -- see that list's own field comment), paired
+            // two at a time, scalar remainder on an odd count. Under
+            // NASSAU_DSP_FLOAT (§12.2's separate, ARM-motivated opt-in path)
+            // this reduces to the plain per-voice scalar scan, unchanged.
+#if !defined(NASSAU_DSP_FLOAT)
+            if (numChains == 2) {
+                // STEREO: a voice's own two chains SHARE modulation
+                // (ynoise/gain, [PERF-5]) but keep independent filter state
+                // (DESIGN.md §9) -- they pair naturally, one SIMD pair per
+                // active voice, no remainder ever needed (2 chains is always
+                // even).
+                for (int li = 0; li < mActiveVoiceCount; ++li) {
+                    Voice& v = mVoices[mActiveVoiceList[li]];
+                    const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+                    const double gain = v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
+
+                    double out0, out1;
+                    processChainPairFilters(v.chain[0], ynoise, v.chain[1], ynoise, snapshot, crossfadeT,
+                                             out0, out1);
+
+                    // `fadeGainCur` is exactly 1.0 for every main-pool voice
+                    // (DESIGN.md §10.4) -- x*1.0 is bit-exact IEEE-754
+                    // identity, matching the pre-§12.3 scalar loop's own
+                    // comment on this multiply.
+                    const double contribution0 = out0 * gain * v.fadeGainCur;
+                    const double contribution1 = out1 * gain * v.fadeGainCur;
+
+                    // Same left-to-right accumulation as the pre-§12.3 scalar
+                    // per-chain loop: chain 0's term before chain 1's, both
+                    // added from a 0.0 start (DESIGN.md §9 pan law).
+                    const double voiceL = contribution0 * mEffPanGainL0 + contribution1 * mEffPanGainL1;
+                    const double voiceR = contribution0 * mEffPanGainR0 + contribution1 * mEffPanGainR1;
+                    mixSumL += voiceL;
+                    mixSumR += voiceR;
+
+                    const double abs0 = contribution0 < 0.0 ? -contribution0 : contribution0;
+                    const double abs1 = contribution1 < 0.0 ? -contribution1 : contribution1;
+                    const double peakThisSample = abs0 > abs1 ? abs0 : abs1;
+                    if (peakThisSample > v.curBlockPeakAccum) v.curBlockPeakAccum = peakThisSample;
+                }
+            } else {
+                // MONO: pair adjacent ACTIVE voices' own chain 0 (DESIGN.md
+                // §12.3's "pairing strategy" -- voices are not contiguous, so
+                // this pairs list POSITIONS, not raw slot indices). Each
+                // lane belongs to a DIFFERENT voice here, so its contribution
+                // is added to mixSumL/R on its own, in ascending list order
+                // (== ascending `vi` order, since the list is built that
+                // way) -- exactly the order the old plain scalar scan summed
+                // in, voice by voice.
+                int li = 0;
+                for (; li + 1 < mActiveVoiceCount; li += 2) {
+                    Voice& vA = mVoices[mActiveVoiceList[li]];
+                    Voice& vB = mVoices[mActiveVoiceList[li + 1]];
+                    const double ynoiseA = vA.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+                    const double ynoiseB = vB.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+                    const double gainA = vA.vcaGainStart + (vA.vcaGainEnd - vA.vcaGainStart) * frac;
+                    const double gainB = vB.vcaGainStart + (vB.vcaGainEnd - vB.vcaGainStart) * frac;
+
+                    double outA, outB;
+                    processChainPairFilters(vA.chain[0], ynoiseA, vB.chain[0], ynoiseB, snapshot, crossfadeT,
+                                             outA, outB);
+
+                    const double contribA = outA * gainA * vA.fadeGainCur;
+                    mixSumL += contribA * mEffPanGainL0;
+                    mixSumR += contribA * mEffPanGainR0;
+                    const double absA = contribA < 0.0 ? -contribA : contribA;
+                    if (absA > vA.curBlockPeakAccum) vA.curBlockPeakAccum = absA;
+
+                    const double contribB = outB * gainB * vB.fadeGainCur;
+                    mixSumL += contribB * mEffPanGainL0;
+                    mixSumR += contribB * mEffPanGainR0;
+                    const double absB = contribB < 0.0 ? -contribB : contribB;
+                    if (absB > vB.curBlockPeakAccum) vB.curBlockPeakAccum = absB;
+                }
+                // Scalar remainder: at most one voice, when mActiveVoiceCount
+                // is odd (DESIGN.md §12.3: "a scalar remainder for an odd
+                // count").
+                for (; li < mActiveVoiceCount; ++li) {
+                    Voice& v = mVoices[mActiveVoiceList[li]];
+                    const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+                    const double gain = v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
+                    const double out = processChainFilters(v.chain[0], ynoise, snapshot, crossfadeT);
+                    const double contribution = out * gain * v.fadeGainCur;
+                    mixSumL += contribution * mEffPanGainL0;
+                    mixSumR += contribution * mEffPanGainR0;
+                    const double absContribution = contribution < 0.0 ? -contribution : contribution;
+                    if (absContribution > v.curBlockPeakAccum) v.curBlockPeakAccum = absContribution;
+                }
+            }
+#else
+            for (int li = 0; li < mActiveVoiceCount; ++li) {
+                Voice& v = mVoices[mActiveVoiceList[li]];
                 const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
-
-                // G8 (DESIGN.md §2's third interpolated scalar, vcaGain):
-                // SHARED across chains ([PERF-5], ENV-A is one Voice-level
-                // field, not per-chain) -- computed ONCE per sample here,
-                // used identically by every chain's contribution below.
-                // G11.11(b): the mDebugDisableVcaInterpolation branch that
-                // used to live here is gone -- controlRateUpdate() now
-                // forces vcaGainStart==vcaGainEnd for that whole control
-                // block when the flag is set, so this single lerp already
-                // produces the "held" value bit-exactly (see that call
-                // site's own comment).
                 const double gain = v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
 
-                // G8: this voice's per-CHANNEL contribution this sample,
-                // panned per DESIGN.md §9's linear law (snapshot.panGainL0/
-                // R0/L1/R1, computed once per host block, finishSnapshot()).
-                // In mono mode (numChains==1) only chain 0 runs and
-                // panGainL0==panGainR0==1.0 exactly, so voiceL==voiceR
-                // bit-for-bit -- G8.1.
                 double voiceL = 0.0, voiceR = 0.0;
                 double peakThisSample = 0.0;
                 for (int c = 0; c < numChains; ++c) {
                     Voice::Chain& ch = v.chain[c];
-
-                    const double prePhase1 = ch.osc1.phase;
-                    const auto r1 = ch.osc1.step();
-                    double y2 = ch.osc2.step().y;
-                    if (snapshot.osc2Sync && r1.wrapped) {
-                        y2 = ch.osc2.hardSync(r1.wrapFrac / ch.osc1.dt, y2);
-                    }
-                    const double ysub = ch.sub.step(prePhase1, ch.osc1.dt, r1.wrapped, true);
-
-                    const double mixRaw = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
-                                                        snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
-                                                        ynoise, snapshot.noiseLevelPercent);
-                    // DC blocker on the mixer output (DESIGN.md §4). A pulse of
-                    // duty d carries DC of exactly (2d - 1); at PW=25% that is
-                    // -0.50. Two mul + two add per sample per chain, and it must
-                    // sit BEFORE the drive and the resonant filter, not at the
-                    // output: DC into a saturator biases it into asymmetric
-                    // clipping, which would make the timbre track pulse width in
-                    // a way that is not the PWM sound anyone wants. G8: this
-                    // chain's OWN dcBlock instance (Voice::Chain), never shared
-                    // with the other chain -- see Voice::Chain::dcBlock's own
-                    // comment for why a shared instance would be wrong.
-                    const double mix = ch.dcBlock.process(mixRaw);
-                    ch.debugMixOut = mix;  // G6.7/G8 test-only readback, see Voice::Chain::debugMixOut
-
-                    // G6 (DESIGN.md §1 step 7, §4): DRIVE sits between the
-                    // mixer DC blocker and the HPF -- never after the filters
-                    // (DESIGN.md §1's own "ordering constraints": "the mixer's
-                    // summed level is what pushes it, exactly as in a real
-                    // instrument where the VCA-input stage is what runs out of
-                    // headroom first"). snapshot.drivePre/driveKnee are BLOCK-
-                    // RATE derived constants (finishSnapshot(), R12), SHARED by
-                    // both chains (kDrive is one instrument-wide param, not
-                    // per-chain) -- at Drive=0 they are EXACTLY 1.0/0.0, so this
-                    // whole line is bit-exact identity (mix*1.0==mix,
-                    // shapeTriodeK(x,0)==x, x/1.0==x, DESIGN.md §4's own
-                    // "bit-exact identity" claim, docs/GATES.md G6.7).
-                    // shapeTriodeK itself is memoryless (no per-chain STATE to
-                    // duplicate), so sharing snapshot.drivePre/driveKnee here
-                    // is not a shortcut -- it is simply what "shared params,
-                    // per-chain signal" means for a stateless stage.
-                    const double driven = shapeTriodeK(mix * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
-                    ch.debugDriveOut = driven;  // G6.4/G8 test-only readback
-
-                    // G6 (DESIGN.md §1 step 8, §5.5): HPF, hard-bypassed at
-                    // kHpfCutoff's minimum (DESIGN.md §5.5: "not a 20Hz filter
-                    // -- an actual bypass"). mHpfBypassed/mHpfNumPoles are
-                    // shared, instrument-wide, computed once per control block
-                    // below (kHpfSlope/kHpfCutoff are single params, not
-                    // per-voice/per-chain) -- this is an ARCHITECTURAL skip (the
-                    // whole HpfCascade call is never made), which is what makes
-                    // the bypass path BIT-EXACT (docs/GATES.md G6.4) rather than
-                    // merely "a very low corner". gHpfCur/Step is THIS CHAIN's
-                    // own per-sample gHpf interpolation (DESIGN.md §2's third
-                    // interpolated quantity, alongside gLpf/vcaGain) -- both
-                    // chains' HPF `g` targets are fed the SAME already-modulated
-                    // Hz value (controlRateUpdate(), G8.5), but each chain's
-                    // HpfCascade is its own instance with its own state.
-                    double hpfOut;
-                    if (mHpfBypassed) {
-                        hpfOut = driven;
-                    } else {
-                        ch.hpf.advanceCoeff(ch.gHpfCur);
-                        ch.gHpfCur += ch.gHpfStep;
-                        hpfOut = ch.hpf.process(driven, mHpfNumPoles);
-                    }
-                    ch.debugHpfOut = hpfOut;  // G6.4/G8 test-only readback
-
-                    // G5 (DESIGN.md §1 step 9, §5): the LPF is now GENUINELY IN
-                    // THE SIGNAL PATH -- the interaction G4's gate note flagged
-                    // (wiring the SVF's causal, previous-control-block Reff into
-                    // a real periodic voice signal broke G3.12's "no DC" bound,
-                    // measured up to -7.96e-4) no longer applies: the mixer DC
-                    // blocker just above now sits BEFORE this stage (it did not
-                    // yet exist in that form when G4's attempt was made), so the
-                    // filter's own input is already DC-free (DESIGN.md §4.1
-                    // measures 1e-9..1e-10 residual at every duty).
-                    //
-                    // That is NOT sufficient on its own, and an earlier version of
-                    // this comment wrongly claimed it was. A DC-free INPUT does not
-                    // give a DC-free OUTPUT here: both structures' feedback
-                    // saturators are odd functions, and an odd function fed a
-                    // zero-mean but not half-wave-symmetric signal re-introduces a
-                    // nonzero time-average. Measured with only the mixer blocker:
-                    // 2.3e-2 DC / 3.69 peak at {SVF, res 99%, PW 30%, fc 500 Hz},
-                    // against a 1e-4 bound -- while a symmetric 50% pulse at the
-                    // same resonance gave 1.5e-6, which is what identifies the
-                    // mechanism. Hence postLpfDcBlock below (DESIGN.md §5.6). G8:
-                    // this chain's OWN postLpfDcBlock instance, same reasoning as
-                    // dcBlock above -- G8's own DC measurement (see the gate
-                    // report) confirms a shared blocker across two detuned
-                    // chains was NOT accidentally introduced here.
-                    double lpfOut;
-                    if (mLpfCrossfadeActive) {
-                        const double yFrom = runLpfStructure(ch, mLpfCrossfadeFromSlope, hpfOut);
-                        const double yTo = runLpfStructure(ch, mLpfCrossfadeToSlope, hpfOut);
-                        lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
-                    } else {
-                        lpfOut = runLpfStructure(ch, mLpfSlopeSettled, hpfOut);
-                    }
-                    ch.lastLpfOutput = lpfOut;
-                    lpfOut = ch.postLpfDcBlock.process(lpfOut);
-
-                    // G7 (DESIGN.md §10.4): `fadeGainCur` is 1.0, permanently,
-                    // for every main-pool voice (never written outside the fade
-                    // branch below), so this multiply is a bit-exact IEEE-754
-                    // identity (x*1.0==x) there -- it only actually attenuates a
-                    // fade slot's copied signal. `gain` (vcaGain*velocity) is
-                    // SHARED across chains (computed once above, [PERF-5]).
-                    // Plain multiply, R12-legal.
-                    const double contribution = lpfOut * gain * v.fadeGainCur;
-
-                    // DESIGN.md §9 PAN: linear law. Chain 0 uses
-                    // mEffPanGainL0/R0, chain 1 uses mEffPanGainL1/R1 --
-                    // these are the CONTROL-RATE-updated effective gains
-                    // (SynthCore::controlRateUpdate(), G8.9's mono<->stereo
-                    // blend), EXACTLY equal to snapshot.panGainL0/R0/L1/R1
-                    // whenever `mStereoBlend`==1.0 (the ordinary,
-                    // continuously-stereo case, G8.1/G8.2/G8.4/G8.6/G8.7/
-                    // G8.8's own scenario) or to the mono law {1,1,0,0}
-                    // whenever `mStereoBlend`==0.0 -- G8.4's exact-at-every-
-                    // spread property and G8.6's gL+gR==1.0 both still hold
-                    // bit-exactly in that settled state; only a genuine
-                    // MID-NOTE toggle sees a value strictly between.
+                    const double out = processChainFilters(ch, ynoise, snapshot, crossfadeT);
+                    const double contribution = out * gain * v.fadeGainCur;
                     if (c == 0) {
                         voiceL += contribution * mEffPanGainL0;
                         voiceR += contribution * mEffPanGainR0;
@@ -536,36 +619,61 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                         voiceL += contribution * mEffPanGainL1;
                         voiceR += contribution * mEffPanGainR1;
                     }
-
                     const double absContribution = contribution < 0.0 ? -contribution : contribution;
                     if (absContribution > peakThisSample) peakThisSample = absContribution;
                 }
                 mixSumL += voiceL;
                 mixSumR += voiceR;
+                if (peakThisSample > v.curBlockPeakAccum) v.curBlockPeakAccum = peakThisSample;
+            }
+#endif
 
-                // G7/DESIGN.md §10.7 [PERF-7]: track this voice's own peak
-                // |contribution| (pre-pan, the larger of whichever chains ran
-                // this sample) over the control block IN PROGRESS (plain
-                // fabs/max, no transcendental/atomic, R12) -- copied into
-                // `peakPrevBlock` at the next control-rate boundary
-                // (controlRateUpdate()), which is the quantity
-                // getDebugActiveVoiceCount() actually reads. Pre-pan is a
-                // deliberately conservative (never-smaller) bound: every pan
-                // gain is <= 1.0, so this never UNDER-counts an audible voice.
+            // Fade slots (DESIGN.md §10.4): always the scalar path. Only two
+            // slots exist, they are short-lived (2ms) and -- unlike main-pool
+            // voices -- `fadeActive` can flip mid-CHUNK on their own
+            // per-sample counter below, so they cannot be folded into a
+            // once-per-control-block compacted list the way main-pool
+            // voices are (DESIGN.md §12.3). Iterated AFTER the main pool,
+            // exactly as the old plain `vi`-ascending scan did (fade slots
+            // sit at indices >= kMaxVoices), so mixSumL/R accumulate in the
+            // SAME overall order as before.
+            for (int vi = kMaxVoices; vi < kMaxVoices + kNumFadeSlots; ++vi) {
+                Voice& v = mVoices[vi];
+                if (!v.fadeActive) continue;
+
+                const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
+                const double gain = v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
+
+                double voiceL = 0.0, voiceR = 0.0;
+                double peakThisSample = 0.0;
+                for (int c = 0; c < numChains; ++c) {
+                    Voice::Chain& ch = v.chain[c];
+                    const double out = processChainFilters(ch, ynoise, snapshot, crossfadeT);
+                    const double contribution = out * gain * v.fadeGainCur;
+                    if (c == 0) {
+                        voiceL += contribution * mEffPanGainL0;
+                        voiceR += contribution * mEffPanGainR0;
+                    } else {
+                        voiceL += contribution * mEffPanGainL1;
+                        voiceR += contribution * mEffPanGainR1;
+                    }
+                    const double absContribution = contribution < 0.0 ? -contribution : contribution;
+                    if (absContribution > peakThisSample) peakThisSample = absContribution;
+                }
+                mixSumL += voiceL;
+                mixSumR += voiceR;
                 if (peakThisSample > v.curBlockPeakAccum) v.curBlockPeakAccum = peakThisSample;
 
-                // G7 (DESIGN.md §10.4): advance a live fade slot's own 2ms
+                // G7 (DESIGN.md §10.4): advance this fade slot's own 2ms
                 // linear ramp by one sample and retire it the instant it
                 // completes -- same shape as the LPF slope crossfade's own
                 // per-sample completion tracking just below (plain int/
                 // double arithmetic only, R12).
-                if (!isMainPool && v.fadeActive) {
-                    v.fadeGainCur += v.fadeGainStep;
-                    ++v.fadeSamplesElapsed;
-                    if (v.fadeSamplesElapsed >= v.fadeSamplesTotal) {
-                        v.fadeActive = false;
-                        v.fadeGainCur = 0.0;
-                    }
+                v.fadeGainCur += v.fadeGainStep;
+                ++v.fadeSamplesElapsed;
+                if (v.fadeSamplesElapsed >= v.fadeSamplesTotal) {
+                    v.fadeActive = false;
+                    v.fadeGainCur = 0.0;
                 }
             }
 
@@ -1576,6 +1684,27 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         }
     }
     mDebugActiveVoiceCount = activeCount;  // G7.14/PERF-7 readback, see getDebugActiveVoiceCount()
+
+    // DESIGN.md §12.3: rebuild the compacted active-MAIN-POOL-voice list from
+    // EXACTLY the predicate the audio-rate loop's own skip check uses
+    // (`state != Idle`, process()'s own `isMainPool ? (v.state == Idle) :
+    // !v.fadeActive` test) -- NOT the stricter PERF-7 `silentSkippable`
+    // predicate `activeCount` above uses, which is a separate, more
+    // aggressive DEBUG-COUNTER-only metric (getDebugActiveVoiceCount()) that
+    // does not actually gate rendering. Using any other predicate here would
+    // silently change which voices render. `v.state` is finalised for the
+    // whole upcoming control block by this point (every write to it above
+    // has already happened), so this list is valid for every sample of the
+    // chunk process() is about to render. Fade slots are deliberately
+    // excluded (they can flip fadeActive MID-chunk, on their own per-sample
+    // counter -- see process()'s own comment on why they always stay on the
+    // scalar path).
+    mActiveVoiceCount = 0;
+    for (int i = 0; i < kMaxVoices; ++i) {
+        if (mVoices[i].state != nassau_alloc::SlotState::Idle) {
+            mActiveVoiceList[mActiveVoiceCount++] = i;
+        }
+    }
 }
 
 double SynthCore::octaveOffsetSemis(Octave o) {

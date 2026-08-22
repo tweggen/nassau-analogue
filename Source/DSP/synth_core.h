@@ -14,6 +14,7 @@
 #include "synth_osc.h"
 #include "synth_filter.h"
 #include "synth_alloc.h"
+#include "synth_simd.h"
 
 // G5 (docs/GATES.md): the LPF is now GENUINELY WIRED into the per-voice
 // audio path (mixer -> DC block -> LPF -> VCA, DESIGN.md §1) -- G4 built and
@@ -965,6 +966,26 @@ private:
     /// fade slots, entered only via stealToFadeSlot() (a plain struct copy,
     /// not an allocation) and left only by their own 2ms sample counter.
     Voice mVoices[kMaxVoices + kNumFadeSlots];
+
+    // ===== DESIGN.md §12.3: SIMD-over-voices compacted active-chain list =====
+    // [PERF-7]/DESIGN.md §12.3: silent voices are skipped entirely, and are
+    // NOT contiguous in `mVoices` (a held chord over time scatters active
+    // slots across the fixed 16-voice pool) -- so the audio-rate loop cannot
+    // just pair (vi, vi+1) directly. `mActiveVoiceList` is a FIXED-SIZE
+    // (R3: no allocation in process()) compaction of the currently-active
+    // MAIN-POOL voice indices (fade slots are excluded -- see
+    // Source/DSP/synth_core.cpp's process() for why), in ascending `vi`
+    // order, rebuilt once per CONTROL BLOCK (controlRateUpdate(), the same
+    // cadence [PERF-7]'s own activeCount already uses) from the SAME
+    // predicate the audio-rate loop's skip check uses (`state != Idle`) --
+    // so this list names EXACTLY the voices that render this block, in the
+    // EXACT order they render in today's plain vi-ascending scalar loop.
+    // Pairing adjacent LIST entries (not adjacent `vi`s) two at a time,
+    // scalar remainder on an odd count, is what SynthCore::process()'s
+    // audio-rate loop actually does with this (DESIGN.md §12.3).
+    int mActiveVoiceList[kMaxVoices] = {};
+    int mActiveVoiceCount = 0;
+
     int mHeldVoiceCount = 0;   ///< DESIGN.md §7: LFO delay retriggers only on 0->1 of this
     Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
                                   ///< control block, read by every voice -- never per-voice.
@@ -1182,6 +1203,69 @@ private:
         c.gLpfSvfCur += c.gLpfSvfStep;
         return c.lpfSvf.process(x);
     }
+
+    // ===== DESIGN.md §12.3: SIMD-over-voices =====
+    // Only compiled/used when `nassau_real == double` (i.e. NASSAU_DSP_FLOAT
+    // is OFF, the default build) -- Vec2d (synth_simd.h) has a well-defined
+    // 2-wide `double` backend only; §12.2's opt-in float path is a separate,
+    // ARM-motivated escape hatch this gate does not touch (see
+    // synth_simd.h's own header comment for the full reasoning). Under
+    // NASSAU_DSP_FLOAT, process() renders every voice through
+    // processChainFilters() below one at a time, exactly as it always has.
+#if !defined(NASSAU_DSP_FLOAT)
+    /// The SIMD-paired twin of runLpfStructure() above: runs chain `ca`'s and
+    /// chain `cb`'s LPF structure selected by `slope` TOGETHER, one sample
+    /// each, via Source/DSP/synth_simd.h's ladderPairProcess()/
+    /// svfPairProcess(). Bit-identical to two separate runLpfStructure()
+    /// calls (see synth_simd.h's own bit-exactness argument) -- same
+    /// advance-then-step-the-ramp shape, just two chains at once.
+    static inline void runLpfStructurePair(Voice::Chain& ca, Voice::Chain& cb, int slope, double xA,
+                                            double xB, double& yA, double& yB) {
+        if (slope == static_cast<int>(LpfSlope::Db24)) {
+            ladderPairProcess(ca.lpfLadder, cb.lpfLadder, ca.gLpfLadderCur, cb.gLpfLadderCur, xA, xB, yA, yB);
+            ca.gLpfLadderCur += ca.gLpfLadderStep;
+            cb.gLpfLadderCur += cb.gLpfLadderStep;
+            return;
+        }
+        svfPairProcess(ca.lpfSvf, cb.lpfSvf, ca.gLpfSvfCur, cb.gLpfSvfCur, xA, xB, yA, yB);
+        ca.gLpfSvfCur += ca.gLpfSvfStep;
+        cb.gLpfSvfCur += cb.gLpfSvfStep;
+    }
+#endif
+
+    /// One chain's worth of osc -> mix -> mixer DC block -> drive -> HPF ->
+    /// LPF (single structure, or both blended during a slope crossfade) ->
+    /// post-LPF DC block, for ONE sample -- factored out of the audio-rate
+    /// loop (Source/DSP/synth_core.cpp) so the scalar remainder path, the
+    /// two fade slots, and (under NASSAU_DSP_FLOAT) every voice all share
+    /// EXACTLY one implementation with the SIMD-paired path below (DESIGN.md
+    /// §12.3: "same operations, same order" is only checkable if there is
+    /// only one copy of the scalar sequence to check). Sets ch's own
+    /// debugMixOut/debugDriveOut/debugHpfOut/lastLpfOutput readbacks exactly
+    /// as the pre-§12.3 inline code did. Returns the post-postLpfDcBlock
+    /// filter output (pre gain/pan/fade-gain -- the caller applies those,
+    /// which differ between a main-pool voice and a fade slot).
+    double processChainFilters(Voice::Chain& ch, double ynoise, const ParamSnapshot& snapshot,
+                                double crossfadeT);
+
+#if !defined(NASSAU_DSP_FLOAT)
+    /// The SIMD-paired twin of processChainFilters() above: runs TWO chains'
+    /// osc/mix/drive scalar (unchanged, unvectorized -- DESIGN.md §12's own
+    /// "vectorize?" table says no here) and their mixer DC block / HPF / LPF
+    /// / post-LPF DC block TOGETHER via synth_simd.h's pair functions. `chA`/
+    /// `chB` may be the SAME voice's two stereo chains (they share
+    /// modulation but keep independent filter state, DESIGN.md §9) or two
+    /// DIFFERENT voices' chain 0 (the mono/[PERF-7] compacted-list pairing,
+    /// DESIGN.md §12.3) -- this function does not care which; the caller
+    /// (process()) decides the pairing and is responsible for the
+    /// gain/pan/peak bookkeeping this function does not do (see
+    /// processChainFilters()'s own comment). Bit-identical to calling
+    /// processChainFilters(chA, ...) then processChainFilters(chB, ...)
+    /// separately -- see synth_simd.h's header comment for the argument.
+    void processChainPairFilters(Voice::Chain& chA, double ynoiseA, Voice::Chain& chB, double ynoiseB,
+                                  const ParamSnapshot& snapshot, double crossfadeT, double& outA,
+                                  double& outB);
+#endif
 
     static constexpr uint32_t kLfoShSeed = 0x5EED1234u;  // [voicing] fixed S&H seed, R8/R13
 

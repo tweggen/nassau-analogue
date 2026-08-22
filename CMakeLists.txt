@@ -69,6 +69,26 @@ if(NASSAU_DSP_FLOAT)
     add_compile_definitions(NASSAU_DSP_FLOAT)
 endif()
 
+# SIMD-over-voices (DESIGN.md §12.3), ON by default on the double-precision
+# path: pairs two active voices' (or one stereo voice's own two chains')
+# LadderFilter/SvfFilter/HpfCascade/OnePoleHP per-sample processing via SSE2
+# 2-wide `double` intrinsics (Source/DSP/synth_simd.h), bit-identical to the
+# scalar path it replaces (both golden batteries verify at exactly
+# 0.000e+00 with this ON). This flag is the R7-required portable escape
+# hatch: with it ON, synth_simd.h's Vec2d compiles to two plain `double`s
+# and plain scalar arithmetic instead of intrinsics -- no arch header, no
+# -march flag, just ordinary C++ -- which is also what any non-x86 target
+# without an intrinsic backend compiles to today (there is no NEON backend
+# yet, see synth_simd.h's own header comment). `add_compile_definitions`
+# (directory-wide) matches NASSAU_DSP_FLOAT's own convention just above, for
+# the same ODR reason.
+option(NASSAU_NO_SIMD
+    "Disable the SSE2 SIMD-over-voices intrinsics and use the portable two-double scalar fallback instead -- default OFF (DESIGN.md §12.3)"
+    OFF)
+if(NASSAU_NO_SIMD)
+    add_compile_definitions(NASSAU_NO_SIMD)
+endif()
+
 # DSP core (always builds — no framework dependencies, R2/R14).
 add_subdirectory(Source/DSP)
 

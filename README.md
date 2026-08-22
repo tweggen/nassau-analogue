@@ -64,39 +64,55 @@ The headline consequences:
 The budget the plan holds itself to: **8 voices, mono, 48 kHz, ≥ 10× realtime
 (≤ 10 % of one core)**, stereo mode ≤ 2.0× that.
 
-## Performance (measured, G11)
+## Performance (measured, G11 + §12.3 SIMD-over-voices)
 
 Linux dev box (g++ 15.3.0, Release, Intel Xeon E5-1650 v3 @ 3.50 GHz),
-`Tests/synth_bench.cpp`, fs = 48 kHz, block = 512, best of 7. Every "N voices"
-row is checked against `getDebugActiveVoiceCount()` post-warm-up, so it means
-N voices *actually sounding* (nonzero sustain, never note-off'd during the
-timed region), not N allocated with some silently skipped by the
-silent-voice-skip path ([PERF-7]):
+`Tests/synth_bench.cpp`, fs = 48 kHz, block = 512, best of 7, run **alone**
+(never alongside `ctest`, which was measured to inflate every figure by
+~40%). Every "N voices" row is checked against `getDebugActiveVoiceCount()`
+post-warm-up, so it means N voices *actually sounding* (nonzero sustain,
+never note-off'd during the timed region), not N allocated with some
+silently skipped by the silent-voice-skip path ([PERF-7]):
 
-| Config | ns/sample | ×realtime@48k |
-|---|---|---|
-| idle | 19.0 | 1099× |
-| 1 voice | 81.449 | 255.8× |
-| **8 voices, mono** | **467.6** | **44.6×** |
-| 8 voices, stereo | 930.172 | 22.4× |
-| 16 voices, unison | 1014.115 | 20.5× |
+| Config | before SIMD (ns/sample) | after SIMD (ns/sample) | speedup | ×realtime@48k (after) |
+|---|---|---|---|---|
+| idle | 17.95 | 12.77 | 1.41× | 1631× |
+| 1 voice | 72.27 | 70.79 | 1.02× | 294× |
+| **8 voices, mono** | **472.25** | **312.90** | **1.51×** | **66.6×** |
+| 8 voices, stereo | 856.80 | 575.59 | 1.49× | 36.2× |
+| 16 voices, unison | 932.00 | 612.91 | 1.52× | 34.0× |
 
-**Budget verdict: 8 voices mono clears the ≥10× floor at 44.6× realtime — a
-4.0× margin** (and already cleared it, at 40.0×, before either G11.11
-optimization below — see `docs/GATES.md`'s G11 status note for why no further
-optimization, e.g. SIMD-over-voices, was attempted). Idle costs **3.5%** of
-the 8-voice-active cost (bound ≤ 5 %, [PERF-7] confirmed real). Stereo costs
-**1.80×** mono (bound ≤ 2.0×).
+**Budget verdict: 8 voices mono clears the ≥10× floor at 66.6× realtime — a
+6.7× margin.** The budget was already met before any optimization (40.0×
+realtime, `docs/GATES.md`'s G11 status note), so §12's escape hatches were
+never *required* — §12.3 (SIMD-over-voices, `Source/DSP/synth_simd.h`) was
+built anyway, by request, on the understanding that it is the most invasive
+of the three and must not be attempted without the golden battery frozen and
+watching. It was: **both golden batteries verify at exactly the same
+value as before this work, bit for bit** — `golden.bin` (G11) at
+`0.000e+00`, `golden_g5.bin` (G5) at `7.105e-15` (a pre-existing, documented
+value, not introduced by this change — see `docs/DESIGN.md` §12.3). Per-voice
+marginal cost dropped **56.79 ns → 37.52 ns (1.51×, 34% less)** — well past
+this section's own pre-implementation estimate of ~10-12%; §12.3 explains
+why (a genuine division-count reduction in the HPF cascade, plus better
+instruction-level parallelism than the five separate scalar calls it
+replaces — not just narrower SIMD lanes).
 
-Two hot-loop items were found and fixed with the golden battery watching
-(`Tests/fixtures/golden.bin`, `GoldenParity`, held at **exactly `0.000e+00`**
-max abs error throughout, not merely inside the 1e-6 tolerance): `frac`'s
-per-sample division replaced with a per-chunk division plus an accumulated
-step, and a per-sample-per-voice debug-only branch
-(`mDebugDisableVcaInterpolation`) hoisted out of the audio-rate loop entirely.
-Combined effect: **≈1%** across every voice-loaded config — modest, because
-the budget was never actually tight; see `docs/GATES.md`'s G11 status note
-for the full before/after table and the per-optimization breakdown.
+Idle costs **4.1%** of the 8-voice-active cost (bound ≤ 5 %, [PERF-7]
+confirmed real). Stereo costs **1.84×** mono (bound ≤ 2.0×).
+
+SSE2, 2-wide `double`, x86-64's baseline ISA (no `-march` flag, R7-legal).
+`-DNASSAU_NO_SIMD=ON` is the portable fallback R7 requires — see
+`docs/DESIGN.md` §12.3 for the mechanism, the bit-exactness argument, and a
+note for whoever adds a NEON backend next (none exists yet: no ARM hardware
+was available to build or verify one here).
+
+Two earlier hot-loop items (pre-SIMD, `docs/GATES.md`'s G11 status note) were
+found and fixed with the golden battery watching: `frac`'s per-sample
+division replaced with a per-chunk division plus an accumulated step, and a
+per-sample-per-voice debug-only branch (`mDebugDisableVcaInterpolation`)
+hoisted out of the audio-rate loop entirely. Combined effect: **≈1%** across
+every voice-loaded config.
 
 ## Dependencies
 
@@ -185,6 +201,26 @@ double throughput, 4-wide NEON for `float32`) is reasoned, not measured** —
 no ARM hardware was available for this work. Re-run
 `Tests/synth_bench.cpp` on the target hardware (alone, never alongside
 `ctest`) before relying on this flag anywhere.
+
+### SIMD-over-voices (`Source/DSP/synth_simd.h`, on by default) and its fallback
+
+The default build pairs active voices' filter processing two at a time via
+SSE2 2-wide `double` intrinsics (`docs/DESIGN.md` §12.3) — bit-identical to
+the plain scalar path it replaces (both golden batteries verify at exactly
+the same value, unchanged by this feature). To force the portable
+scalar-pair fallback (no intrinsics, no arch header — the R7-required escape
+hatch, and what any non-x86 target without an intrinsic backend uses today):
+
+```sh
+cmake -S . -B build-nosimd -DCMAKE_BUILD_TYPE=Release -DNASSAU_NO_SIMD=ON
+cmake --build build-nosimd -j
+ctest --test-dir build-nosimd --output-on-failure
+```
+
+There is currently no NEON backend (no ARM hardware was available to build
+or verify one) — an ARM/Apple Silicon host falls back to the same portable
+scalar path automatically. See `docs/DESIGN.md` §12.3 for what a future NEON
+branch needs to implement.
 
 ### If the build fails on `File can't be removed and still exist`
 
