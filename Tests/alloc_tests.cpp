@@ -625,7 +625,7 @@ int main() {
   // bound (never before s) is asserted at the AC's own literal [s, ...].
   //
   // *** R11 FINDING (a plan defect, not a G7 regression): the upper bound
-  // is asserted at s+33, not the AC's literal s+31 -- measured, and traced
+  // is asserted at s+32, not the AC's literal s+31 -- measured, and traced
   // to TWO STACKING mechanisms, neither introduced by this gate:
   //
   // (1) process()'s control-block loop (Source/DSP/synth_core.cpp, G0/G3-
@@ -662,7 +662,7 @@ int main() {
   //     [PERF-1] exists to prevent -- not a trade this gate should make.
   //
   // Net, measured, PER MECHANISM: (1) contributes up to +32 (not +31),
-  // (2) contributes exactly +1 more -- s+33 worst case, confirmed at every
+  // (2) contributes exactly +1 more -- s+32 worst case, confirmed at every
   // s tested where s mod mControlBlock lands unfavourably (s=0, s=32
   // below). ***
   // =========================================================================
@@ -684,9 +684,9 @@ int main() {
           break;
         }
       }
-      const bool ok = firstNonZero >= s && firstNonZero <= s + 33;  // see this group's own R11 comment
-      checkNum("G7.8: note-on at offset " + std::to_string(s) + " -- first non-zero sample in [s, s+33] "
-               "(R11: NOT the AC's literal s+31 -- see this group's own comment)",
+      const bool ok = firstNonZero >= s && firstNonZero <= s + 32;  // see this group's own R11 comment
+      checkNum("G7.8: note-on at offset " + std::to_string(s) + " -- first non-zero sample in [s, s+32] "
+               "(s+31 quantisation + 1 architectural, see this group's comment)",
                ok, firstNonZero);
     }
   }

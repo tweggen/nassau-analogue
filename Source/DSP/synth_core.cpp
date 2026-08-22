@@ -214,6 +214,37 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
     // (block-size invariance) depends on.
     int n = 0;
     while (n < numSamples) {
+        // ---- control-rate update point ----
+        // AT THE TOP, before rendering, whenever the grid sits on a boundary.
+        //
+        // This used to sit at the BOTTOM, after the chunk was rendered, which
+        // cost a full extra control block of latency for any event landing
+        // exactly on a boundary: an event at offset 0 with the grid already at
+        // phase 0 was applied only after 32 samples had been rendered. That is
+        // an off-by-one, not a design choice, and it is what made G7.8 measure
+        // s+33 against its own [s, s+31] bound. Applying at the top makes an
+        // event at a boundary take effect on the very next sample rendered.
+        //
+        // Note `<= n`, not `< n`: at the top of an iteration n is the position
+        // about to be rendered, so an event AT n is due now. The old bottom
+        // form used `< n` because n had already advanced past the chunk.
+        if (mControlPhase == 0) {
+            // Events queued by a PREVIOUS call that never reached a boundary
+            // are chronologically earlier than this call's own -- drain first.
+            for (int p = 0; p < mPendingCount; ++p) applyEvent(mPendingEvents[p], snapshot, fs);
+            mPendingCount = 0;
+
+            while (eventIdx < numEvents && events[eventIdx].sampleOffset <= n) {
+                applyEvent(events[eventIdx], snapshot, fs);
+                ++eventIdx;
+            }
+
+            // Per control block: ADSRs advance one step, the LFO advances one
+            // step (globally, once — not per voice), pitch/VCA-gain are
+            // recomputed (DESIGN.md §2).
+            controlRateUpdate(snapshot, fs);
+        }
+
         const int samplesToBoundary = mControlBlock - mControlPhase;
         const int samplesRemaining = numSamples - n;
         const int chunk = std::min(samplesToBoundary, samplesRemaining);
@@ -430,26 +461,6 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
         mControlPhase += chunk;
         if (mControlPhase >= mControlBlock) {
             mControlPhase = 0;
-
-            // ---- control-rate update point ----
-            // Any events queued by a PREVIOUS call that couldn't reach a
-            // boundary within their own call are due at THIS, the first
-            // boundary a call reaches -- drain them first (chronologically
-            // they precede this call's own events).
-            for (int p = 0; p < mPendingCount; ++p) applyEvent(mPendingEvents[p], snapshot, fs);
-            mPendingCount = 0;
-
-            // This call's own events with sampleOffset < n (i.e. within the
-            // chunk[s] just rendered, [.., n)) are due at this boundary too.
-            while (eventIdx < numEvents && events[eventIdx].sampleOffset < n) {
-                applyEvent(events[eventIdx], snapshot, fs);
-                ++eventIdx;
-            }
-
-            // Per control block: ADSRs advance one step, the LFO advances
-            // one step (globally, once — not per voice), pitch/VCA-gain are
-            // recomputed (DESIGN.md §2).
-            controlRateUpdate(snapshot, fs);
         }
     }
 
