@@ -211,7 +211,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // subtle Prophet-flavoured Poly-Mod (ENV-F -> VCO2 pitch) for growl.
       // Stereo mode widens it.
       {"Jupiter Brass",
-       WithOverrides({{kOsc1Level, 100.0},
+       WithOverrides({{kMasterVolume, -8.0},  // [voicing] G9 headroom trim -- was default -6; only 0.60 dB of headroom on that voicing
+                       {kOsc1Level, 100.0},
                        {kOsc2Level, 90.0},
                        {kEnvFAttack, 8.0},
                        {kEnvFDecay, 650.0},
@@ -299,7 +300,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // DESIGN.md §4.1 calls out as one of this instrument's core timbres.
       // 12 dB SVF, wide stereo.
       {"PWM Pad",
-       WithOverrides({{kMasterVolume, -15.0},  // headroom: wide detuned stereo pulse pad
+       WithOverrides({{kMasterVolume, -17.0},  // [voicing] G9 headroom trim -- was -15; only 0.52 dB of headroom  // headroom: wide detuned stereo pulse pad
                        {kOsc1Wave, 1.0},  // Pulse
                        {kOsc1PW, 50.0},
                        {kOsc2Wave, 1.0},  // Pulse
@@ -470,7 +471,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // the resonant LPF ever sees it, plus a fast filter/amp envelope and
       // real drive bite.
       {"HPF Clav",
-       WithOverrides({{kOsc1Wave, 1.0},  // Pulse
+       WithOverrides({{kMasterVolume, -10.0},  // [voicing] G9 headroom trim -- was default -6; measured +2.04 dBFS (clipping) on a C3 G3 C4 G4 voicing
+                       {kOsc1Wave, 1.0},  // Pulse
                        {kOsc1PW, 30.0},
                        {kOsc1Level, 100.0},
                        {kOsc2Wave, 1.0},  // Pulse
