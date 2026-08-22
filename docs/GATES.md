@@ -164,6 +164,25 @@ Use the shared `Xorshift` generator, as Zermatt does.
 public API of `SynthCore` — declared, not implemented. No sound yet beyond a
 proven-silent, proven-bounded path.
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4): `ctest --test-dir build` → 1/1 test binaries passed, `SynthTests`
+> 27/27 checks passed, 0 compiler warnings at `-Wall -Wextra -Wpedantic`
+> across `Source/DSP` + `Tests` (both the default and
+> `-DNASSAU_FORCE_HEADLESS=ON` configs), 0 heap allocations measured across
+> 479,744 samples (937×512-sample blocks ≈ 10 s @ 48 kHz) of `process()` with
+> a busy 8-event stream (G0.11), and a full `-fsanitize=thread` rebuild of the
+> same binary (GCC supports it; G0.9's own AC anticipates this) ran the same
+> 27/27 checks green with zero TSan diagnostics. G0.1/G0.3(plugin
+> half)/G0.12 are **not applicable on this platform** — no SDK/iPlug2
+> checkout exists here and the platform is Linux (DESIGN.md §0.4); `G0.2`'s
+> skip-message path is exactly what was exercised instead. `Source/Plugin/`
+> was written (config.h, NassauAnaloguePlugin.{h,cpp}, NassauAnalogueUI.{h,cpp},
+> nassau_state.h, the 3 Info.plist templates) but is **unbuilt and
+> unverified** — G9 is the first gate that can actually compile it. See the
+> G0 gate report (session record) for the full per-AC table, the
+> `PLUG_MFR_ID` wording conflict found in this gate's own text (R11), and the
+> debug-accessor scoping decision.
+
 ### Deliverables
 
 * `CMakeLists.txt` mirroring `nassau-zermatt/CMakeLists.txt`: `Source/DSP` always,
@@ -225,7 +244,7 @@ the submodules are provisioned.
 | G0.7 | `reset()` clears all state without touching params: process a note, `reset()`, then re-run the identical event sequence — output is **bit-identical** to a fresh instance's (this is also R13's first test) | exact |
 | G0.8 | `process()` is safe for every host block size 1..8192 including 1, and for `numEvents == 0`, and for events at offset 0 and at `numSamples-1` | no crash, all finite |
 | G0.9 | Every setter can be called from a non-audio thread while `process()` runs, with no data race | thread + 1 s of blocks; plus one `-fsanitize=thread` build on a Clang host if available, else record "not run" |
-| G0.10 | `PLUG_UID_STR` differs from NassauZermatt's `C51E51D5BAFEFB22B5B6E8CFF6BEFB30` and NassauEQ's `6DDB946C34D64805A0C496E553B57266`, **and so do `PLUG_UNIQUE_ID` / `PLUG_MFR_ID`** — AU and some VST3 hosts key on the 4-char codes, not the UID, so a unique UID alone is not enough | grep |
+| G0.10 | `PLUG_UID_STR` is **exactly 32 hex characters** and differs from NassauZermatt's `C51E51D5BAFEFB22B5B6E8CFF6BEFB30` and NassauEQ's `6DDB946C34D64805A0C496E553B57266`; **`PLUG_UNIQUE_ID` also differs** from Zermatt's `'Nzm1'`. **`PLUG_MFR_ID` deliberately does NOT differ** — it stays `'Nass'`. A manufacturer code names the *vendor* and is expected to be constant across a catalogue; per-plugin uniqueness is the job of the `(type, subtype)` pair, which `PLUG_UNIQUE_ID` already provides. An earlier draft of this AC said "and so do `PLUG_UNIQUE_ID` / `PLUG_MFR_ID`", contradicting this gate's own Deliverables snippet two paragraphs above; G0 found the contradiction and resolved it this way. **Assert the length**: a VST3 FUID is 128 bits, so 31 or 33 characters is malformed, and nothing on a Linux or headless box will ever tell you — G0 shipped a 31-character UID (one character lost transcribing a SHA-256 digest) that a `grep`-only check passed | grep + length assert |
 | G0.11 | **Zero heap allocation in `process()`**: global `operator new`/`delete` counter, 10 s of blocks with a busy event stream, count == 0. Land this in G0 rather than G10 — an instrument has a dozen places to accidentally allocate (event vectors, voice lists) and retrofitting the check finds them all at once, late | 0 allocations |
 | G0.12 | Plugin loads in one real host on an instrument track, receives MIDI, and outputs silence without crashing | manual, recorded in the gate note |
 

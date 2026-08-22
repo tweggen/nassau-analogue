@@ -20,9 +20,10 @@ sustain-pedal state, stereo duplication — lives in the core, behind a
 framework-free `NoteEvent` interface. It builds and is unit-tested standalone,
 with no SDK present.
 
-> **Status: planning complete and adversarially reviewed, no code yet.**
-> Twelve gates (G0–G11) are specified in [`docs/GATES.md`](docs/GATES.md), each
-> with objectively measurable acceptance criteria.
+> **Status: G0 done** (scaffold, build, test harness, `SynthCore`'s complete
+> 53-param API declared — silent, no DSP yet). Twelve gates (G0–G11) are
+> specified in [`docs/GATES.md`](docs/GATES.md), each with objectively
+> measurable acceptance criteria; see that file for the per-gate status.
 >
 > The plan went through one independent review pass before any code was written.
 > It found nine defects that a correct implementation would have failed —
