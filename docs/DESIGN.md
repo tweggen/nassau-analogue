@@ -118,6 +118,7 @@ which are computed once per voice and used by both chains (PERF-5).
      4. SUB        square at VCO1/2 or VCO1/4, from VCO1's phase × SubLevel
      5. NOISE      white | pink                          × NoiseLevel
      6. MIX        sum of 2..5
+     6b. DC BLOCK  1-pole HP @ 5 Hz — a pulse carries DC of (2d-1)
      7. DRIVE      shapeTriodeK(x, k(Drive))    — exact identity at Drive = 0
      8. HPF        TPT 1-pole HP cascade, 2 or 4 poles, cutoff × key follow
      9. LPF        24 dB: ZDF ladder │ 12 dB: TPT SVF        (§5)
@@ -350,6 +351,33 @@ pre   = 1 + 2*(Drive/100)                  // pre(0) == 1.0 EXACTLY
 knee  = 3.0 * (Drive/100)^1.5              // knee(0) == 0.0 EXACTLY
 drive = shapeTriodeK(mix * pre, knee) / pre
 ```
+
+### 4.1 The mixer DC blocker — not optional
+
+A pulse wave of duty `d` carries a DC offset of **exactly `2d − 1`**. That is not
+a defect to be tuned out; it is what a pulse *is*. Measured on this
+implementation before the blocker existed: **−0.50 at PW = 25 %** and **−0.80 at
+PW = 10 %**. PWM is one of this instrument's core sounds, so without AC coupling
+the synth emits an enormous DC offset in ordinary use.
+
+So a **one-pole high-pass at 5 Hz sits on the mixer output**, per voice, before
+everything downstream. Real hardware does this with a coupling capacitor.
+Measured after: **1e-6 to 5e-6 at every duty**, against G3.12's 1e-4 bound.
+
+**It must sit before the drive and the filter, not at the output.** DC into a
+saturator biases it into asymmetric clipping, so the timbre would track pulse
+width in a way that is not the PWM sound anyone wants; and DC into a resonant
+ladder shifts the operating point its feedback saturator is bounded around.
+
+Two consequences worth knowing before writing a test against this chain. The
+blocker is a 5 Hz one-pole, so its **step response at note-on has τ = 31.8 ms**
+and takes ~160 ms to settle. Any zero-crossing-based pitch or period estimate
+must skip that, or it reads the settling transient as pitch drift (G3.7's
+control measured 1.43 cents of phantom drift before its window was moved, and
+0.0027 cents after). And an unmodulated periodic signal must be averaged over a
+**whole number of periods** — 4096 samples at 261.63 Hz is 22.32 periods, and
+the truncation alone shows up as ~8e-3 of phantom DC, which is 80× G3.12's
+bound. This was found the hard way, twice, during G4's review.
 
 Dividing by `pre` — not by some separate normalisation function — is what makes
 the drive a *timbre* control rather than a volume control: `shapeTriodeK` has

@@ -37,6 +37,12 @@ void SynthCore::init(float sampleRate) {
     for (int i = 0; i < kG3Voices; ++i) {
         mVoices[i].osc1.setSampleRate(sampleRate);
         mVoices[i].osc2.setSampleRate(sampleRate);
+        // [dsp] Mixer DC blocker at 5 Hz -- the same corner nassau-zermatt
+        // uses for its coupling-cap models, and far enough below the lowest
+        // musical fundamental (16' at MIDI 0 is 4.1 Hz, but no envelope
+        // sustains a note that low audibly) to be transparent in band.
+        // DESIGN.md §4.
+        mVoices[i].dcBlock.setFc(5.0, sampleRate);
     }
 
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
@@ -54,6 +60,7 @@ void SynthCore::reset() {
     mControlPhase = 0;
 
     for (int i = 0; i < kG3Voices; ++i) {
+        mVoices[i].dcBlock.reset();
         Voice& v = mVoices[i];
         v.osc1.reset();   // full reset (phase + triangle integrator state) --
         v.osc2.reset();   // distinct from the PHASE-ONLY resetPhase() a note-on
@@ -162,9 +169,17 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 const double ysub = v.sub.step(prePhase1, v.osc1.dt, r1.wrapped, true);
                 const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
 
-                const double mix = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
+                const double mixRaw = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
                                                     snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
                                                     ynoise, snapshot.noiseLevelPercent);
+                // DC blocker on the mixer output (DESIGN.md §4). A pulse of
+                // duty d carries DC of exactly (2d - 1); at PW=25% that is
+                // -0.50. Two mul + two add per sample per voice, and it must
+                // sit BEFORE the drive and the resonant filter, not at the
+                // output: DC into a saturator biases it into asymmetric
+                // clipping, which would make the timbre track pulse width in
+                // a way that is not the PWM sound anyone wants.
+                const double mix = v.dcBlock.process(mixRaw);
 
                 // G4 NOTE (DESIGN.md §5.1/§1, docs/GATES.md's own "driving
                 // the structures directly from the test... is the expected

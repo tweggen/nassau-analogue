@@ -829,13 +829,24 @@ int main() {
     core.setLfoWave(SynthCore::LfoWave::Tri);
 
     const int note = 57;  // 220.00 Hz exactly (G2.1's tuning table)
-    const int total = static_cast<int>(0.4 * kFs);  // 2 LFO periods (200ms each)
+    // Skip EXACTLY ONE whole LFO cycle before measuring. Two reasons, and the
+    // first is not optional: the per-voice mixer DC blocker (DESIGN.md §4) is
+    // a 5 Hz one-pole, so its own step response at note-on has tau = 1/(2*pi*5)
+    // = 31.8 ms and needs ~5 tau = 159 ms to settle. Residual DC displaces
+    // zero crossings, and measuredF0 is a zero-crossing estimator, so
+    // measuring from sample 0 reads the blocker's transient as pitch drift
+    // (measured 1.43 cents on a completely unmodulated note). A 200 ms skip
+    // clears 6.3 tau AND is a whole LFO period, so the four quarter windows
+    // keep their exact phase alignment -- any other settle time would shift
+    // the LFO phase and corrupt the 50.12-cent figure this AC is built on.
+    const int settle = static_cast<int>(0.2 * kFs);          // 1 LFO period @ 5 Hz
+    const int total = settle + static_cast<int>(0.4 * kFs);  // + 2 LFO periods
     auto out = renderNoteHeld(core, note, 1.0f, total);
 
     const int q = static_cast<int>(0.05 * kFs);  // 50ms = one quarter cycle at 5Hz
     double quarters[4];
     for (int k = 0; k < 4; ++k) {
-      const double f = measuredF0(slice(out, k * q, (k + 1) * q), kFs);
+      const double f = measuredF0(slice(out, settle + k * q, settle + (k + 1) * q), kFs);
       quarters[k] = 1200.0 * std::log2(f / 220.0);
     }
     const double maxC = *std::max_element(quarters, quarters + 4);
@@ -861,7 +872,7 @@ int main() {
     auto outOff = renderNoteHeld(coreOff, note, 1.0f, total);
     double q2[4];
     for (int k = 0; k < 4; ++k) {
-      const double f = measuredF0(slice(outOff, k * q, (k + 1) * q), kFs);
+      const double f = measuredF0(slice(outOff, settle + k * q, settle + (k + 1) * q), kFs);
       q2[k] = 1200.0 * std::log2(f / 220.0);
     }
     const double swingOff =
@@ -1248,6 +1259,36 @@ int main() {
     check("G3.12: mean of the last 4096 samples (an exact whole number of cycles at the chosen "
           "375Hz carrier) after 2s, every waveform, < 1e-4",
           allOk);
+
+    // ---- Pulse width, the case the original AC missed entirely -----------
+    // A pulse of duty d carries DC of EXACTLY (2d - 1). Testing only the 50%
+    // default hid this completely: before DESIGN.md §4.1's mixer DC blocker
+    // existed, this synth measured -0.50 DC at PW=25% and -0.80 at PW=10%,
+    // i.e. four thousand times the bound, while G3.12 sat green. PWM is a
+    // core sound of this instrument, not an exotic corner.
+    bool pwOk = true;
+    for (double pw : {10.0, 25.0, 40.0, 50.0}) {
+      SynthCore core;
+      core.init(48000.0f);
+      core.setOsc1Wave(SynthCore::Wave::Pulse);
+      core.setOsc1PwPercent(static_cast<float>(pw));
+      core.setOsc1FineCents(fineDc);
+      core.setOsc2LevelPercent(0.0f);
+      core.setSubLevelPercent(0.0f);
+      core.setNoiseLevelPercent(0.0f);
+      core.setEnvAAttackMs(5.0f);
+      core.setEnvASustainPercent(100.0f);
+      auto out = renderNoteHeld(core, noteDc, 1.0f, static_cast<int>(2.0 * kFs));
+      double mean = 0.0;
+      for (size_t i = out.size() - 4096; i < out.size(); ++i) mean += out[i];
+      mean /= 4096.0;
+      std::cout << "    pulse PW=" << pw << "% DC mean=" << mean
+                << "  (undamped this would be " << (2.0 * pw / 100.0 - 1.0) << ")\n";
+      if (std::fabs(mean) >= 1e-4) pwOk = false;
+    }
+    check("G3.12: pulse DC < 1e-4 at PW = 10/25/40/50% -- proves DESIGN.md §4.1's "
+          "mixer DC blocker is present (a pulse's own DC is 2d-1)",
+          pwOk);
   }
 
   // =========================================================================

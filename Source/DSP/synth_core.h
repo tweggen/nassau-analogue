@@ -539,6 +539,13 @@ private:
         Osc osc1, osc2;
         SubOsc sub;
         NoiseSource noise;
+        /// Per-voice DC blocker, applied to the MIXER OUTPUT before anything
+        /// downstream (DESIGN.md §4). A pulse of duty d carries a DC offset of
+        /// exactly (2d - 1) by construction -- measured -0.50 at PW=25% and
+        /// -0.80 at PW=10% -- so PWM, one of this instrument's core sounds,
+        /// emits large DC into the drive stage and the resonant filter unless
+        /// it is coupled out. Real hardware does this with a capacitor.
+        OnePoleHP dcBlock;
         AdsrEnv envF, envA;    ///< ENV-F (filter, not yet routed anywhere -- G5) / ENV-A (VCA).
                                ///< The LPF itself (G4: LadderFilter/SvfFilter,
                                ///< Source/DSP/synth_filter.h) is not yet a per-voice member --
