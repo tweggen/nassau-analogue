@@ -12,11 +12,13 @@ target_compile_options(synth_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME SynthTests COMMAND synth_tests)
 
-# NOTE: Tests/test_util.h (the shared rms/thdPercent/harmonicDb/... harness
-# helpers, docs/GATES.md "Shared test harness") is deliberately NOT created
-# here -- it is a G1 deliverable (started from
-# nassau-zermatt/Tests/test_util.h, plus the instrument-specific additions
-# docs/GATES.md lists). synth_tests.cpp above needs none of it: G0's
-# SynthCore::process() writes exact silence, so its own checks are
-# silence/finiteness/no-crash/thread-safety/allocation-count assertions with
-# no signal-analysis helpers required.
+# ---- G1: DSP primitives (Source/DSP/synth_dsp.h) ---------------------------
+# Header-only (no nassau_synth_core link needed) -- dsp_tests.cpp exercises
+# synth_dsp.h's structs/free functions directly, using the shared
+# Tests/test_util.h harness helpers (docs/GATES.md "Shared test harness").
+add_executable(dsp_tests dsp_tests.cpp)
+target_include_directories(dsp_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(dsp_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME DspTests COMMAND dsp_tests)

@@ -587,6 +587,9 @@ have anyway.
 * Rate: 0.05 .. 30 Hz, exponential taper. `[voicing]`
 * Delay: 0 .. 3000 ms. The delay is **per note-on of the first held note** — the
   LFO depth ramps in linearly after the delay, over 200 ms. `[ref]`
+  **At `kLfoDelay = 0` there is no ramp at all**: full depth immediately. A
+  control at zero means off, and the default must not carry an unrequested
+  200 ms fade. (Raised by G1, which had to pick one reading; settled here.)
   It resets only when the voice count goes from 0 to 1, so it does not restart
   under a held chord.
 * Destinations: pitch (± 50 cents at 100 %), pulse width (± 45 % at 100 %),

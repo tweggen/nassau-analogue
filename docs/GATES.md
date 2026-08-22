@@ -122,13 +122,19 @@ double harmonicDb(const std::vector<float>&, double f0, int n, double fs);  // G
 double nonHarmonicEnergyDb(const std::vector<float>&, double f0, double fs); // MUST BE MODIFIED
 void   envelopeDb(const std::vector<float>&, double fs, std::vector<double>&); // 1 ms frames
 
-// new for this plugin
-double magDbAt(SynthCore&, double probeHz, double fs);   // steady-state, noise-excited
-double measuredF0(const std::vector<float>&, double fs); // long-window, sub-cent accurate
-double minus3dBPoint(/*filter callable*/, double fs);    // bisection on the magnitude
-std::vector<NoteEvent> seqHoldNote(int note, float vel, double onSec, double offSec, double fs);
-std::vector<NoteEvent> seqChord(const std::vector<int>& notes, ...);
+// new for this plugin -- created by the gate that first needs them, NOT all in G1
+double measuredF0(const std::vector<float>&, double fs); // G1: long-window, sub-cent
+double minus3dBPoint(/*filter callable*/, double fs);    // G1: bisection on magnitude
+double magDbAt(SynthCore&, double probeHz, double fs);   // G4: needs a filter to probe
+std::vector<NoteEvent> seqHoldNote(int note, float vel, double onSec, double offSec, double fs); // G3
+std::vector<NoteEvent> seqChord(const std::vector<int>& notes, ...);                             // G7
 ```
+
+**Only the SynthCore-independent helpers are due in G1.** `magDbAt` needs a
+filter to probe and `seqHoldNote`/`seqChord` need a voice that responds to
+notes; neither exists before G3/G4. Writing them in G1 would mean writing
+untested guesswork against an API whose shape is still being decided. G1 raised
+this; it is settled here.
 
 ### Two things about `nonHarmonicEnergyDb` that invalidate every alias AC if missed
 
@@ -254,6 +260,57 @@ on which platform.
 ---
 
 # G1 — DSP primitives
+
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4): `ctest --test-dir build` → 2/2 test binaries passed (`SynthTests`
+> 27/27, `DspTests` 75/75), 0 compiler warnings at `-Wall -Wextra -Wpedantic`
+> across `Source/DSP` + `Tests`. All 19 ACs met; key measured numbers:
+> G1.1 TptOnePole LP matched an independently-coded analytic reference to
+> ≤0.043 dB (tol 0.1 dB) across 8 (fc,fs) combinations × 24 log-spaced probes
+> (20 Hz .. min(20 kHz, 0.48·fs), a range chosen to avoid the >−150 dBFS
+> region where float32 test-buffer precision, not the filter, dominates the
+> comparison). G1.2: HP == x−lp exact over 1e5 samples; DC residual
+> 4.1e-15 after 5 s (tol 1e-9). G1.3: finite/|y|<4 (max 1.528) across fc ∈
+> [10 Hz, 0.45·fs] at all 5 rates, 10 s of noise each. G1.4/G1.5: polyBlep
+> boundary residuals ≤4.4e-16, antisymmetry error ≤2.1e-15 (tol 1e-12).
+> G1.6/G1.7: Xorshift32 mean 8.9e-5, variance 0.33333 over 1e7 draws, no
+> immediate repeats, two same-seeded streams bit-identical over 1e6 draws.
+> G1.8: PinkFilter's 8 octave-pair sine-response deltas ranged −2.42 .. −3.69
+> dB (tol 3.0±0.7 dB) — measured via magnitude response (the filter is LTI),
+> not a noise periodogram, because the latter was hand-verified (python3) to
+> occasionally exceed 0.7 dB on a *correct* filter from statistical variance
+> alone. G1.9–G1.14: AdsrEnv attack/decay/release all within 15% (worst case
+> 3.2% at 1000 ms); G1.11 short-attack cases (1/2/5 ms) within the
+> quantisation-aware bound; G1.12 t(50%)/t(99%) = 0.2945 (tol 0.289±0.03);
+> G1.13 never leaves [0,1], exactly 0.0 in Idle; G1.14 transition jump = 0.0
+> exactly (tol 1e-6). G1.15: Lfo frequency accurate to ≤0.02% at 0.05/1/5/30
+> Hz; all waves in [-1,1]; Tri/Saw/Ramp/Square zero-mean to ≤4.3e-14 over
+> dynamically-detected whole cycles (tol 1e-6) — required a midpoint-phase
+> evaluation fix in `Lfo::step()` (see synth_dsp.h) after an initial
+> left-edge sampling scheme showed a real ~0.003 discretization bias on
+> Saw/Ramp, and required the *test* to detect cycle boundaries by watching
+> `phase` wrap rather than assuming a fixed step count, because
+> `1.0/300.0` summed 300 times in double is 0.9999999999999961 (verified),
+> one ULP short of the assumed wrap point. G1.16: S&H constant strictly
+> between wraps, changes on the step after every wrap (the draw happens
+> one step after the wrap is detected, since `step()` returns the OLD
+> shValue on the wrapping step itself). G1.17: exactly 0 for the first
+> 500 ms, ramp reaches 0.503 at the midpoint and 1.0 at 200 ms (tol 5%).
+> G1.18: MXCSR round-trips exactly, and — the amendment this AC specifically
+> asked for — a functional check confirms a denormal product genuinely
+> flushes to zero (`FP_ZERO`) while the guard is active and is a genuine
+> `FP_SUBNORMAL` outside it, so the guard is provably not a no-op on this
+> x86-64 host. G1.19: `shapeTriodeK(x,0)==x` bit-exact over 4096 random x;
+> `shapeCubic(0.25,2.0) == 0.251922607421875` to <1e-12 (independently
+> recomputed with python3; confirmed this is NOT the cubic-only value
+> 0.251953125). Two bonus (unnumbered) harness self-checks also pass:
+> `measuredF0` recovers a known 440 Hz sine to <0.1 Hz, and `minus3dBPoint`
+> locates TptOnePole's own corner to within 2% of fc. `fastTan`/`fastExp2`
+> were **not** added (DESIGN.md §2.1's documented non-goal). See the G1 gate
+> report (session record) for the per-AC table and the two harness-methodology
+> defects found and fixed during this gate (both explained above): the
+> literal-noise-periodogram approach to G1.8, and the fixed-step-count
+> assumption for G1.15/G1.16's "whole cycle" boundaries.
 
 **Goal:** `Source/DSP/synth_dsp.h`, header-only, dependency-free, all `double`
 internally. This is the foundation every later gate builds on.
