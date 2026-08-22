@@ -18,21 +18,36 @@
 // Both reuse TptOnePole/shapeTriodeK from synth_dsp.h (already gate-proven,
 // G1) rather than re-deriving the per-pole TPT recursion.
 //
-// R12/G4.11: EVERY division either structure needs (the ladder's
-// `1/(1+k*G^4)`, the SVF's `d = 1/(1+2*Reff*g+g*g)`) is computed ONCE, in
-// setControlRate() -- called once per CONTROL BLOCK by the caller (DESIGN.md
-// §2), never per sample -- and cached as a reciprocal/product the per-sample
-// process() below only multiplies by. process()'s own body is delimited by
-// a matching pair of marker comments a few lines below each function
-// (mirroring synth_core.cpp's own "AUDIO-RATE LOOP" marker convention,
-// G3.2) specifically so Tests/filter_tests.cpp can grep that exact region
-// and prove, not just assert, that it contains no division and no
-// transcendental call (G4.11).
+// R12/G4.11: process() itself -- the CLOSED-FORM SOLVE of DESIGN.md
+// §5.2/§5.3's per-sample recursion -- stays division-free: every division
+// setControlRate() needs (the ladder's `1/(1+k*G^4)`, the SVF's
+// `d = 1/(1+2*Reff*g+g*g)`) is computed there, once per CONTROL BLOCK
+// (DESIGN.md §2), and cached as a reciprocal/product process() only
+// multiplies by. process()'s own body is delimited by a matching pair of
+// marker comments a few lines below each function (mirroring
+// synth_core.cpp's own "AUDIO-RATE LOOP" marker convention, G3.2)
+// specifically so Tests/filter_tests.cpp can grep that exact region and
+// prove, not just assert, that it contains no division and no
+// transcendental call (G4.11) -- this remains true after G5.
+//
+// G5 ADDITION: DESIGN.md §2 separately requires `gLpf` itself to be
+// LINEARLY INTERPOLATED PER SAMPLE ("a 2ms filter attack sweeps ~0.9
+// octave per control block; held, that is a clearly audible staircase") --
+// a requirement about the COEFFICIENT `g`, not about process()'s closed-form
+// solve above. Each structure's `advanceCoeff(gValue)` (a THIRD function,
+// also outside the marked per-sample-process region) applies an
+// already-interpolated g (the caller ramps it via plain addition, not a
+// transcendental, R12's own "adds, not transcendentals" exception) and
+// recomputes the pure-function quantities derived from it (G4.11's own
+// "no division per sample" claim is scoped to process(), not to this new,
+// deliberate function -- see advanceCoeff's own comment for the full
+// reasoning). SynthCore's controlRateUpdate()/AUDIO-RATE LOOP (G5) is the
+// caller that does this ramping, once per voice per sample.
 //
 // Scope (docs/GATES.md G4): cutoff modulation (ENV-F/key-follow/LFO), the
-// slope crossfade, and the golden fixture are explicitly OUT of scope here
-// (G5's job) -- setControlRate() below takes an already-resolved `fc` in Hz,
-// nothing more.
+// slope crossfade, and the golden fixture were explicitly out of scope for
+// G4 (this file's own filters) -- they, and the audio-rate g interpolation
+// above, are G5's job (Source/DSP/synth_core.cpp), landed there.
 
 #include "synth_dsp.h"
 
@@ -82,11 +97,53 @@ struct LadderFilter {
   // path only (DESIGN.md §5.2's own derivation).
   static constexpr double kLadderSat = 0.10;
 
+  // R11 finding (G5): through G4, reset() only cleared the four poles'
+  // STATE (s/curLp/curHp) -- g/G/G2/G3/G4/k/invDenom were left untouched,
+  // which was invisible before G5 because setControlRate() always fully
+  // overwrote all of them fresh every control block regardless of their
+  // prior value, so nothing ever depended on a filter's coefficient state
+  // surviving (or not) a reset(). G5's per-sample g INTERPOLATION changes
+  // that: the interpolation ramp's START (synth_core.cpp's prepGInterp())
+  // reads `filter.g` as it stood BEFORE this block's setControlRate() call
+  // -- so a perturbed-then-reset instance whose `g` was left at a stale
+  // nonzero value would ramp from a DIFFERENT starting point than a fresh
+  // instance (g == 0.0, the in-class default), breaking G0.7/R13's
+  // bit-exact "reset() matches a fresh instance" requirement. Found by
+  // exactly the ctest G0.7 exists to catch. Fixed by resetting every
+  // coefficient to its own in-class default here, not just the poles.
   void reset() {
     p1.reset();
     p2.reset();
     p3.reset();
     p4.reset();
+    g = 0.0;
+    G = 0.0;
+    G2 = 0.0;
+    G3 = 0.0;
+    G4 = 0.0;
+    k = 0.0;
+    invDenom = 1.0;
+  }
+
+  // G5 (DESIGN.md §5.1's 20ms slope crossfade, docs/GATES.md G5.4): seed
+  // every pole's integrator state so that if this structure were driven by
+  // a CONSTANT input equal to `y`, its own next output would already sit at
+  // `y` -- a DC-consistent starting condition rather than the silence a
+  // fresh reset() leaves. Verified fixed point: with p.s = y and x = y,
+  // v = (y-y)*G = 0, lp = v+s = y, s' = lp+v = y -- so all four cascaded
+  // stages hold at y indefinitely under a sustained-y input. Used ONLY when
+  // this structure is about to become the "incoming" side of a slope
+  // crossfade (SynthCore::controlRateUpdate), seeded from the OUTGOING
+  // structure's most recent actual output, so the newly-engaged structure
+  // does not audibly dip toward zero before catching up with the signal the
+  // outgoing structure was already tracking (G5.4's own requirement: "the
+  // incoming structure's integrators must be initialised from the outgoing
+  // structure's current output").
+  void seedFromOutput(double y) {
+    p1.s = y; p1.curLp = y; p1.curHp = 0.0;
+    p2.s = y; p2.curLp = y; p2.curHp = 0.0;
+    p3.s = y; p3.curLp = y; p3.curHp = 0.0;
+    p4.s = y; p4.curLp = y; p4.curHp = 0.0;
   }
 
   /// Control-rate coefficient update (DESIGN.md §2/§5.2): call once per
@@ -107,6 +164,46 @@ struct LadderFilter {
     k = 4.2 * (resonancePercent * 0.01);  // [voicing] DESIGN.md §5.2
     invDenom = 1.0 / (1.0 + k * G4);      // [dsp] THE control-rate division (G4.11)
 
+    p1.g = g;
+    p2.g = g;
+    p3.g = g;
+    p4.g = g;
+  }
+
+  // G5 (DESIGN.md §2: "gLpf (LPF TPT coefficient)... interpolated per
+  // sample" -- one of exactly three quantities DESIGN.md §2 names,
+  // alongside gHpf and vcaGain, because "a 2ms filter attack sweeps ~0.9
+  // octave per control block; held, that is a clearly audible staircase").
+  // setControlRate() above still computes the CONTROL-RATE target (k stays
+  // control-rate, per DESIGN.md §5.2 -- only g moves faster than that).
+  // This function applies an already-interpolated `gValue` (the CALLER
+  // linearly ramps g itself, sample by sample, from the previous block's
+  // final g to this block's setControlRate()-computed target -- an ADD,
+  // not a transcendental, exactly R12's "adds, not transcendentals"
+  // exception) and recomputes every quantity DERIVED from g -- G, G2, G3,
+  // G4, invDenom -- which are PURE FUNCTIONS of (g, k) with no other
+  // hidden state, so recomputing them from an interpolated g each sample
+  // is mathematically consistent, not an approximation layered on stale
+  // state. This is a SEPARATE function from process() below, deliberately
+  // OUTSIDE this file's own per-sample-process marker comments (the ones
+  // G4.11 inspects, spelled out fully a few lines below each process()):
+  // that AC is about process()'s own CLOSED-FORM SOLVE staying
+  // division-free when g is HELD for a block (still true, unchanged --
+  // see process()'s own comment); it does not forbid a genuine,
+  // deliberate per-sample division elsewhere when g is INTERPOLATED
+  // instead, which is a G5 addition G4 did not need. The division here
+  // (invDenom) is the audio-rate cost DESIGN.md §2 itself calls for by
+  // naming gLpf as interpolated; TptOnePole::process() (synth_dsp.h,
+  // G1-proven) already does the analogous G=g/(1+g) recompute every
+  // sample from its own `g` member, so this is the same established
+  // pattern, not a new category of cost.
+  inline void advanceCoeff(double gValue) {
+    g = gValue;
+    G = g / (1.0 + g);
+    G2 = G * G;
+    G3 = G2 * G;
+    G4 = G3 * G;
+    invDenom = 1.0 / (1.0 + k * G4);
     p1.g = g;
     p2.g = g;
     p3.g = g;
@@ -183,9 +280,37 @@ struct SvfFilter {
   static constexpr double kR0Scale = 1.005;
   static constexpr double kSvfSat = 0.02;
 
+  // R11 finding (G5): see LadderFilter::reset's identical note above --
+  // through G4, reset() left g/Reff/d/twoReffPlusG untouched (harmless
+  // until G5's per-sample interpolation started reading `g` ACROSS a
+  // reset() boundary to seed its ramp's start). Reset every coefficient to
+  // its own in-class default here too, not just the integrator memories.
   void reset() {
     ic1 = 0.0;
     ic2 = 0.0;
+    peakBpPrev = 0.0;
+    peakBpAccum = 0.0;
+    g = 0.0;
+    Reff = 1.0;
+    d = 1.0;
+    twoReffPlusG = 0.0;
+  }
+
+  // G5 (DESIGN.md §5.1's 20ms slope crossfade, docs/GATES.md G5.4): seed
+  // this structure's integrator memories so that a CONSTANT input `y` is
+  // already a fixed point -- ic1 = 0 (bandpass memory), ic2 = y (lowpass
+  // memory). Verified: with those and x = y, hp = (y - 0 - y)*d = 0,
+  // bp = g*0+0 = 0 (ic1 stays 0), lp = g*0+y = y (ic2 stays y) -- so `lp`
+  // (the output) is exactly `y` from the very first sample, matching
+  // LadderFilter::seedFromOutput's analogous fixed-point property above.
+  // peakBpPrev/peakBpAccum are reset to 0 rather than left at whatever this
+  // (previously idle) structure last saw: a stale peak would otherwise bias
+  // Reff (DESIGN.md §5.3) away from R0 the instant this structure becomes
+  // audible, which is exactly the kind of discontinuity the crossfade
+  // exists to avoid.
+  void seedFromOutput(double y) {
+    ic1 = 0.0;
+    ic2 = y;
     peakBpPrev = 0.0;
     peakBpAccum = 0.0;
   }
@@ -206,6 +331,21 @@ struct SvfFilter {
     Reff = std::clamp(R0 + kSvfSat * peakBpPrev * peakBpPrev, -0.02, 2.0);  // [voicing]
     twoReffPlusG = 2.0 * Reff + g;
     d = 1.0 / (1.0 + 2.0 * Reff * g + g * g);  // [dsp] THE control-rate division (G4.11)
+  }
+
+  // G5 (DESIGN.md §2's "gLpf...interpolated per sample" -- see
+  // LadderFilter::advanceCoeff's identical class-level rationale above,
+  // which applies verbatim here). `Reff` stays CONTROL-RATE, exactly as
+  // DESIGN.md §5.3 specifies ("Reff...recomputed once per control block,
+  // not per sample" -- that scheduling is load-bearing for the
+  // self-oscillation limit cycle, G4.4, and is untouched here): only `g`
+  // (and its two PURE-FUNCTION derivatives twoReffPlusG, d) move faster.
+  // Deliberately outside the per-sample-process marker comments below,
+  // same reasoning as the ladder's advanceCoeff.
+  inline void advanceCoeff(double gValue) {
+    g = gValue;
+    twoReffPlusG = 2.0 * Reff + g;
+    d = 1.0 / (1.0 + 2.0 * Reff * g + g * g);
   }
 
   // R12/G4.11: no division, no transcendental, no atomic load anywhere in

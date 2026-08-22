@@ -12,16 +12,24 @@
 // ever) so this include does not touch R2's framework-free guarantee.
 #include "synth_dsp.h"
 #include "synth_osc.h"
+#include "synth_filter.h"
 
-// G4 (docs/GATES.md): SynthCore's public API gains a debug readback for the
-// clamped LPF cutoff (getDebugLpfCutoff(), G4.9) but does NOT include
-// synth_filter.h or hold a LadderFilter/SvfFilter per voice -- the two
-// structures themselves are exercised directly by Tests/filter_tests.cpp
-// (matching nassau-zermatt/Tests/cabinet_tests.cpp's precedent for driving a
-// DSP structure straight from its test rather than through the full voice
-// path). See synth_core.cpp's AUDIO-RATE LOOP comment for why wiring them
-// into this voice's real signal path is deferred to G5 (the slope crossfade
-// and modulation gate, which touches this exact code path anyway).
+// G5 (docs/GATES.md): the LPF is now GENUINELY WIRED into the per-voice
+// audio path (mixer -> DC block -> LPF -> VCA, DESIGN.md §1) -- G4 built and
+// fully proved LadderFilter/SvfFilter (Source/DSP/synth_filter.h) but
+// deliberately left them driven only from Tests/filter_tests.cpp, because an
+// early attempt at wiring them in broke the then-green G3.12 ("no DC")
+// AC. That root cause (a pulse's DC of 2d-1, DESIGN.md §4.1) has since been
+// fixed by the per-voice mixer DC blocker landing BEFORE the filter in the
+// chain, so the interaction G4's gate note flagged no longer applies -- see
+// synth_core.cpp's AUDIO-RATE LOOP comment for the live measurement. Each
+// active voice holds BOTH a LadderFilter and an SvfFilter (Voice struct
+// below): normally only the structure DESIGN.md §11's kLpfSlope currently
+// selects is driven (per DESIGN.md §5.1 [PERF-8], "only one structure runs
+// at a time"), but for the 20ms duration of a slope-switch crossfade BOTH
+// run simultaneously and are cross-faded (DESIGN.md §5.1, docs/GATES.md
+// G5.4) -- which is why every voice owns both structures unconditionally
+// rather than only the currently-selected one.
 
 /**
  * NoteEvent — the framework-free MIDI-event wire format SynthCore::process()
@@ -424,14 +432,29 @@ public:
 
     // ===== Test-only debug accessors (G4, docs/GATES.md) =====
 
-    /// G4.9: the ACTUAL cutoff (Hz) fed to both filter structures'
-    /// setControlRate() as of the most recent control-rate update -- i.e.
-    /// `kLpfCutoff` after DESIGN.md §5.4's `[10, 0.45*fs]` clamp (G4's slice
-    /// of that clamp: no modulation term exists yet, that is G5's). Updated
-    /// once per control block regardless of whether any voice is active
-    /// (DESIGN.md §2: cutoff is not per-voice at G4 -- see
-    /// controlRateUpdate()'s own comment).
+    /// G4.9 (kept stable, unchanged behaviour, into G5): the RAW `kLpfCutoff`
+    /// param after DESIGN.md §5.4's `[10, 0.45*fs]` clamp only -- deliberately
+    /// WITHOUT any of G5's per-voice modulation terms (key follow/ENV-F/LFO),
+    /// so this stays the same "is the robustness clamp itself real" readback
+    /// G4.9 asserted, computed once per control block regardless of whether
+    /// any voice is active (DESIGN.md §2: unmodulated, so it is not
+    /// per-voice). See getDebugVoiceLpfCutoff() below for the ACTUAL
+    /// modulated-and-clamped per-voice fc G5 feeds to each voice's filter.
     double getDebugLpfCutoff() const { return mDebugLpfCutoffHz; }
+
+    // ===== Test-only debug accessors (G5, docs/GATES.md) =====
+
+    /// G5.6: voice slot `voiceIndex`'s ACTUAL cutoff (Hz) -- kLpfCutoff after
+    /// key follow, ENV-F and LFO modulation (DESIGN.md §5.4) AND the
+    /// `[10, 0.45*fs]` clamp -- exactly the value most recently fed to that
+    /// voice's filter structure(s)' setControlRate() (Source/DSP/
+    /// synth_filter.h). 0.0 for an inactive slot (matches
+    /// getDebugVoiceLfoPitchModSemis's own "0 for a slot that is not active"
+    /// convention).
+    double getDebugVoiceLpfCutoff(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        return mVoices[voiceIndex].debugLpfCutoffHz;
+    }
 
 private:
     // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
@@ -546,11 +569,44 @@ private:
         /// emits large DC into the drive stage and the resonant filter unless
         /// it is coupled out. Real hardware does this with a capacitor.
         OnePoleHP dcBlock;
-        AdsrEnv envF, envA;    ///< ENV-F (filter, not yet routed anywhere -- G5) / ENV-A (VCA).
-                               ///< The LPF itself (G4: LadderFilter/SvfFilter,
-                               ///< Source/DSP/synth_filter.h) is not yet a per-voice member --
-                               ///< see synth_core.h's top-of-file G4 note and the AUDIO-RATE
-                               ///< LOOP's own comment in synth_core.cpp.
+        /// SECOND DC blocker, on the LPF OUTPUT, before the VCA (DESIGN.md
+        /// §5.6). The mixer blocker above cannot cover this: the filters'
+        /// feedback saturators are ODD functions, and an odd function fed a
+        /// zero-mean but NOT half-wave-symmetric signal (any pulse at duty
+        /// != 50%) re-introduces a nonzero time-average. Measured without it:
+        /// 2.3e-2 DC and a 3.69 peak at {SVF, res 99%, PW 30%, fc 500 Hz}.
+        /// Same mechanism, and same remedy, as nassau-zermatt's mCfDcBlock
+        /// and mPowerDcBlock.
+        OnePoleHP postLpfDcBlock;
+        AdsrEnv envF, envA;    ///< ENV-F (filter, DESIGN.md §5.4, G5) / ENV-A (VCA).
+
+        // ===== G5: per-voice LPF state (DESIGN.md §5.1-§5.4) =====
+        // BOTH structures always exist per voice (see synth_core.h's G5
+        // top-of-file note): normally only the one `kLpfSlope` currently
+        // selects is driven; during a slope-switch crossfade both run and
+        // are mixed (SynthCore::mLpfCrossfade* below drives the shared
+        // timing, per-voice state lives here).
+        LadderFilter lpfLadder;
+        SvfFilter lpfSvf;
+        double lastLpfOutput = 0.0;  ///< this voice's most recent LPF-stage output (mixed or
+                                      ///< single-structure) -- used to seed the INCOMING
+                                      ///< structure's state when a new crossfade starts (G5.4).
+        double debugLpfCutoffHz = 0.0;  ///< G5.6: this voice's actual modulated+clamped fc, as
+                                         ///< last fed to setControlRate() (0 while inactive).
+
+        // DESIGN.md §2: `gLpf` is one of exactly three quantities LINEARLY
+        // INTERPOLATED PER SAMPLE across a control block (with vcaGain and,
+        // from G6, gHpf) -- "Cur" is the per-sample-advancing value fed to
+        // that structure's advanceCoeff() (Source/DSP/synth_filter.h) every
+        // sample; "Step" is the constant per-sample increment, both set once
+        // per control block in controlRateUpdate() from the structure's own
+        // `g` before/after calling setControlRate(). Both structures carry
+        // their own independent interpolation state because either can be
+        // live in a given control block (the currently-selected slope, or
+        // both during a crossfade).
+        double gLpfLadderCur = 0.0, gLpfLadderStep = 0.0;
+        double gLpfSvfCur = 0.0, gLpfSvfStep = 0.0;
+
         bool active = false;   ///< sounding (Attack/Decay/Sustain/Release), not Idle
         int note = -1;
         double vcaGainStart = 0.0;   ///< interpolation endpoints for THIS control block
@@ -575,7 +631,51 @@ private:
     Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
                                   ///< control block, read by every voice -- never per-voice.
     double mLastLfoValue = 0.0;  ///< test-only readback of the most recent mLfo.step() result (G3.10)
-    double mDebugLpfCutoffHz = 0.0;  ///< G4.9: last clamped LPF cutoff fed to setControlRate()
+    double mDebugLpfCutoffHz = 0.0;  ///< G4.9: last clamped (UNMODULATED) LPF cutoff -- see
+                                      ///< getDebugLpfCutoff()'s own comment for why this stays
+                                      ///< unmodulated even after G5.
+
+    // ===== G5: the LPF slope crossfade (DESIGN.md §5.1, docs/GATES.md G5.4) =====
+    // `kLpfSlope` is a single INSTRUMENT-WIDE param (DESIGN.md §11), so the
+    // crossfade's TIMING (which structure is "from", which is "to", how far
+    // along) is tracked ONCE here, shared by every voice -- each voice's own
+    // Voice::lpfLadder/lpfSvf hold the per-voice STATE the shared timing
+    // drives. `mLpfSlopeSettled` is which structure is authoritative when no
+    // crossfade is running (mirrors `snapshot.lpfSlope` once settled);
+    // during a crossfade both structures run and are mixed per DESIGN.md
+    // §5.1's 20ms window (docs/GATES.md G5.4).
+    int mLpfSlopeSettled = static_cast<int>(LpfSlope::Db24);  ///< [voicing] DESIGN.md §11 default
+    bool mLpfCrossfadeActive = false;
+    int mLpfCrossfadeFromSlope = static_cast<int>(LpfSlope::Db24);
+    int mLpfCrossfadeToSlope = static_cast<int>(LpfSlope::Db24);
+    int mLpfCrossfadeSamplesTotal = 0;    ///< round(0.020 * fs), computed when a crossfade starts
+    int mLpfCrossfadeSamplesElapsed = 0;  ///< advances once per AUDIO sample while active
+
+    /// [voicing] DESIGN.md §5.1: "crossfades over 20ms" -- an engineering
+    /// choice (G5.4's own tolerance is +/-2ms), not a measured hardware
+    /// figure, hence [voicing] rather than [ref].
+    static constexpr double kLpfCrossfadeSeconds = 0.020;
+
+    /// Runs voice `v`'s structure selected by `slope` (LpfSlope::Db24 (0) ->
+    /// LadderFilter, Db12 (1) -> SvfFilter) on one sample `x`. DESIGN.md §2:
+    /// `gLpf` is interpolated PER SAMPLE, so this first advances that
+    /// structure's coefficient to its current per-sample-interpolated value
+    /// (advanceCoeff(), Source/DSP/synth_filter.h -- an add for the ramp
+    /// itself, R12's own "adds, not transcendentals" exception) before
+    /// calling its already-R12-clean process() (G4.11), then steps the
+    /// interpolation forward by one sample for next time. No transcendental,
+    /// no atomic load anywhere in this function, so it is safe to call from
+    /// inside the AUDIO-RATE LOOP (R12).
+    static inline double runLpfStructure(Voice& v, int slope, double x) {
+        if (slope == static_cast<int>(LpfSlope::Db24)) {
+            v.lpfLadder.advanceCoeff(v.gLpfLadderCur);
+            v.gLpfLadderCur += v.gLpfLadderStep;
+            return v.lpfLadder.process(x);
+        }
+        v.lpfSvf.advanceCoeff(v.gLpfSvfCur);
+        v.gLpfSvfCur += v.gLpfSvfStep;
+        return v.lpfSvf.process(x);
+    }
 
     static constexpr uint32_t kLfoShSeed = 0x5EED1234u;  // [voicing] fixed S&H seed, R8/R13
 

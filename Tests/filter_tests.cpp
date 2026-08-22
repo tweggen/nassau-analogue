@@ -94,12 +94,26 @@ void checkNum(const std::string& name, bool cond, double measured) {
 // (DESIGN.md §5.3), so the self-regulating limit-cycle mechanism G4.4 tests
 // only behaves correctly if setControlRate() is actually invoked at that
 // cadence during the render, not just once at the start.
+//
+// G5 ADDITION: also reproduces DESIGN.md §2's per-sample `gLpf`
+// interpolation (SynthCore::controlRateUpdate()'s prepGInterp() / the
+// filter's own advanceCoeff(), Source/DSP/synth_filter.h) -- at each
+// control-block boundary, `g`'s value just BEFORE this block's
+// setControlRate() call becomes the interpolation start, this block's
+// freshly-computed target the end, and every sample in between advances
+// through advanceCoeff() rather than holding g fixed for the whole block.
+// For every G4/G5.1-G5.4 test that never changes `fc` between blocks this
+// is a no-op (gStart == gEnd == the same unchanging target every time, so
+// advanceCoeff(target) recomputes exactly what setControlRate() already
+// did -- bit-identical to the pre-G5 behaviour those ACs already measured);
+// it only actually interpolates for G5.5's live cutoff sweep below.
 template <typename FilterT>
 struct ControlRateDriver {
   FilterT filter;
   double fc = 0.0, fs = 0.0, resonancePercent = 0.0;
   int controlBlock = 32;  // [dsp] DESIGN.md §2 default
   int phase = 0;
+  double gCur = 0.0, gStep = 0.0;
 
   void configure(double fcIn, double fsIn, double resonancePercentIn) {
     fc = fcIn;
@@ -108,13 +122,20 @@ struct ControlRateDriver {
     filter.reset();
     phase = 0;
     filter.setControlRate(fc, fs, resonancePercent);
+    gCur = filter.g;  // starts already AT target -- no ramp-in on the very first block
+    gStep = 0.0;
   }
 
   inline double step(double x) {
     if (phase >= controlBlock) {
+      const double gStart = filter.g;
       filter.setControlRate(fc, fs, resonancePercent);
+      gStep = (filter.g - gStart) / static_cast<double>(controlBlock);
+      gCur = gStart;
       phase = 0;
     }
+    filter.advanceCoeff(gCur);
+    gCur += gStep;
     const double y = filter.process(x);
     ++phase;
     return y;
@@ -192,6 +213,79 @@ double measuredFreqInWindow(const std::vector<float>& v, double fs, double t0, d
   const double totalSamples = crossings.back() - crossings.front();
   const double numPeriods = static_cast<double>(crossings.size() - 1);
   return totalSamples > 0.0 ? numPeriods * fs / totalSamples : 0.0;
+}
+
+// ============================================================================
+// G5 additions (docs/GATES.md G5.1-G5.6): the LPF is now wired into
+// SynthCore's real per-voice audio path (Source/DSP/synth_core.cpp,
+// AUDIO-RATE LOOP), so G5's own ACs are tested two ways, tied together
+// explicitly rather than trusted separately (R11's own lesson -- an
+// unresolvable reference probe, a regex matching inside its own comment,
+// and a fractional-period DC average have each independently fooled this
+// project's own review tooling before):
+//   (a) FORMULA correctness -- DESIGN.md §5.4's cutoff-modulation formula,
+//       replicated here (never re-derived differently) and fed to the raw
+//       LadderFilter/SvfFilter via ControlRateDriver, then probed
+//       acoustically with minus3dBPoint -- the same technique G4.3 already
+//       established for "the corner is a RATIO of fc, not fc itself".
+//   (b) WIRING proof -- SynthCore::getDebugVoiceLpfCutoff() (G5.6) read
+//       back from a REAL held note, confirming SynthCore's own internal
+//       computation matches (a)'s formula value, not just that the formula
+//       is correct in isolation. Since (a) already ties fc -> acoustic
+//       corner, and (b) ties SynthCore -> the same fc, together they prove
+//       "SynthCore's real per-voice modulation reaches a real acoustic
+//       corner shift", not just one half of that chain.
+// G5.1-G5.3 exercise the LADDER (24dB) structure for (a)/(b): the cutoff-
+// modulation formula is computed identically regardless of which structure
+// consumes the resulting fc (Source/DSP/synth_core.cpp's controlRateUpdate()
+// computes `lpfFcVoice` once, then feeds whichever structure(s) kLpfSlope/
+// crossfade select), so testing one structure's formula math is sufficient;
+// G5.4 (both directions of the crossfade) and G5.5 (explicitly both modes)
+// separately give the SVF its own direct coverage in this same file.
+
+// [dsp] DESIGN.md §5.4's own modulation formula, replicated (not
+// re-derived) for the acoustic (a)-side probes above -- SynthCore's actual
+// implementation (synth_core.cpp's controlRateUpdate()) computes this
+// exact expression, folded into one exp2 call per DESIGN.md §2.1; this
+// helper intentionally keeps the three terms separate for test readability,
+// since it runs at TEST time, not inside SynthCore's own audio path (R12
+// does not apply to test code).
+inline double lpfFcFormula(double baseFc, double keyFollowPct, int note, double envAmountPct, double envF,
+                            double lfoAmountPct, double lfoValue, double fs) {
+  const double keyFollowOct = (keyFollowPct * 0.01) * (static_cast<double>(note) - 60.0) / 12.0;
+  const double envOct = 6.0 * (envAmountPct * 0.01) * envF;
+  const double lfoOct = 2.0 * (lfoAmountPct * 0.01) * lfoValue;
+  return std::clamp(baseFc * std::exp2(keyFollowOct + envOct + lfoOct), 10.0, 0.45 * fs);
+}
+
+// (a)-side probe: configure a raw filter structure at `fc`/`res` and
+// measure its ACTUAL acoustic -3dB corner (Hz) via minus3dBPoint --
+// exactly G4.3's own technique, generalised over FilterT so G5.1-G5.3 do
+// not have to duplicate the ladder/SVF probe code three times over.
+// `hiFactor` sets the upper search bracket as a multiple of `fc` (G4.3's
+// own per-structure choice: 2.0 keeps the ladder's ~0.435*fc corner well
+// inside the bracket without the bisection approaching Nyquist; callers
+// probing a LARGE fc pass a smaller hiFactor for the same Nyquist-margin
+// reason -- see the G5.1 call site's own comment).
+template <typename FilterT>
+double measureCornerHz(double fc, double fs, double res, double hiFactor) {
+  ControlRateDriver<FilterT> d;
+  d.configure(fc, fs, res);
+  return minus3dBPoint([&](const float* in, float* out, int n) { d.process(in, out, n); }, fs, fc * 0.1,
+                        fc * 0.01, fc * hiFactor);
+}
+
+// Frame-aligned 1kHz test carrier (note 83 + a COMPUTED, not hand-
+// transcribed, fine-tune offset -- R11's own lesson on hand-typed
+// constants), matching envlfo_tests.cpp's kNote1k/fineCentsFor and
+// filter_tests.cpp's own G4.10 carrier choice: envelopeDb's frame is fixed
+// at 1ms (48 samples @48kHz), and a non-aligned carrier reads 11-13dB/ms of
+// PURE frame/period misalignment noise with no bearing on any real
+// envelope change (confirmed independently in G4.10, this file).
+constexpr int kFilterNote1k = 83;
+inline float filterFineCentsFor1k(int note) {
+  const double noteHz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+  return static_cast<float>(1200.0 * std::log2(1000.0 / noteHz));
 }
 
 }  // namespace
@@ -694,6 +788,528 @@ int main() {
 #else
     check("G4.11: NASSAU_FILTER_H_PATH was not defined at compile time -- inspection skipped", false);
 #endif
+  }
+
+  // =========================================================================
+  // G5.1: ENV-F modulates cutoff, bipolar. kLpfCutoff=200Hz,
+  // kLpfEnvAmount=+100 (then -100), ENV-F at full.
+  // QUANTITY MEASURED: (a) the RATIO of the modulated corner to the
+  // unmodulated corner (never an absolute frequency -- this AC's own
+  // explicit warning); (b) SynthCore's REAL per-voice fc
+  // (getDebugVoiceLpfCutoff()) for a held note with ENV-F driven to its
+  // sustain-settled value near 1.0 (fast 1ms attack/decay, 100% sustain).
+  // The -100% "clamped at the 10Hz floor" half is checked via (b) and plain
+  // arithmetic only, NOT acoustically: 6 octaves below 200Hz clamps to
+  // 10Hz, and minus3dBPoint's fixed-length magDb window (65536 samples)
+  // cannot reliably resolve a magnitude response down at ~0.1-20Hz (well
+  // under 2 cycles in that window) -- attempting it would be measuring
+  // windowing noise, not the filter, exactly the kind of wrong-quantity
+  // trap this project's own review process keeps finding.
+  // =========================================================================
+  std::cout << "\nGroup: ENV-F modulates cutoff, bipolar (G5.1)\n";
+  {
+    const double fs = 48000.0;
+    const double baseFc = 200.0;  // DESIGN.md G5.1's own example
+    const double res = 20.0;      // [voicing] DESIGN.md §11 kLpfResonance default
+
+    const double cornerBase = measureCornerHz<LadderFilter>(baseFc, fs, res, 2.0);
+
+    // +100%: 6 octaves up -> fc = 200*64 = 12800Hz. hiFactor kept at 1.5
+    // (not G4.3's usual 2.0) so the bisection's upper bracket (19200Hz)
+    // stays comfortably clear of Nyquist (24000Hz @ 48kHz) -- the corner
+    // itself (~5568Hz) sits well inside either bracket.
+    const double fcPlus = baseFc * 64.0;
+    const double cornerPlus = measureCornerHz<LadderFilter>(fcPlus, fs, res, 1.5);
+    const double ratioPlus = cornerPlus / cornerBase;
+    checkNum("G5.1: ladder ENV-F=+100% moves the -3dB corner 64x (6 octaves) above the "
+             "unmodulated corner -- a RATIO, not an absolute frequency",
+             std::fabs(ratioPlus - 64.0) <= 0.08 * 64.0, ratioPlus);
+
+    // -100%: arithmetic only (see the group comment above for why not acoustic).
+    const double fcMinusFormula = lpfFcFormula(baseFc, 0.0, 60, -100.0, 1.0, 0.0, 0.0, fs);
+    checkNum("G5.1: formula ENV-F=-100% clamps the raw fc (3.125Hz) at the 10Hz floor",
+             std::fabs(fcMinusFormula - 10.0) < 1e-9, fcMinusFormula);
+
+    // ---- (b) Wiring proof: SynthCore's OWN computed fc for a real held note ----
+    auto wiringProofFc = [&](float envAmountPct) {
+      SynthCore core;
+      core.init(48000.0f);
+      core.setLpfSlope(SynthCore::LpfSlope::Db24);
+      core.setLpfCutoffHz(static_cast<float>(baseFc));
+      core.setLpfResonancePercent(static_cast<float>(res));
+      core.setLpfKeyFollowPercent(0.0f);
+      core.setLpfLfoAmountPercent(0.0f);
+      core.setEnvFAttackMs(1.0f);
+      core.setEnvFDecayMs(1.0f);
+      core.setEnvFSustainPercent(100.0f);  // ENV-F "at full" settles here (fast A/D)
+      core.setLpfEnvAmountPercent(envAmountPct);
+      std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 60, 1.0f}};
+      std::vector<float> l(3200), r(3200);  // 100 control blocks -- envF settles in ~15
+      core.process(ev.data(), 1, l.data(), r.data(), 3200);
+      return std::make_pair(core.getDebugEnvFValue(0), core.getDebugVoiceLpfCutoff(0));
+    };
+
+    const auto [envFPlus, coreFcPlus] = wiringProofFc(100.0f);
+    checkNum("G5.1 wiring proof: ENV-F genuinely settles near 1.0 (fast A/D, 100% sustain)",
+             std::fabs(envFPlus - 1.0) < 0.02, envFPlus);
+    checkNum("G5.1 wiring proof: SynthCore's own per-voice fc at ENV-F~1.0, amount=+100% "
+             "matches the formula's 12800Hz within 1%",
+             std::fabs(coreFcPlus - fcPlus) <= 0.01 * fcPlus, coreFcPlus);
+
+    const auto [envFMinus, coreFcMinus] = wiringProofFc(-100.0f);
+    (void)envFMinus;
+    checkNum("G5.1 wiring proof: SynthCore's own per-voice fc at ENV-F~1.0, amount=-100% "
+             "clamps at the 10Hz floor",
+             std::fabs(coreFcMinus - 10.0) < 1e-6, coreFcMinus);
+  }
+
+  // =========================================================================
+  // G5.2: key follow. kLpfKeyFollow=100/50/0, notes 48 and 72.
+  // QUANTITY MEASURED: (a) the RATIO of the note-72 corner to the note-48
+  // corner (raw ladder, minus3dBPoint); (b) SynthCore's real per-voice fc
+  // for the same two notes at key-follow=100%.
+  // =========================================================================
+  std::cout << "\nGroup: key follow (G5.2)\n";
+  {
+    const double fs = 48000.0, res = 20.0, baseFc = 1000.0;
+    auto fcForNote = [&](double keyFollowPct, int note) {
+      return baseFc * std::exp2((keyFollowPct * 0.01) * (static_cast<double>(note) - 60.0) / 12.0);
+    };
+    for (double kf : {100.0, 50.0, 0.0}) {
+      const double corner48 = measureCornerHz<LadderFilter>(fcForNote(kf, 48), fs, res, 2.0);
+      const double corner72 = measureCornerHz<LadderFilter>(fcForNote(kf, 72), fs, res, 2.0);
+      const double ratio = corner72 / corner48;
+      const double expected = std::exp2((kf * 0.01) * (72.0 - 48.0) / 12.0);
+      const double tol = (kf == 0.0) ? 0.02 : 0.05;
+      checkNum("G5.2: ladder key-follow=" + std::to_string(static_cast<int>(kf)) +
+                   "% corner ratio note72/note48 is " + std::to_string(expected) + " +/- " +
+                   std::to_string(static_cast<int>(tol * 100)) + "%",
+               std::fabs(ratio - expected) <= tol * expected, ratio);
+    }
+
+    for (int note : {48, 72}) {
+      SynthCore core;
+      core.init(48000.0f);
+      core.setLpfCutoffHz(static_cast<float>(baseFc));
+      core.setLpfResonancePercent(static_cast<float>(res));
+      core.setLpfKeyFollowPercent(100.0f);
+      core.setLpfEnvAmountPercent(0.0f);
+      core.setLpfLfoAmountPercent(0.0f);
+      std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, note, 1.0f}};
+      std::vector<float> l(64), r(64);
+      core.process(ev.data(), 1, l.data(), r.data(), 64);
+      const double gotFc = core.getDebugVoiceLpfCutoff(0);
+      const double wantFc = fcForNote(100.0, note);
+      checkNum("G5.2 wiring proof: SynthCore's own fc at note " + std::to_string(note) +
+                   ", key-follow=100% matches the formula",
+               std::fabs(gotFc - wantFc) <= 0.01 * wantFc, gotFc);
+    }
+  }
+
+  // =========================================================================
+  // G5.3: LFO -> cutoff. kLpfLfoAmount=100, 5Hz tri -> corner swings +/-2
+  // octaves.
+  // QUANTITY MEASURED: max/min of SynthCore's real per-voice fc
+  // (getDebugVoiceLpfCutoff(), sampled every control block over 3 LFO
+  // cycles from a real held note) expressed in octaves relative to the
+  // unmodulated base fc -- a direct readback of the ACTUAL value SynthCore
+  // feeds to setControlRate() every control block, which is more precise
+  // than an acoustic measurement could be for a 5Hz sweep (a -3dB
+  // minus3dBPoint probe needs ~1.4s to converge, far slower than one LFO
+  // cycle, so it would average the swing away exactly as DESIGN.md/
+  // docs/GATES.md's own G3.7 note warns for LFO->pitch). A separate
+  // acoustic cross-check ties the measured peak fc back to a real -3dB
+  // corner shift, closing the loop to an actual sound.
+  // =========================================================================
+  std::cout << "\nGroup: LFO -> cutoff (G5.3)\n";
+  {
+    const double fs = 48000.0;
+    const double baseFc = 1000.0;
+    const double res = 20.0;
+    SynthCore core;
+    core.init(48000.0f);
+    core.setLpfCutoffHz(static_cast<float>(baseFc));
+    core.setLpfResonancePercent(static_cast<float>(res));
+    core.setLpfEnvAmountPercent(0.0f);
+    core.setLpfKeyFollowPercent(0.0f);
+    core.setLpfLfoAmountPercent(100.0f);
+    core.setLfoRateHz(5.0f);
+    core.setLfoWave(SynthCore::LfoWave::Tri);
+    core.setLfoDelayMs(0.0f);
+    std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 60, 1.0f}};
+
+    const int total = static_cast<int>(0.6 * fs);  // 3 cycles @ 5Hz
+    const int block = 32;
+    const int skipSamples = static_cast<int>(0.05 * fs);  // past note-on/first-ramp transient
+    double maxFc = 0.0, minFc = 1e18;
+    std::vector<float> l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+    int pos = 0;
+    while (pos < total) {
+      const int n = std::min(block, total - pos);
+      if (pos == 0) {
+        core.process(ev.data(), 1, l.data(), r.data(), n);
+      } else {
+        core.process(nullptr, 0, l.data(), r.data(), n);
+      }
+      const double fc = core.getDebugVoiceLpfCutoff(0);
+      if (pos > skipSamples) {
+        maxFc = std::max(maxFc, fc);
+        minFc = std::min(minFc, fc);
+      }
+      pos += n;
+    }
+
+    const double octUp = std::log2(maxFc / baseFc);
+    const double octDown = std::log2(baseFc / minFc);
+    checkNum("G5.3: LFO->cutoff swings +2 octaves above base (SynthCore's own per-voice fc)",
+             std::fabs(octUp - 2.0) <= 0.08 * 2.0, octUp);
+    checkNum("G5.3: LFO->cutoff swings -2 octaves below base (SynthCore's own per-voice fc)",
+             std::fabs(octDown - 2.0) <= 0.08 * 2.0, octDown);
+
+    // Acoustic cross-check: feed the measured peak fc to the raw ladder and
+    // confirm minus3dBPoint's own corner ratio matches -- ties "the debug
+    // value is accurate" to "the fc-to-corner mapping (G4.3/G5.1/G5.2)
+    // holds" for this AC's specific fc values too.
+    const double cornerBase = measureCornerHz<LadderFilter>(baseFc, fs, res, 2.0);
+    const double cornerMax = measureCornerHz<LadderFilter>(maxFc, fs, res, 2.0);
+    const double ratioAcoustic = cornerMax / cornerBase;
+    checkNum("G5.3 acoustic cross-check: the measured LFO-peak fc, fed to the raw filter, gives "
+             "a -3dB corner ~4x (2 octaves) above the unmodulated corner",
+             std::fabs(ratioAcoustic - 4.0) <= 0.08 * 4.0, ratioAcoustic);
+  }
+
+  // =========================================================================
+  // G5.4: the slope crossfade is clean. Switch kLpfSlope mid-note on a
+  // sustained saw AT kLpfCutoff=2kHz, res=30 (this AC's own named test
+  // point -- at fc~20Hz the incoming structure's own settle time exceeds
+  // the 20ms crossfade and would measure a dip that is not a crossfade
+  // defect, per this AC's own warning).
+  // QUANTITY MEASURED: (1) whether every sample of the real SynthCore
+  // output is finite; (2) the number of 1ms envelope frames (envelopeDb,
+  // frame-aligned 1kHz carrier) after the switch until the level settles
+  // to within 10% of its final post-switch value -- an operational
+  // "transition duration" measured directly off real audio, not off
+  // internal crossfade state; (3) the worst frame-to-frame envelope delta
+  // during the switch. Both directions (24->12 and 12->24).
+  // =========================================================================
+  std::cout << "\nGroup: the slope crossfade is clean (G5.4)\n";
+  {
+    const double fs = 48000.0;
+    const float fine1k = filterFineCentsFor1k(kFilterNote1k);
+
+    auto runCrossfade = [&](SynthCore::LpfSlope fromSlope, SynthCore::LpfSlope toSlope, int preroll) {
+      SynthCore core;
+      core.init(48000.0f);
+      core.setOsc1Wave(SynthCore::Wave::Saw);
+      core.setOsc1FineCents(fine1k);
+      core.setOsc2LevelPercent(0.0f);
+      core.setSubLevelPercent(0.0f);
+      core.setNoiseLevelPercent(0.0f);
+      core.setEnvAAttackMs(2.0f);
+      core.setEnvASustainPercent(100.0f);
+      core.setLpfCutoffHz(2000.0f);       // G5.4's own named test cutoff
+      core.setLpfResonancePercent(30.0f);  // G5.4's own named test resonance
+      core.setLpfEnvAmountPercent(0.0f);
+      core.setLpfKeyFollowPercent(0.0f);
+      core.setLpfLfoAmountPercent(0.0f);
+      core.setLpfSlope(fromSlope);
+
+      const int total = preroll + preroll;  // symmetric pre/post window
+      const int block = 32;                 // == mControlBlock: the setter's finest resolution
+      std::vector<float> outL(static_cast<size_t>(total)), outR(static_cast<size_t>(total));
+      std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, kFilterNote1k, 1.0f}};
+      int pos = 0;
+      bool switched = false;
+      while (pos < total) {
+        if (pos == preroll && !switched) {
+          core.setLpfSlope(toSlope);
+          switched = true;
+        }
+        const int n = std::min(block, total - pos);
+        if (pos == 0) {
+          core.process(ev.data(), 1, outL.data() + pos, outR.data() + pos, n);
+        } else {
+          core.process(nullptr, 0, outL.data() + pos, outR.data() + pos, n);
+        }
+        pos += n;
+      }
+      return outL;
+    };
+
+    struct CrossfadeResult {
+      bool finite;
+      double transitionMs;
+      double worstDeltaDbPerMs;
+      double preLevelDb, postLevelDb;
+    };
+    auto measureCrossfade = [&](const std::vector<float>& out, int preroll) {
+      bool allFinite = true;
+      for (float s : out)
+        if (!std::isfinite(s)) allFinite = false;
+
+      std::vector<double> frames;
+      envelopeDb(out, fs, frames);
+      const int f0 = preroll / 48;  // 1ms frame = 48 samples @48kHz
+
+      double l0 = 0.0;
+      int n0 = 0;
+      for (int i = std::max(0, f0 - 10); i < f0; ++i) {
+        l0 += frames[static_cast<size_t>(i)];
+        ++n0;
+      }
+      l0 = n0 > 0 ? l0 / n0 : frames[static_cast<size_t>(f0)];
+
+      double l1 = 0.0;
+      int n1 = 0;
+      for (int i = f0 + 30; i < std::min(static_cast<int>(frames.size()), f0 + 50); ++i) {
+        l1 += frames[static_cast<size_t>(i)];
+        ++n1;
+      }
+      l1 = n1 > 0 ? l1 / n1 : frames.back();
+
+      double transitionMs = 0.0;
+      const double span = l1 - l0;
+      for (int i = f0; i < std::min(static_cast<int>(frames.size()), f0 + 40); ++i) {
+        const double frac = std::fabs(span) > 1e-6 ? (frames[static_cast<size_t>(i)] - l0) / span : 1.0;
+        if (frac < 0.9) transitionMs = static_cast<double>(i - f0 + 1);
+      }
+
+      double worstDelta = 0.0;
+      for (int i = std::max(1, f0); i < std::min(static_cast<int>(frames.size()), f0 + 40); ++i) {
+        worstDelta = std::max(worstDelta, std::fabs(frames[static_cast<size_t>(i)] - frames[static_cast<size_t>(i - 1)]));
+      }
+      return CrossfadeResult{allFinite, transitionMs, worstDelta, l0, l1};
+    };
+
+    const int preroll = static_cast<int>(0.08 * fs);
+
+    {
+      auto out = runCrossfade(SynthCore::LpfSlope::Db24, SynthCore::LpfSlope::Db12, preroll);
+      auto res = measureCrossfade(out, preroll);
+      std::cout << "  [INFO] 24->12: pre-level=" << res.preLevelDb << "dB post-level=" << res.postLevelDb
+                << "dB\n";
+      check("G5.4: 24->12 crossfade -- every sample finite", res.finite);
+      checkNum("G5.4: 24->12 crossfade completes in 20+/-2ms", std::fabs(res.transitionMs - 20.0) <= 2.0,
+               res.transitionMs);
+      checkNum("G5.4: 24->12 crossfade max envelope delta <= 1dB/ms", res.worstDeltaDbPerMs <= 1.0,
+               res.worstDeltaDbPerMs);
+    }
+    {
+      auto out = runCrossfade(SynthCore::LpfSlope::Db12, SynthCore::LpfSlope::Db24, preroll);
+      auto res = measureCrossfade(out, preroll);
+      std::cout << "  [INFO] 12->24: pre-level=" << res.preLevelDb << "dB post-level=" << res.postLevelDb
+                << "dB\n";
+      check("G5.4: 12->24 crossfade -- every sample finite", res.finite);
+      checkNum("G5.4: 12->24 crossfade completes in 20+/-2ms", std::fabs(res.transitionMs - 20.0) <= 2.0,
+               res.transitionMs);
+      checkNum("G5.4: 12->24 crossfade max envelope delta <= 1dB/ms", res.worstDeltaDbPerMs <= 1.0,
+               res.worstDeltaDbPerMs);
+    }
+  }
+
+  // =========================================================================
+  // G5.5: no zipper on a cutoff sweep. 200Hz -> 8kHz over 100ms on a
+  // sustained saw, both modes, bound 0.5dB/ms.
+  //
+  // R11 FINDING: the literal 0.5dB/ms bound is MATHEMATICALLY UNACHIEVABLE
+  // for this specific sweep by ANY implementation, correct or not -- not a
+  // defect to fix, a property of the numbers in the AC itself. Derivation:
+  // 200Hz->8kHz is log2(8000/200) = 5.322 octaves; over 100ms that is
+  // 0.05322 octaves/ms. A STATIC probe tone anywhere near the moving
+  // transition band sees the filter's own asymptotic skirt slope (24dB/
+  // octave ladder, 12dB/octave SVF, G4.1/G4.2) times that sweep rate:
+  // 24*0.05322 = 1.277dB/ms (ladder), 12*0.05322 = 0.639dB/ms (SVF) -- BOTH
+  // already exceed 0.5dB/ms from filter physics alone, before any
+  // measurement of the actual implementation. Confirmed empirically (a
+  // standalone diagnostic swept the probe across 1/2/3/4/6/8/12/16kHz, all
+  // frame-aligned): the INTERPOLATED implementation lands at 1.25-1.41dB/ms
+  // (ladder) / 0.64-0.73dB/ms (SVF) at every single probe frequency --
+  // matching the derived floor almost exactly and staying essentially
+  // CONSTANT regardless of where the probe sits, which is exactly what
+  // "hitting a physical floor, not a probe-placement artifact" looks like
+  // (contrast G4.10's own at-fc finding, which WAS probe-placement-
+  // dependent). A carrier held far enough below the whole swept range to
+  // dodge the skirt (e.g. 20-50Hz) was also tried and rejected: it is not
+  // frame-aligned (envelopeDb's 1ms frame needs >=1000Hz for a whole
+  // number of cycles/frame) and reads a ~11dB/ms artifact IDENTICAL
+  // whether interpolation is on or off -- pure frame/period misalignment
+  // noise (this file's own G4.10/G5.4 note), not signal.
+  //
+  // So the GATED checks below measure what this AC can actually prove: (1)
+  // the interpolated reading sits at the DERIVED PHYSICAL FLOOR (within
+  // 15%), not above it -- i.e. no EXCESS zipper beyond what sweeping a
+  // filter this fast through this many octaves necessarily costs; (2) the
+  // interpolated reading is substantially (>=3dB) better than a
+  // NON-interpolated reference at the SAME probe frequency -- proving
+  // DESIGN.md §2's gLpf interpolation is genuinely doing its job (mirrors
+  // G3.5's own "stepped reference" technique for the identical class of
+  // confound). The raw absolute-vs-0.5dB/ms comparison is recorded as
+  // [INFO], not gated, exactly matching G4.10's own precedent for a
+  // literal-AC number that measures a real confound rather than a defect.
+  // =========================================================================
+  std::cout << "\nGroup: no zipper on a cutoff sweep (G5.5)\n";
+  {
+    const double fs = 48000.0;
+    const double res = 20.0;  // [voicing] DESIGN.md §11 kLpfResonance default
+    const int preroll = static_cast<int>(0.05 * fs);
+    const int sweepLen = static_cast<int>(0.1 * fs);
+    const int total = preroll + sweepLen + static_cast<int>(0.02 * fs);
+    const int f0 = preroll / static_cast<int>(fs * 0.001);
+    const int f1 = (preroll + sweepLen) / static_cast<int>(fs * 0.001);
+
+    const double sweepOctaves = std::log2(8000.0 / 200.0);
+    const double sweepRateOctPerMs = sweepOctaves / 100.0;
+    // G4.1/G4.2's own measured slopes AT fs=48kHz (this test's own rate) --
+    // 25.884dB (ladder) / 12.9418dB (SVF), NOT the 96kHz figures (23.9/
+    // 11.95) or the pure asymptote (24/12): bilinear warping measurably
+    // steepens the 4kHz-8kHz drop at 48kHz (G4.1's own recorded, non-gated
+    // figure), so the correct floor for a probe living in this same
+    // frequency region at this same fs uses that number.
+    const double ladderFloorDbPerMs = 25.884 * sweepRateOctPerMs;
+    const double svfFloorDbPerMs = 12.9418 * sweepRateOctPerMs;
+
+    auto runCutoffSweep = [&](auto& driver, double noteHz, bool interp) {
+      Osc osc;
+      osc.setSampleRate(fs);
+      osc.wave = Osc::Wave::Saw;
+      osc.setDt(noteHz / fs);
+      osc.resetPhase();
+      driver.configure(200.0, fs, res);
+
+      std::vector<float> out(static_cast<size_t>(total));
+      int phase = 0;
+      for (int i = 0; i < total; ++i) {
+        if (i >= preroll && i < preroll + sweepLen) {
+          const double t01 = static_cast<double>(i - preroll) / static_cast<double>(sweepLen);
+          // [voicing] geometric sweep, matching this file's own G4.10
+          // resonance sweep and envlfo_tests.cpp's expSweep -- the finest
+          // resolution the control-rate architecture can express anyway.
+          driver.fc = 200.0 * std::pow(8000.0 / 200.0, t01);
+        }
+        const double x = osc.step().y;
+        double y;
+        if (interp) {
+          y = driver.step(x);
+        } else {
+          // Non-interpolated REFERENCE: g held fixed for the whole control
+          // block (this file's pre-G5 behaviour, and this project's own
+          // G3.5 "stepped reference" technique) -- deliberately bypasses
+          // driver.step()'s G5 interpolation.
+          if (phase >= driver.controlBlock) {
+            driver.filter.setControlRate(driver.fc, driver.fs, driver.resonancePercent);
+            phase = 0;
+          }
+          y = driver.filter.process(x);
+          ++phase;
+        }
+        out[static_cast<size_t>(i)] = static_cast<float>(y);
+      }
+      return out;
+    };
+
+    auto worstDbPerMs = [&](const std::vector<float>& out) {
+      std::vector<double> frames;
+      envelopeDb(out, fs, frames);
+      double worst = 0.0;
+      for (int i = std::max(1, f0); i < std::min(static_cast<int>(frames.size()), f1); ++i) {
+        if (frames[static_cast<size_t>(i - 1)] <= -80.0 || frames[static_cast<size_t>(i)] <= -80.0) continue;
+        worst = std::max(worst, std::fabs(frames[static_cast<size_t>(i)] - frames[static_cast<size_t>(i - 1)]));
+      }
+      return worst;
+    };
+
+    {
+      ControlRateDriver<LadderFilter> dlInterp, dlHeld;
+      const double worstL = worstDbPerMs(runCutoffSweep(dlInterp, 2000.0, true));
+      const double worstLHeld = worstDbPerMs(runCutoffSweep(dlHeld, 2000.0, false));
+      std::cout << "  [INFO] ladder: interpolated=" << worstL << "dB/ms vs the AC's literal 0.5dB/ms bound "
+                << "(derived physical floor " << ladderFloorDbPerMs << "dB/ms -- see group comment; "
+                << "held/non-interpolated reference=" << worstLHeld << "dB/ms)\n";
+      checkNum("G5.5: ladder -- interpolated reading sits at the derived physical floor (24dB/octave "
+               "skirt x sweep rate), not above it, +/- 15%",
+               std::fabs(worstL - ladderFloorDbPerMs) <= 0.15 * ladderFloorDbPerMs, worstL);
+      checkNum("G5.5: ladder -- per-sample gLpf interpolation beats a held (non-interpolated) "
+               "reference at the same probe by >= 3dB",
+               20.0 * std::log10(worstLHeld / worstL) >= 3.0, 20.0 * std::log10(worstLHeld / worstL));
+    }
+    {
+      ControlRateDriver<SvfFilter> dsInterp, dsHeld;
+      const double worstS = worstDbPerMs(runCutoffSweep(dsInterp, 2000.0, true));
+      const double worstSHeld = worstDbPerMs(runCutoffSweep(dsHeld, 2000.0, false));
+      std::cout << "  [INFO] SVF: interpolated=" << worstS << "dB/ms vs the AC's literal 0.5dB/ms bound "
+                << "(derived physical floor " << svfFloorDbPerMs << "dB/ms -- see group comment; "
+                << "held/non-interpolated reference=" << worstSHeld << "dB/ms)\n";
+      checkNum("G5.5: SVF -- interpolated reading sits at the derived physical floor (12dB/octave "
+               "skirt x sweep rate), not above it, +/- 15%",
+               std::fabs(worstS - svfFloorDbPerMs) <= 0.15 * svfFloorDbPerMs, worstS);
+      checkNum("G5.5: SVF -- per-sample gLpf interpolation beats a held (non-interpolated) "
+               "reference at the same probe by >= 3dB",
+               20.0 * std::log10(worstSHeld / worstS) >= 3.0, 20.0 * std::log10(worstSHeld / worstS));
+    }
+  }
+
+  // =========================================================================
+  // G5.6: the clamp holds under full modulation. env amount/key follow/LFO
+  // amount all 100%, note 108.
+  // QUANTITY MEASURED: getDebugVoiceLpfCutoff() (the REAL, per-voice,
+  // modulated-and-clamped fc), NOT the AC text's literal
+  // getDebugLpfCutoff() -- that function deliberately stayed the
+  // UNMODULATED readback across G5 (see its own header comment in
+  // synth_core.h) precisely so G4.9 keeps testing what it always tested;
+  // using it here would trivially "pass" regardless of whether the clamp
+  // holds under modulation, which is exactly the AC-measures-the-wrong-
+  // quantity trap this project's own review process keeps finding.
+  // Sampled at EVERY control block over 0.5s (>= 2 LFO cycles at the
+  // default 5Hz) per {fs, cutoff} config, not just once, since the LFO/
+  // ENV-F terms make fc genuinely time-varying.
+  // =========================================================================
+  std::cout << "\nGroup: the clamp holds under full modulation (G5.6)\n";
+  {
+    const float fss[] = {44100.0f, 48000.0f, 88200.0f, 96000.0f, 192000.0f};
+    const float cutoffs[] = {20.0f, 100.0f, 2000.0f, 8000.0f, 18000.0f};
+    bool allOk = true;
+    double worstTanArg = 0.0;
+    for (float fs : fss) {
+      for (float cutoff : cutoffs) {
+        SynthCore core;
+        core.init(fs);
+        core.setLpfCutoffHz(cutoff);
+        core.setLpfEnvAmountPercent(100.0f);
+        core.setLpfKeyFollowPercent(100.0f);
+        core.setLpfLfoAmountPercent(100.0f);
+        core.setEnvFSustainPercent(100.0f);
+        core.setLfoRateHz(5.0f);
+        std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 108, 1.0f}};
+        const int block = 32;
+        const int total = static_cast<int>(0.5 * static_cast<double>(fs));
+        std::vector<float> l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
+        int pos = 0;
+        while (pos < total) {
+          const int n = std::min(block, total - pos);
+          if (pos == 0) {
+            core.process(ev.data(), 1, l.data(), r.data(), n);
+          } else {
+            core.process(nullptr, 0, l.data(), r.data(), n);
+          }
+          const double got = core.getDebugVoiceLpfCutoff(0);
+          const double hi = 0.45 * static_cast<double>(fs);
+          if (got < 10.0 - 1e-6 || got > hi + 1e-3) {
+            allOk = false;
+            std::cout << "    FAIL fs=" << fs << " cutoff=" << cutoff << " pos=" << pos << " -> " << got
+                      << "\n";
+          }
+          const double tanArg = kAmpPi * got / static_cast<double>(fs);
+          worstTanArg = std::max(worstTanArg, tanArg);
+          pos += n;
+        }
+      }
+    }
+    check("G5.6: getDebugVoiceLpfCutoff() stays in [10, 0.45*fs] at every control block, note "
+          "108, env/key-follow/LFO amount all 100%, across the full {fs, cutoff} grid",
+          allOk);
+    checkNum("G5.6: largest tan() argument implied by any clamped, fully-modulated cutoff is <= "
+             "pi*0.45 (1.4137)",
+             worstTanArg <= kAmpPi * 0.45 + 1e-9, worstTanArg);
   }
 
   std::cout << "\n=== Summary: " << (g_checks - g_failures) << "/" << g_checks << " checks passed ===\n";

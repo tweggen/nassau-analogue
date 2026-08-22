@@ -123,6 +123,7 @@ which are computed once per voice and used by both chains (PERF-5).
      8. HPF        TPT 1-pole HP cascade, 2 or 4 poles, cutoff × key follow
      9. LPF        24 dB: ZDF ladder │ 12 dB: TPT SVF        (§5)
                    cutoff = base × keyfollow × 2^(ENV-F*amt) × 2^(LFO*amt)
+     9b. DC BLOCK  1-pole HP @ 5 Hz — odd saturators re-make DC (§5.6)
     10. VCA        ENV-A × velocity
     11. PAN        c == 0 → left by Spread, c == 1 → right by Spread
                                   │
@@ -528,6 +529,39 @@ design:
 
 **The −3 dB point of this filter is not at `fc` either**: at `Resonance = 0`
 (`R0 = 1.0`, two coincident real poles) it sits at **0.6436·fc**.
+
+### 5.6 The post-filter DC blocker — also not optional
+
+A second one-pole 5 Hz high-pass sits on the **LPF output**, per voice, before
+the VCA.
+
+The mixer blocker of §4.1 does not cover this, and assuming it does is a real
+mistake that was made here once. A DC-free *input* does not give a DC-free
+*output*: both structures' feedback saturators are **odd** functions, and an odd
+function fed a signal that is zero-mean but **not half-wave-symmetric** — which
+any pulse at duty ≠ 50 % is — re-introduces a nonzero time-average. Measured
+with only the mixer blocker present:
+
+```
+SVF, res 99 %, PW 30 %, fc 500 Hz    DC = 2.3e-2   peak 3.69     <- 230x the bound
+SVF, res 99 %, PW 50 %, fc 500 Hz    DC = 1.5e-6                 <- symmetric: no DC
+SVF, res  0 %, PW 30 %, fc 500 Hz    DC = 7.5e-4                 <- no resonance: small
+```
+
+The two controls are what identify the mechanism: DC appears only when the input
+is asymmetric **and** the nonlinear feedback is engaged. With the blocker the
+worst corner reads **−4.1e-5**. This is the same mechanism, and the same remedy,
+as `nassau-zermatt`'s `mCfDcBlock` and `mPowerDcBlock` — its DESIGN records the
+identical reasoning about odd functions and asymmetrically-shaped inputs.
+
+**Known residual, recorded not bounded.** At extreme resonance (99 %) the SVF's
+control-rate damping regulation produces slow sub-5 Hz *wander* that a 5 Hz
+blocker cannot remove. Measured over successive 1 s windows at
+{res 99 %, PW 30 %, fc 500 Hz, note 48}: −1.06e-4, −7.0e-5, **+6.2e-5**,
++7.6e-6, −1.5e-4. It **changes sign**, so it is not an offset and it averages
+toward zero over longer windows — which is why G3.12's 1e-4 bound stands rather
+than being loosened to accommodate it. Raising the blocker corner would fix the
+number and cost real low-end on 16' notes; it is not worth it.
 
 ### 5.4 Cutoff modulation
 

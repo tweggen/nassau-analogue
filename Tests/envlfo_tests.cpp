@@ -1222,19 +1222,87 @@ int main() {
   // G3.12: no DC.
   // QUANTITY MEASURED: mean of the last 4096 samples after 2s of a
   // sustained note, for each of the 3 oscillator waveforms.
+  //
+  // R11 FINDING (G5): the bound below was 1e-4 through G3/G4, when nothing
+  // downstream of the mixer DC blocker (DESIGN.md §4.1) was nonlinear or
+  // time-varying. G5 wires the real LPF into this exact signal path (both
+  // structures, per DESIGN.md §5.2/§5.3, driven with their DEFAULT params:
+  // kLpfSlope=24dB/ladder, kLpfResonance=20%, kLpfCutoff=2000Hz,
+  // kLpfEnvAmount=40%, kLpfKeyFollow=50%), and BOTH filter structures turn
+  // out to leak a small, genuinely STRUCTURAL (not implementation-bug) DC
+  // for a periodic input that is zero-mean but NOT half-wave-symmetric
+  // (x(t+T/2) != -x(t)) -- which describes a saw, and a pulse at any duty
+  // other than exactly 50%. Isolated with a standalone diagnostic (not
+  // committed, see the G5 gate report) sweeping SynthCore's real params:
+  //   - kLpfResonance = 0 (the ladder's k = 4.2*0 = 0, so its feedback
+  //     saturator shapeTriodeK(y4lin, kLadderSat) is multiplied by k=0 and
+  //     never actually perturbs the signal) -> DC = EXACTLY 0.0 at every
+  //     duty tested. This isolates the cause to resonance > 0, not to the
+  //     cutoff-modulation wiring this gate also adds (confirmed separately:
+  //     zeroing kLpfEnvAmount/kLpfKeyFollow with resonance left at its
+  //     20% default barely moves the reading, 0.00459 vs 0.00473).
+  //   - PW = 50% (the one duty that IS half-wave-symmetric) -> DC = exactly
+  //     0.0 even at the 20% resonance default. Consistent with the
+  //     mathematical fact that an ODD point nonlinearity f(-x)=-f(x)
+  //     (shapeTriodeK is odd) preserves the zero mean of a half-wave-
+  //     symmetric periodic signal, but NOT of a general zero-mean one: for
+  //     a two-level signal at A for a fraction d of the period and B for
+  //     (1-d) with dA+(1-d)B=0, the output mean d*f(A)+(1-d)*f(B) is zero
+  //     only if B=-A, i.e. only at d=0.5.
+  //   - The default-param sweep this AC actually drives (PW 10/25/40/50%,
+  //     kLpfResonance=20%, ladder) measures a WORST CASE of 4.73e-3 (at
+  //     PW=25%), stable (bit-identical at t=2s and t=4s -- not a leak/
+  //     growing instability, a genuine small steady-state bias). The Saw/
+  //     Tri/Pulse-50% sweep's worst is -2.68e-4 (Saw, also not half-wave-
+  //     symmetric; Tri and Pulse-50% both measure ~1e-12, exactly the
+  //     half-wave-symmetric prediction).
+  // This is exactly the DC-related finding the G5 task brief anticipated
+  // ("if you still see a DC or stability problem after wiring it in, that
+  // is a genuine finding") -- and a SEPARATE, larger-magnitude instance of
+  // the same class of phenomenon G4's own gate note already flagged for the
+  // SVF specifically (its Reff depends on the PREVIOUS control block's peak
+  // |bp|, an explicitly causal/time-varying scheduling that also breaks
+  // exact periodic symmetry on its own, independent of the ladder's odd
+  // saturator -- confirmed separately: the SVF leaks DC even at resonance 0,
+  // where the ladder's mechanism is provably inert). DESIGN.md §5.2's
+  // saturator formula and §5.3's Reff formula are both frozen, gate-proven
+  // (G4) design constants (R5); this is not a coding defect to fix by
+  // changing them, so the bound below is updated instead, with the
+  // reasoning kept here rather than silently loosened. It is NOT relaxed
+  // to "whatever passes" -- 6e-3 is chosen with headroom over the 4.73e-3
+  // worst case actually measured here, while remaining 83x tighter than the
+  // -0.50/-0.80 catastrophic pre-DC-blocker bug this AC exists to catch.
+  //
+  // Note 66 + a computed fine-tune gives EXACTLY 375 Hz => EXACTLY 128
+  // samples/cycle at 48kHz, and 4096/128 = 32, a WHOLE number of cycles.
+  // Without this, "the last 4096 samples" (the AC's own literal window)
+  // spans a fractional number of periods of a non-aligned carrier (e.g.
+  // 440Hz: 4096/109.09 = 37.55 cycles), and a plain arithmetic mean over
+  // a fractional period of an otherwise-zero-mean waveform is NOT itself
+  // exactly zero-mean -- confirmed this was the actual cause here (all
+  // three waveforms initially measured ~1e-3, an order of magnitude over
+  // the ORIGINAL 1e-4 bound, purely from this window-truncation bias, not a
+  // real DC leak; switching to a period-aligned window resolves it).
   // =========================================================================
   std::cout << "\nGroup: no DC (G3.12)\n";
   {
-    // Note 66 + a computed fine-tune gives EXACTLY 375 Hz => EXACTLY 128
-    // samples/cycle at 48kHz, and 4096/128 = 32, a WHOLE number of cycles.
-    // Without this, "the last 4096 samples" (the AC's own literal window)
-    // spans a fractional number of periods of a non-aligned carrier (e.g.
-    // 440Hz: 4096/109.09 = 37.55 cycles), and a plain arithmetic mean over
-    // a fractional period of an otherwise-zero-mean waveform is NOT itself
-    // exactly zero-mean -- confirmed this was the actual cause here (all
-    // three waveforms initially measured ~1e-3, an order of magnitude over
-    // the 1e-4 bound, purely from this window-truncation bias, not a real
-    // DC leak; switching to a period-aligned window resolves it).
+    // [voicing] G5 finding (see the group comment above): was 1e-4 through
+    // G3/G4 (before the LPF sat in this path); the small, structural,
+    // resonance-driven DC a nonlinear resonant filter genuinely introduces
+    // for a non-half-wave-symmetric periodic input pushed the measured worst
+    // case to 4.73e-3, so this bound now carries headroom over that instead.
+    // RESTORED to 1e-4 after G5's review. G5 moved this to 6e-3 on the
+    // grounds that a nonlinear resonant filter in the path structurally leaks
+    // DC. The mechanism is real -- both filters' feedback saturators are ODD
+    // functions, and an odd function fed a zero-mean but not half-wave-
+    // symmetric signal (any pulse at duty != 50%) re-introduces a nonzero
+    // time-average -- but the remedy is a DC blocker, not a looser bound.
+    // That is precisely what nassau-zermatt did twice for the identical
+    // mechanism (mCfDcBlock, mPowerDcBlock). Voice::postLpfDcBlock
+    // (DESIGN.md §5.6) now sits on the LPF output: the worst corner went
+    // from 2.3e-2 to -4.1e-5, and this AC's own default-parameter scope
+    // measures ~1e-6.
+    constexpr double kG312DcBound = 1e-4;
     const int noteDc = 66;
     const float fineDc = fineCentsFor(noteDc, 375.0);
     bool allOk = true;
@@ -1254,7 +1322,7 @@ int main() {
       for (size_t i = out.size() - 4096; i < out.size(); ++i) mean += out[i];
       mean /= 4096.0;
       std::cout << "    wave=" << static_cast<int>(wave) << " DC mean=" << mean << "\n";
-      if (std::fabs(mean) >= 1e-4) allOk = false;
+      if (std::fabs(mean) >= kG312DcBound) allOk = false;
     }
     check("G3.12: mean of the last 4096 samples (an exact whole number of cycles at the chosen "
           "375Hz carrier) after 2s, every waveform, < 1e-4",
@@ -1284,10 +1352,11 @@ int main() {
       mean /= 4096.0;
       std::cout << "    pulse PW=" << pw << "% DC mean=" << mean
                 << "  (undamped this would be " << (2.0 * pw / 100.0 - 1.0) << ")\n";
-      if (std::fabs(mean) >= 1e-4) pwOk = false;
+      if (std::fabs(mean) >= kG312DcBound) pwOk = false;
     }
-    check("G3.12: pulse DC < 1e-4 at PW = 10/25/40/50% -- proves DESIGN.md §4.1's "
-          "mixer DC blocker is present (a pulse's own DC is 2d-1)",
+    check("G3.12: pulse DC < 1e-4 at PW = 10/25/40/50% -- "
+          "proves DESIGN.md §4.1's mixer DC blocker is present (a pulse's own DC is 2d-1) and "
+          "bounds the small additional structural DC the now-wired resonant LPF adds on top",
           pwOk);
   }
 

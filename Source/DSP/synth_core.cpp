@@ -43,6 +43,7 @@ void SynthCore::init(float sampleRate) {
         // sustains a note that low audibly) to be transparent in band.
         // DESIGN.md §4.
         mVoices[i].dcBlock.setFc(5.0, sampleRate);
+        mVoices[i].postLpfDcBlock.setFc(5.0, sampleRate);
     }
 
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
@@ -61,6 +62,7 @@ void SynthCore::reset() {
 
     for (int i = 0; i < kG3Voices; ++i) {
         mVoices[i].dcBlock.reset();
+        mVoices[i].postLpfDcBlock.reset();
         Voice& v = mVoices[i];
         v.osc1.reset();   // full reset (phase + triangle integrator state) --
         v.osc2.reset();   // distinct from the PHASE-ONLY resetPhase() a note-on
@@ -69,6 +71,14 @@ void SynthCore::reset() {
         v.noise.init(i);  // [dsp] DESIGN.md §3.5/R8/R13: seeded from voice index
         v.envF.reset();
         v.envA.reset();
+        v.lpfLadder.reset();  // G5: both structures exist per voice regardless of kLpfSlope
+        v.lpfSvf.reset();     // (DESIGN.md §5.1 [PERF-8] crossfade), so both must reset here.
+        v.lastLpfOutput = 0.0;
+        v.debugLpfCutoffHz = 0.0;
+        v.gLpfLadderCur = 0.0;
+        v.gLpfLadderStep = 0.0;
+        v.gLpfSvfCur = 0.0;
+        v.gLpfSvfStep = 0.0;
         v.active = false;
         v.note = -1;
         v.vcaGainStart = 0.0;
@@ -78,6 +88,19 @@ void SynthCore::reset() {
     mActiveVoiceCount = 0;
     mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
     mLastLfoValue = 0.0;
+
+    // G5: the crossfade never survives a reset (DESIGN.md §11 "Reset
+    // semantics": clears state, never touches params) -- re-settle on
+    // whichever slope kLpfSlope's CURRENT atomic value says, so a reset()
+    // immediately after setLpfSlope(X) does not spuriously start a
+    // crossfade the next time controlRateUpdate() runs (it would otherwise
+    // see mLpfSlopeSettled still at its stale pre-reset value).
+    mLpfSlopeSettled = mLpfSlope.load(std::memory_order_relaxed);
+    mLpfCrossfadeActive = false;
+    mLpfCrossfadeFromSlope = mLpfSlopeSettled;
+    mLpfCrossfadeToSlope = mLpfSlopeSettled;
+    mLpfCrossfadeSamplesTotal = 0;
+    mLpfCrossfadeSamplesElapsed = 0;
 
     mPendingCount = 0;
 
@@ -155,6 +178,19 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
         for (int i = 0; i < chunk; ++i) {
             const int posInBlock = mControlPhase + i;
             const double frac = static_cast<double>(posInBlock) / static_cast<double>(blockSizeForFrac);
+
+            // G5 (DESIGN.md §5.1's 20ms slope crossfade): this SAMPLE's
+            // crossfade mix position, shared by every voice (the crossfade
+            // is one instrument-wide event, DESIGN.md §11's kLpfSlope is a
+            // single param -- see synth_core.h's mLpfCrossfade* comment).
+            // Plain int-ratio division, exactly the same shape as `frac`
+            // above (already R12-legal in this loop) -- not a transcendental.
+            const double crossfadeT =
+                mLpfCrossfadeActive
+                    ? std::min(1.0, static_cast<double>(mLpfCrossfadeSamplesElapsed) /
+                                         static_cast<double>(std::max(1, mLpfCrossfadeSamplesTotal)))
+                    : 0.0;
+
             double mixSum = 0.0;
             for (int vi = 0; vi < kG3Voices; ++vi) {
                 Voice& v = mVoices[vi];
@@ -181,37 +217,56 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 // a way that is not the PWM sound anyone wants.
                 const double mix = v.dcBlock.process(mixRaw);
 
-                // G4 NOTE (DESIGN.md §5.1/§1, docs/GATES.md's own "driving
-                // the structures directly from the test... is the expected
-                // shape" guidance): the mixer -> LPF -> VCA signal-chain
-                // wiring is deliberately NOT done here yet. Routing the real
-                // per-voice audio through LadderFilter/SvfFilter here was
-                // tried during this gate and reverted: DESIGN.md §5.3's own
-                // "Reff recomputed from the PREVIOUS control block's peak"
-                // scheduling is *causal, not time-symmetric* by explicit
-                // specification, so wiring it into a real (periodic,
-                // resonance-fed) voice signal necessarily makes the filter's
-                // coefficients periodically time-varying at block rate -- and
-                // that is enough, for ANY spec-correct implementation, to
-                // break the exact odd/half-period symmetry a purely-LTI
-                // stage would preserve, leaking a small (~1e-4, stable,
-                // non-growing -- confirmed by direct measurement, not a
-                // leak/instability) resonance-dependent DC into the signal
-                // that G3.12's pre-existing (pre-G4) "no DC" bound (written
-                // when no filter sat in this path) does not tolerate. This
-                // is a genuine interaction the plan did not name (R11); it
-                // is recorded in the G4 gate note rather than silently
-                // routed around. G4's own ACs (G4.1-G4.11) are all satisfied
-                // by driving LadderFilter/SvfFilter directly (Tests/
-                // filter_tests.cpp), matching Zermatt's cabinet_tests.cpp
-                // precedent -- full per-voice signal-chain integration
-                // (alongside the slope crossfade and modulation that also
-                // touch this exact code path) is G5's job.
+                // G5 (DESIGN.md §1 step 9, §5): the LPF is now GENUINELY IN
+                // THE SIGNAL PATH -- the interaction G4's gate note flagged
+                // (wiring the SVF's causal, previous-control-block Reff into
+                // a real periodic voice signal broke G3.12's "no DC" bound,
+                // measured up to -7.96e-4) no longer applies: the mixer DC
+                // blocker just above now sits BEFORE this stage (it did not
+                // yet exist in that form when G4's attempt was made), so the
+                // filter's own input is already DC-free (DESIGN.md §4.1
+                // measures 1e-9..1e-10 residual at every duty).
+                //
+                // That is NOT sufficient on its own, and an earlier version of
+                // this comment wrongly claimed it was. A DC-free INPUT does not
+                // give a DC-free OUTPUT here: both structures' feedback
+                // saturators are odd functions, and an odd function fed a
+                // zero-mean but not half-wave-symmetric signal re-introduces a
+                // nonzero time-average. Measured with only the mixer blocker:
+                // 2.3e-2 DC / 3.69 peak at {SVF, res 99%, PW 30%, fc 500 Hz},
+                // against a 1e-4 bound -- while a symmetric 50% pulse at the
+                // same resonance gave 1.5e-6, which is what identifies the
+                // mechanism. Hence postLpfDcBlock below (DESIGN.md §5.6).
+                double lpfOut;
+                if (mLpfCrossfadeActive) {
+                    const double yFrom = runLpfStructure(v, mLpfCrossfadeFromSlope, mix);
+                    const double yTo = runLpfStructure(v, mLpfCrossfadeToSlope, mix);
+                    lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
+                } else {
+                    lpfOut = runLpfStructure(v, mLpfSlopeSettled, mix);
+                }
+                v.lastLpfOutput = lpfOut;
+                lpfOut = v.postLpfDcBlock.process(lpfOut);
+
                 const double gain = mDebugDisableVcaInterpolation
                                          ? v.vcaGainEnd
                                          : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
-                mixSum += mix * gain;
+                mixSum += lpfOut * gain;
             }
+
+            // G5: advance the crossfade's shared, AUDIO-RATE sample counter
+            // and finalise it the instant it completes -- mid control-block
+            // is fine (and correct: DESIGN.md §5.1's 20ms is a TIME window,
+            // not a control-block-aligned one). Plain int arithmetic only,
+            // no transcendental/atomic (R12).
+            if (mLpfCrossfadeActive) {
+                ++mLpfCrossfadeSamplesElapsed;
+                if (mLpfCrossfadeSamplesElapsed >= mLpfCrossfadeSamplesTotal) {
+                    mLpfCrossfadeActive = false;
+                    mLpfSlopeSettled = mLpfCrossfadeToSlope;
+                }
+            }
+
             outL[n + i] = static_cast<float>(mixSum);
             outR[n + i] = static_cast<float>(mixSum);
         }
@@ -461,17 +516,38 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
     const double lfoPwmModPercent = (static_cast<double>(snapshot.lfoPwmAmountPercent) * 0.01) *
                                      mLastLfoValue * 45.0;
 
-    // G4.9 (DESIGN.md §5.4's clamp): kLpfCutoff clamped into [10, 0.45*fs] --
-    // the ROBUSTNESS half of §5.4's clamp (tan(pi*fc/fs) diverges at
-    // Nyquist), proven live here so getDebugLpfCutoff() reflects the exact
-    // value the real control-rate path would feed a filter's
-    // setControlRate() (Source/DSP/synth_filter.h). The MODULATION half of
-    // §5.4 (key follow/ENV-F/LFO -> cutoff) is G5's job. G4's filter
-    // structures themselves are not yet wired into this voice's audio
-    // summation -- see the AUDIO-RATE LOOP's own G4 comment above for why.
-    // Computed once per control block, not per sample (R12).
+    // G4.9 (kept stable into G5, DESIGN.md §5.4's clamp): the RAW kLpfCutoff
+    // clamped into [10, 0.45*fs] -- deliberately WITHOUT any of G5's
+    // per-voice modulation terms (see getDebugLpfCutoff()'s own header
+    // comment for why). Computed once per control block, not per sample
+    // (R12). The REAL, per-voice, modulated-and-clamped fc (DESIGN.md §5.4's
+    // key follow/ENV-F/LFO terms) is computed inside the per-voice loop
+    // below and fed to that voice's filter structure(s)' setControlRate();
+    // getDebugVoiceLpfCutoff() reads it back (G5.6).
     const double lpfFcClamped = std::clamp(static_cast<double>(snapshot.lpfCutoffHz), 10.0, 0.45 * fs);
     mDebugLpfCutoffHz = lpfFcClamped;  // G4.9 readback
+
+    // G5 (DESIGN.md §5.1, docs/GATES.md G5.4): a slope switch is a SINGLE
+    // instrument-wide event (kLpfSlope, DESIGN.md §11), so detecting it and
+    // timing the resulting 20ms crossfade both happen ONCE here, shared by
+    // every voice -- only the per-voice SEEDING of the incoming structure's
+    // state (below, inside the per-voice loop, from that voice's own most
+    // recent LPF output) differs voice to voice. If a crossfade is ALREADY
+    // running and the param changes again before it finishes, this
+    // deliberately lets the current one finish first rather than compounding
+    // two crossfades -- DESIGN.md §5.1 calls a slope switch "a rare,
+    // deliberate gesture" and no G5 AC exercises a mid-crossfade re-toggle;
+    // flagged as a decision the plan did not name (R11).
+    const bool startingLpfCrossfade = !mLpfCrossfadeActive && snapshot.lpfSlope != mLpfSlopeSettled;
+    if (startingLpfCrossfade) {
+        mLpfCrossfadeFromSlope = mLpfSlopeSettled;
+        mLpfCrossfadeToSlope = snapshot.lpfSlope;
+        // [voicing] DESIGN.md §5.1: 20ms, see kLpfCrossfadeSeconds's own comment.
+        mLpfCrossfadeSamplesTotal = std::max(1, static_cast<int>(std::lround(kLpfCrossfadeSeconds * fs)));
+        mLpfCrossfadeSamplesElapsed = 0;
+        mLpfCrossfadeActive = true;
+    }
+    const double lpfResonancePercent = static_cast<double>(snapshot.lpfResonancePercent);
 
     for (int i = 0; i < kG3Voices; ++i) {
         Voice& v = mVoices[i];
@@ -529,6 +605,68 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
 
         v.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent);
         v.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent);
+
+        // G5.4: THIS voice's own most recent LPF output seeds the incoming
+        // structure -- each voice carries a different signal, so each needs
+        // its own seed (the shared crossfade TIMING above is instrument-wide,
+        // this per-voice STATE seeding is not).
+        if (startingLpfCrossfade) {
+            if (mLpfCrossfadeToSlope == static_cast<int>(LpfSlope::Db24)) {
+                v.lpfLadder.seedFromOutput(v.lastLpfOutput);
+            } else {
+                v.lpfSvf.seedFromOutput(v.lastLpfOutput);
+            }
+        }
+
+        // [dsp] DESIGN.md §5.4, folded into ONE exp2 call per §2.1 ("write
+        // them as one exp2 of a summed octave offset per filter, not one
+        // per term"): key follow (referred to note 60), ENV-F (bipolar,
+        // +/-6 octaves at 100%), LFO (+/-2 octaves at 100%), then the
+        // [10, 0.45*fs] robustness clamp (tan(pi*fc/fs) diverges at
+        // Nyquist, same clamp as the unmodulated lpfFcClamped above).
+        const double lpfKeyFollowOct = (static_cast<double>(snapshot.lpfKeyFollowPercent) * 0.01) *
+                                        (static_cast<double>(v.note) - 60.0) / 12.0;
+        const double lpfEnvOct =
+            6.0 * (static_cast<double>(snapshot.lpfEnvAmountPercent) * 0.01) * v.envF.y;
+        const double lpfLfoOct =
+            2.0 * (static_cast<double>(snapshot.lpfLfoAmountPercent) * 0.01) * mLastLfoValue;
+        const double lpfFcRaw =
+            static_cast<double>(snapshot.lpfCutoffHz) * std::exp2(lpfKeyFollowOct + lpfEnvOct + lpfLfoOct);
+        const double lpfFcVoice = std::clamp(lpfFcRaw, 10.0, 0.45 * fs);
+        v.debugLpfCutoffHz = lpfFcVoice;  // G5.6 readback
+
+        // DESIGN.md §2: gLpf (the coefficient `g` itself) is linearly
+        // interpolated PER SAMPLE across the control block -- one of
+        // exactly three such quantities, alongside vcaGain (already
+        // interpolated since G3) and gHpf (G6). `filter.g` going into
+        // setControlRate() is wherever the PREVIOUS block's interpolation
+        // left it (the ramp's start); setControlRate() below computes this
+        // block's TARGET g (and the control-rate-only k/Reff resonance
+        // terms, unchanged), and the per-sample step is derived from the
+        // two. runLpfStructure() (synth_core.h) applies the interpolated
+        // value via advanceCoeff() every sample (an audio-rate division,
+        // deliberately, see synth_filter.h's own G5 comment) and advances
+        // it by this step afterward.
+        auto prepGInterp = [&](auto& filter, double& gCur, double& gStep) {
+            const double gStart = filter.g;
+            filter.setControlRate(lpfFcVoice, fs, lpfResonancePercent);
+            gStep = (filter.g - gStart) / static_cast<double>(std::max(1, mControlBlock));
+            gCur = gStart;
+        };
+
+        // DESIGN.md §5.1 [PERF-8]: only the currently-selected structure
+        // runs a control block's worth of coefficient recompute, EXCEPT
+        // during the 20ms crossfade, when BOTH must (G4's own gate note:
+        // "recompute both, unconditionally, every control block... G5 is
+        // where that becomes the live design").
+        if (mLpfCrossfadeActive) {
+            prepGInterp(v.lpfLadder, v.gLpfLadderCur, v.gLpfLadderStep);
+            prepGInterp(v.lpfSvf, v.gLpfSvfCur, v.gLpfSvfStep);
+        } else if (mLpfSlopeSettled == static_cast<int>(LpfSlope::Db24)) {
+            prepGInterp(v.lpfLadder, v.gLpfLadderCur, v.gLpfLadderStep);
+        } else {
+            prepGInterp(v.lpfSvf, v.gLpfSvfCur, v.gLpfSvfStep);
+        }
     }
 }
 

@@ -67,3 +67,21 @@ target_compile_definitions(filter_tests PRIVATE
     NASSAU_FILTER_H_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_filter.h")
 
 add_test(NAME FilterTests COMMAND filter_tests)
+
+# ---- G5.7: golden-reference parity harness (Tests/synth_golden.cpp) -------
+# synth_golden generate|verify [path]. Captures the sound-defining core as
+# of G5 (mixer -> DC block -> LPF [+cutoff modulation +slope crossfade] ->
+# VCA) into fixtures/golden_g5.bin, checked in. Regenerate with
+# `synth_golden generate "<abs path>"` -- a deliberate act (docs/GATES.md
+# R8/R13), never a side effect of a normal build/test run (`generate` is
+# never invoked by ctest, only `verify` is).
+set(SYNTH_GOLDEN_FIXTURE_G5 "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/golden_g5.bin")
+add_executable(synth_golden synth_golden.cpp)
+target_link_libraries(synth_golden nassau_synth_core)
+target_include_directories(synth_golden PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(synth_golden PRIVATE ${NASSAU_WARNING_FLAGS})
+target_compile_definitions(synth_golden PRIVATE
+    GOLDEN_FIXTURE_PATH_G5="${SYNTH_GOLDEN_FIXTURE_G5}")
+
+add_test(NAME GoldenParityG5 COMMAND synth_golden verify "${SYNTH_GOLDEN_FIXTURE_G5}")
