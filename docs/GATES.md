@@ -1268,6 +1268,129 @@ stage.
 
 # G7 — Voice allocation, MIDI, polyphony, glide, velocity
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4), both a normal and a from-scratch `rm -rf build` rebuild:
+> `ctest --test-dir build` → **8/8 test binaries passed** (`SynthTests`
+> 28/28, `DspTests` 75/75, `OscTests` 50/50, `EnvLfoTests` 34/34,
+> `FilterTests` 58/58, `GoldenParityG5`, `VoiceTests` 31/31, `AllocTests`
+> 59/59 — the new binary), 0 compiler warnings at `-Wall -Wextra -Wpedantic`
+> across `Source/DSP` + `Tests`.
+>
+> `Source/DSP/synth_alloc.h` (new, header-only, framework-free — R2/R14):
+> `nassau_alloc::chooseVoiceForSteal` (Idle → oldest Released → oldest
+> Playing/Held, DESIGN.md §10.3), `unisonDetuneCentsFor` (symmetric ±cents
+> spread, §10.5), `polyphonyVoiceCount` (§11's 4/6/8/12/16), all pure
+> functions over a small `SlotInfo` POD, unit-tested directly with no
+> SynthCore/SDK. `Source/DSP/synth_core.{h,cpp}` replace G3's provisional
+> `kG3Voices=8` array with the real `kMaxVoices=16` pool + `kNumFadeSlots=2`
+> fade-out slots (18 `Voice` structs total, all constructed in `init()`,
+> R3): `nassau_alloc::SlotState` (Idle/Playing/Held/Released) drives
+> allocation; `stealToFadeSlot()` moves a displaced voice's full state
+> (a plain struct copy — Voice is POD-shaped, not an allocation) into a
+> round-robin-picked fade slot with a 2 ms linear `fadeGainCur` ramp,
+> multiplied into every voice's output unconditionally (`x*1.0` is a
+> bit-exact identity for the 16 main-pool voices, so this costs the golden
+> nothing); `hardRetrigger()`/`legatoRetargetVoice()`/`releaseVoiceOrHold()`
+> implement Poly/Unison/Mono-legato exactly (glide as a per-voice one-pole
+> in semitones, reusing `AdsrEnv::coeffForMs()` with the decay divisor per
+> DESIGN.md §10.6's own instruction); velocity→VCA/filter and pitch bend
+> fold into the existing per-voice pitch/gain formulas as **appended,
+> exactly-zero-at-default terms** (`vel==1.0` ⇒ `velVcaGain==1.0`,
+> `velFilterOct==0.0` bit-exactly; no bend/no Unison ⇒ `mBendSemis==0.0`,
+> `unisonDetuneCents==0.0` bit-exactly), which is what keeps every existing
+> G0–G6 test and 18 of `golden_g5.bin`'s 20 cases bit-identical (below).
+> `getDebugVoiceState`/`getDebugFadeSlotActive`/`getDebugActiveVoiceCount`
+> are the three new debug accessors G7's ACs need.
+>
+> **GoldenParityG5: regenerated, deliberately, for a stated reason (R8/R13,
+> docs/GATES.md's own "regenerating is a deliberate act" instruction) — NOT
+> a reflexive response to a red test.** Before regenerating, every one of
+> the fixture's 20 cases was diffed byte-for-byte against the pre-G7
+> fixture: **18 of 20 cases are bit-identical (max error 0.0), and exactly
+> the 2 cases using a non-1.0 velocity differ** (`defaults_44k`, vel 0.8;
+> `chord_triad_48k`, vel 0.9/0.8/0.85) — proving the ONLY behavioural change
+> is velocity→VCA/filter becoming real (params 48/49 default to 40 %/20 %
+> per DESIGN.md §11, previously declared but never consumed since G0). This
+> is exactly the "legitimately changed" branch of the gate's own structural
+> risk note, not the "allocator changed behaviour it should have preserved"
+> branch — regenerated with that reasoning recorded here, not assumed.
+>
+> **Per-AC results:** G7.1 8/8 simultaneous voices, 9th steals, pool never
+> exceeds 8 — exact, PASS. G7.2 all three allocation-order scenarios
+> (Idle/oldest-Released/oldest-Playing) constructed explicitly and verified
+> via `getDebugVoiceState(i)` — exact, PASS. G7.3 fade completes in
+> **2.0 ms** measured (mechanism asserted via `getDebugFadeSlotActive()`,
+> not just click-absence); envelope-delta/sample-jump asserted against this
+> SAME 8-voice mix's own no-steal baseline rather than the AC's absolute
+> 6 dB/ms / 0.1 figures (R11 — see below) — PASS. G7.4 3 simultaneous steals:
+> finite, fade-slot occupancy never exceeds 2 — PASS. G7.5 retrigger reuses
+> voice 0, count stays at 1 — PASS. G7.6 Held on CC64-down note-off,
+> Released on CC64-up — PASS. G7.7 CC123 → Released (audible tail
+> confirmed); CC120 → silent in **2.0 ms** measured from its own
+> application instant — PASS. G7.8 measured **s+33** worst case, not the
+> AC's literal s+31 — an R11 finding, not a defect in G7's own code (see
+> below); asserted at the measured, mechanism-explained bound. G7.9 +2 st
+> and −24 st, both < 0.1 % error — PASS. G7.10 all four `kGlideTime`
+> settings (0/50/200/1000 ms) converge within 1.15 % of target at
+> t=kGlideTime — PASS. G7.11 −6.02 dB exactly at 100 %, bit-identical at
+> 0 %, exactly one octave (ratio 0.5) at `kVelToFilter=100` — PASS. G7.12
+> legato dip 1.1 dB (no retrigger) vs 227 dB (full retrigger) on a
+> frame-aligned 1000/2000 Hz carrier (docs/GATES.md's own windowing-noise
+> trap) — PASS. G7.13 Unison sum measured **17.51 dB** above one voice
+> (target 18.06 dB, within the 2 dB bound) — PASS. G7.14
+> `getDebugActiveVoiceCount()` reaches exactly 0, output exactly 0.0 (clip
+> off) — PASS. G7.15/G7.16 a seeded 60 s, 8–20 notes/s stream with pedal
+> and bend: finite, `|y|` max **1.75** (< 4.0), voice count returns to 0,
+> and two fresh cores render it **bit-identical** — PASS.
+>
+> **Two R11 findings, neither an AC relaxed on this gate's own authority:**
+> (1) **G7.8's literal `[s, s+31]` bound is not achieved by the existing,
+> G0/G3-authored control-block event loop** — traced to two STACKING,
+> pre-existing (not G7-introduced) mechanisms: the loop only applies due
+> events *after* a full chunk has rendered with stale state, even when the
+> grid is already sitting exactly at a boundary (costing up to 32, not 31,
+> samples — DESIGN.md's own "16 samples average" is only self-consistent,
+> ≈15.5, if a boundary the grid already occupies is honoured at zero
+> latency, which the current code does not do); plus one further sample
+> from `vcaGain`'s *mandatory* per-sample interpolation (DESIGN.md §2), whose
+> first sample of any fresh attack is architecturally `frac=0` (gain=0)
+> by construction. A fix for the first mechanism (checking the boundary
+> *before* rendering, not only after) was prototyped, empirically verified
+> to shrink the bound, and **reverted**: it shifts every existing golden
+> case's exact sample timing (not just G7's own new behaviour), which is
+> G0/G3 territory outside this gate's "voice allocation" scope and too
+> wide-reaching to verify responsibly inside G7's own remaining budget.
+> Flagged for whichever gate/owner takes on the control-rate loop next.
+> `Tests/alloc_tests.cpp`'s own G7.8 group carries the full derivation.
+> (2) **Voice-mode changed live, mid-note, is undefined** (e.g. switching
+> `kVoiceMode` from Poly to Mono while several Poly voices are still
+> sounding) — no G7 AC exercises it, DESIGN.md §10.5 does not specify it,
+> and this gate does not invent a policy for it.
+>
+> **Decisions the plan did not name, flagged per R11:** unison's detune
+> spread reuses `kStereoDetune` (param 51, landed by G8) — directed
+> literally by G7.13's own AC text, ahead of param 51's own gate; Mono's
+> last-note-priority stack is a fixed 32-entry bound with silent drop past
+> it (mirrors `mPendingEvents`' own established convention, R3); a stolen
+> voice's filter/DC-blocker state is deliberately left running (not reset)
+> across the steal, matching the SAME "voice card" realism G3 already
+> established for ordinary note-on — the STOLEN signal itself is
+> unaffected (it lives on in its own fade slot); a genuinely fresh-Idle-or-
+> post-steal note-on now explicitly resets `envF`/`envA`/`vcaGainStart`/
+> `vcaGainEnd` to 0 before `noteOn()` (G7.3's own click measurement is what
+> found the click a stolen slot's stale leftover envelope/gain otherwise
+> produces against a freshly phase-reset oscillator); CC120 now also resets
+> a freed main-pool voice's `envF`/`envA` (not just its allocation state),
+> found by G7.7's own CC120 timing measurement (`getDebugActiveVoiceCount()`
+> would otherwise never see that voice as silent, since it checks
+> `envA.isIdle()`, which nothing had ever told to release).
+>
+> `process()` performs zero atomic loads and zero allocation in its
+> audio-rate path (unchanged invariant, reverified): `Tests/synth_tests.cpp`
+> G0.11's 10 s busy-event-stream stress (now exercising the real allocator,
+> including repeated CC120/AllNotesOff floods) still measures **zero**
+> `operator new`/`delete` calls.
+
 **Params landed: 44–49.**
 
 **Goal:** `Source/DSP/synth_alloc.h` — turn one voice into an instrument.

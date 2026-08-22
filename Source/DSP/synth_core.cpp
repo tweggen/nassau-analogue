@@ -34,7 +34,13 @@ void SynthCore::init(float sampleRate) {
     // this is the ONE oscillator quantity that genuinely depends on fs
     // rather than being recomputed every control block, so it lives here
     // (called once per init(), not once per control block/sample, R12).
-    for (int i = 0; i < kG3Voices; ++i) {
+    // G7: ALL kMaxVoices+kNumFadeSlots physical slots -- the two fade slots
+    // (DESIGN.md §10.4) are just as real a voice as the 16 main-pool ones
+    // (a fade slot renders a full copy of a stolen voice's DSP chain, see
+    // synth_core.h's own G7 top-of-file note), so they need their
+    // sample-rate-dependent state prepared here too, once, in init() (R3:
+    // never in process()).
+    for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
         mVoices[i].osc1.setSampleRate(sampleRate);
         mVoices[i].osc2.setSampleRate(sampleRate);
         // [dsp] Mixer DC blocker at 5 Hz -- the same corner nassau-zermatt
@@ -51,8 +57,7 @@ void SynthCore::init(float sampleRate) {
     mOutputDcBlock.setFc(5.0, sampleRate);
 
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
-    // Everything else fixed-size for kMaxVoices + 2 fade slots (DESIGN.md
-    // §10.3) is G7's job; G3's kG3Voices-sized array is already fixed-size.
+    // G7: kMaxVoices+kNumFadeSlots is already a fixed-size array (synth_core.h).
     reset();
 }
 
@@ -64,7 +69,7 @@ void SynthCore::reset() {
     // a parameter" rule.
     mControlPhase = 0;
 
-    for (int i = 0; i < kG3Voices; ++i) {
+    for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
         mVoices[i].dcBlock.reset();
         mVoices[i].postLpfDcBlock.reset();
         Voice& v = mVoices[i];
@@ -90,16 +95,42 @@ void SynthCore::reset() {
         v.gLpfLadderStep = 0.0;
         v.gLpfSvfCur = 0.0;
         v.gLpfSvfStep = 0.0;
-        v.active = false;
         v.note = -1;
         v.vcaGainStart = 0.0;
         v.vcaGainEnd = 0.0;
         v.debugLfoPitchModSemis = 0.0;
+        // ---- G7: allocation/glide/velocity/unison/fade state ----
+        v.state = nassau_alloc::SlotState::Idle;
+        v.startedAt = 0;
+        v.releasedAt = 0;
+        v.glideCurrentSemis = 0.0;
+        v.glideTargetSemis = 0.0;
+        v.velVcaGain = 1.0;
+        v.velFilterOct = 0.0;
+        v.unisonDetuneCents = 0.0;
+        v.fadeActive = false;
+        v.fadeSamplesTotal = 0;
+        v.fadeSamplesElapsed = 0;
+        v.fadeGainCur = 1.0;
+        v.fadeGainStep = 0.0;
+        v.curBlockPeakAccum = 0.0;
+        v.peakPrevBlock = 0.0;
     }
-    mActiveVoiceCount = 0;
+    mHeldVoiceCount = 0;
     mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
     mLastLfoValue = 0.0;
     mOutputDcBlock.reset();  // G6: see its own field comment in synth_core.h
+
+    // ---- G7: allocator/performance-control reset (DESIGN.md §11 "Reset
+    // semantics": clears state, never touches a parameter) ----
+    mVoiceClock = 0;
+    mNextFadeSlot = 0;
+    mSustainHeld = false;
+    mBendSemis = 0.0;
+    mMonoStackCount = 0;
+    mUnisonActive = false;
+    mUnisonNote = -1;
+    mDebugActiveVoiceCount = 0;
 
     // G5: the crossfade never survives a reset (DESIGN.md §11 "Reset
     // semantics": clears state, never touches params) -- re-settle on
@@ -212,9 +243,21 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                     : 0.0;
 
             double mixSum = 0.0;
-            for (int vi = 0; vi < kG3Voices; ++vi) {
+            for (int vi = 0; vi < kMaxVoices + kNumFadeSlots; ++vi) {
                 Voice& v = mVoices[vi];
-                if (!v.active) continue;
+                // G7: main-pool voices [0,kMaxVoices) skip on Idle (DESIGN.md
+                // §10.7 [PERF-7] -- the VCA-after-filter chain ordering below
+                // pins vcaGain, and therefore this voice's WHOLE
+                // contribution, at exactly 0.0 the control block after ENV-A
+                // reaches Idle, which is exactly when `state` becomes Idle
+                // too (controlRateUpdate()) -- see getDebugActiveVoiceCount()
+                // 's own header comment for the full argument). Fade slots
+                // [kMaxVoices, kMaxVoices+kNumFadeSlots) skip on
+                // !fadeActive instead: DESIGN.md §10.4's 2ms fade is a
+                // property of the SLOT, independent of that copied voice's
+                // own envelope state.
+                const bool isMainPool = vi < kMaxVoices;
+                if (isMainPool ? (v.state == nassau_alloc::SlotState::Idle) : !v.fadeActive) continue;
 
                 const double prePhase1 = v.osc1.phase;
                 const auto r1 = v.osc1.step();
@@ -307,7 +350,37 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 const double gain = mDebugDisableVcaInterpolation
                                          ? v.vcaGainEnd
                                          : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
-                mixSum += lpfOut * gain;
+
+                // G7 (DESIGN.md §10.4): `fadeGainCur` is 1.0, permanently,
+                // for every main-pool voice (never written outside the fade
+                // branch below), so this multiply is a bit-exact IEEE-754
+                // identity (x*1.0==x) there -- it only actually attenuates a
+                // fade slot's copied signal. Plain multiply, R12-legal.
+                const double contribution = lpfOut * gain * v.fadeGainCur;
+                mixSum += contribution;
+
+                // G7/DESIGN.md §10.7 [PERF-7]: track this voice's own peak
+                // |contribution| over the control block IN PROGRESS (plain
+                // fabs/max, no transcendental/atomic, R12) -- copied into
+                // `peakPrevBlock` at the next control-rate boundary
+                // (controlRateUpdate()), which is the quantity
+                // getDebugActiveVoiceCount() actually reads.
+                const double absContribution = contribution < 0.0 ? -contribution : contribution;
+                if (absContribution > v.curBlockPeakAccum) v.curBlockPeakAccum = absContribution;
+
+                // G7 (DESIGN.md §10.4): advance a live fade slot's own 2ms
+                // linear ramp by one sample and retire it the instant it
+                // completes -- same shape as the LPF slope crossfade's own
+                // per-sample completion tracking just below (plain int/
+                // double arithmetic only, R12).
+                if (!isMainPool && v.fadeActive) {
+                    v.fadeGainCur += v.fadeGainStep;
+                    ++v.fadeSamplesElapsed;
+                    if (v.fadeSamplesElapsed >= v.fadeSamplesTotal) {
+                        v.fadeActive = false;
+                        v.fadeGainCur = 0.0;
+                    }
+                }
             }
 
             // G5: advance the crossfade's shared, AUDIO-RATE sample counter
@@ -363,13 +436,13 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
             // boundary within their own call are due at THIS, the first
             // boundary a call reaches -- drain them first (chronologically
             // they precede this call's own events).
-            for (int p = 0; p < mPendingCount; ++p) applyEvent(mPendingEvents[p]);
+            for (int p = 0; p < mPendingCount; ++p) applyEvent(mPendingEvents[p], snapshot, fs);
             mPendingCount = 0;
 
             // This call's own events with sampleOffset < n (i.e. within the
             // chunk[s] just rendered, [.., n)) are due at this boundary too.
             while (eventIdx < numEvents && events[eventIdx].sampleOffset < n) {
-                applyEvent(events[eventIdx]);
+                applyEvent(events[eventIdx], snapshot, fs);
                 ++eventIdx;
             }
 
@@ -492,105 +565,367 @@ void SynthCore::finishSnapshot(ParamSnapshot& s, double fsControl) {
     // [dsp] DESIGN.md §11 "Output stage": MasterVolume_linear = 10^(dB/20).
     // Also block-rate only (std::pow), also a single instrument-wide param.
     s.masterVolumeLinear = std::pow(10.0, static_cast<double>(s.masterVolumeDb) / 20.0);
+
+    // [dsp] G7/DESIGN.md §10.6: "tau = t/4.605 -- same convention as the
+    // envelope decay (§6), deliberately" -- literally AdsrEnv::coeffForMs()
+    // with the decay divisor (ln(100)), not a separately re-derived
+    // formula. kGlideTime is a single instrument-wide param, so this
+    // belongs here (block-rate, R12: std::exp via coeffForMs). At
+    // glideTimeMs==0 (coeffForMs's own ms-floor of 1e-3ms), tau is so small
+    // relative to fsControl that exp(-1/(tau*fsControl)) underflows to
+    // exactly 0.0 in IEEE double, making this EXACTLY 1.0 -- a full jump to
+    // target on the very first control step ("instantaneous (first control
+    // block)", G7.10) -- and matches AdsrEnv's own "y += coeff*(target-y)"
+    // stepping convention used throughout this class (controlRateUpdate()).
+    s.glideStepCoeff = AdsrEnv::coeffForMs(static_cast<double>(s.glideTimeMs), AdsrEnv::decayDivisor(), fsControl);
 }
 
-// ===== G3: event application (DESIGN.md §10.1/§10.3, minimal/provisional) ===
+// ===== G7: event application (DESIGN.md §10.1/§10.3-§10.6) =====
 
-void SynthCore::applyEvent(const NoteEvent& ev) {
+void SynthCore::applyEvent(const NoteEvent& ev, const ParamSnapshot& snapshot, double fs) {
     switch (ev.type) {
-        case NoteEvent::NoteOn: {
-            // Reuse a voice already sounding THIS note (avoids piling up a
-            // second voice on a fast repeated NoteOn -- not G7.5's full
-            // "reuse" AC, but the same idea; free to add here).
-            int slot = -1;
-            for (int i = 0; i < kG3Voices; ++i) {
-                if (mVoices[i].active && mVoices[i].note == ev.note) { slot = i; break; }
-            }
-            if (slot < 0) {
-                for (int i = 0; i < kG3Voices; ++i) {
-                    if (!mVoices[i].active) { slot = i; break; }
-                }
-            }
-            // No allocation-order policy yet (Idle/oldest-Released/oldest-
-            // Playing is G7's job, DESIGN.md §10.3) -- if every slot is
-            // active and none matches this note, this minimal path just
-            // reuses slot 0. Not tested by any G3 AC.
-            if (slot < 0) slot = 0;
-
-            Voice& v = mVoices[slot];
-            v.note = ev.note;
-            // DESIGN.md §3.2: "both oscillators reset to 0" at note-on --
-            // PHASE only (resetPhase()), not the full reset() SynthCore::
-            // reset()/init() use, which would also clear the triangle
-            // leaky-integrator's running state. G2's own note left this
-            // exact choice ("resetPhase() vs reset() at note-on") open for
-            // "G7's voice design" -- G3 is in fact the first gate to build a
-            // voice, so the choice is made here instead, against DESIGN.md
-            // §3.2's literal wording (a decision the plan did not name G3
-            // for, flagged in this gate's report per R11).
-            v.osc1.resetPhase();
-            v.osc2.resetPhase();
-            v.sub.reset();  // keep the sub's wrap-index counter consistent with osc1's fresh phase=0
-            // Noise is deliberately NOT reset at note-on (only reset()/
-            // init() reseed it) -- a real analogue noise source runs
-            // continuously; DESIGN.md/R13 only require voice-index seeding
-            // at init()/reset(), not at every note-on.
-            v.envF.noteOn();
-            v.envA.noteOn();
-            if (!v.active) {
-                v.active = true;
-                ++mActiveVoiceCount;
-                if (mActiveVoiceCount == 1) mLfo.noteOnEdge();  // DESIGN.md §7: only 0->1
-            }
+        case NoteEvent::NoteOn:
+            handleNoteOn(ev.note, ev.value, snapshot, fs);
             break;
-        }
-        case NoteEvent::NoteOff: {
-            for (int i = 0; i < kG3Voices; ++i) {
-                if (mVoices[i].active && mVoices[i].note == ev.note) {
-                    mVoices[i].envF.noteOff();
-                    mVoices[i].envA.noteOff();
-                    break;  // first match only -- G7.2's oldest/allocation-order policy is out of scope
-                }
-            }
+        case NoteEvent::NoteOff:
+            handleNoteOff(ev.note, snapshot);
             break;
-        }
-        case NoteEvent::AllNotesOff: {
-            // DESIGN.md §10.3: "releases every voice normally." Real CC 123
-            // handling (this event's own G7.7 AC) is G7's job; releasing
-            // every sounding voice via noteOff() is a correct subset of that
-            // and free to add now.
-            for (int i = 0; i < kG3Voices; ++i) {
-                if (mVoices[i].active) {
-                    mVoices[i].envF.noteOff();
-                    mVoices[i].envA.noteOff();
-                }
-            }
-            break;
-        }
-        case NoteEvent::AllSoundOff: {
-            // DESIGN.md §10.4's click-free fade-out slots are G7's job; this
-            // minimal path just hard-silences every voice immediately
-            // (provisional -- not G7.7's precise 2.8 ms bound).
-            for (int i = 0; i < kG3Voices; ++i) {
-                if (mVoices[i].active) {
-                    mVoices[i].envF.reset();
-                    mVoices[i].envA.reset();
-                    mVoices[i].active = false;
-                    --mActiveVoiceCount;
-                    mVoices[i].vcaGainStart = 0.0;
-                    mVoices[i].vcaGainEnd = 0.0;
-                }
-            }
-            break;
-        }
         case NoteEvent::PitchBend:
+            // DESIGN.md §3.2/§10.6/G7.9: bend applies to EVERY sounding
+            // voice, not just new ones -- stored once here and read by
+            // EVERY active voice's pitch recompute in controlRateUpdate(),
+            // exactly like mLastLfoValue's own "one shared value, read by
+            // every voice" pattern (DESIGN.md §7 [PERF-4]).
+            mBendSemis = static_cast<double>(ev.value) * static_cast<double>(snapshot.bendRangeSemitones);
+            break;
         case NoteEvent::Sustain:
+            handleSustain(ev.value >= 0.5f);
+            break;
+        case NoteEvent::AllNotesOff:
+            handleAllNotesOff();
+            break;
+        case NoteEvent::AllSoundOff:
+            handleAllSoundOff(fs);
+            break;
         default:
-            // G7's job (DESIGN.md §10.3/§10.6/§7.6) -- no-op at G3, but
-            // accepted (not a crash/UB) so G0.8's "every event type" grid
-            // stays green (R1).
             break;
     }
+}
+
+void SynthCore::setVoiceState(int mainPoolIndex, nassau_alloc::SlotState newState) {
+    Voice& v = mVoices[mainPoolIndex];
+    const bool wasIdle = (v.state == nassau_alloc::SlotState::Idle);
+    const bool willBeIdle = (newState == nassau_alloc::SlotState::Idle);
+    v.state = newState;
+    if (wasIdle && !willBeIdle) {
+        ++mHeldVoiceCount;
+        if (mHeldVoiceCount == 1) mLfo.noteOnEdge();  // DESIGN.md §7: only 0->1
+    } else if (!wasIdle && willBeIdle) {
+        --mHeldVoiceCount;
+    }
+}
+
+void SynthCore::stealToFadeSlot(int mainPoolIndex, double fs) {
+    // DESIGN.md §10.4: "moved into one of two dedicated fade-out slots,
+    // where it continues to render with a 2ms linear fade to zero... Two
+    // slots is enough... if [a third steal within 2ms] happens the oldest
+    // fade slot is simply overwritten." Alternating 0/1 on every steal
+    // guarantees the slot picked is always the one used longest ago, with
+    // only 2 slots to track (no timestamp comparison needed).
+    const int fadeIdx = kMaxVoices + mNextFadeSlot;
+    mNextFadeSlot = 1 - mNextFadeSlot;
+
+    Voice& dst = mVoices[fadeIdx];
+    dst = mVoices[mainPoolIndex];  // plain struct copy (Voice is POD-shaped, R3: not an allocation)
+
+    // [voicing] DESIGN.md §10.4: "a 2ms linear fade to zero" -- an
+    // engineering choice, not a measured hardware figure (mirrors
+    // kLpfCrossfadeSeconds's own [voicing] tag for the same reason).
+    constexpr double kFadeSeconds = 0.002;
+    const int total = std::max(1, static_cast<int>(std::lround(kFadeSeconds * fs)));
+    dst.fadeActive = true;
+    dst.fadeSamplesTotal = total;
+    dst.fadeSamplesElapsed = 0;
+    dst.fadeGainCur = 1.0;
+    dst.fadeGainStep = -1.0 / static_cast<double>(total);
+    dst.curBlockPeakAccum = 0.0;
+    dst.peakPrevBlock = 0.0;
+}
+
+void SynthCore::hardRetrigger(int mainPoolIndex, int note, float vel, const ParamSnapshot& snapshot,
+                               double unisonDetuneCentsVal, bool freshEnvelope) {
+    Voice& v = mVoices[mainPoolIndex];
+    // `freshEnvelope` (Idle-alloc, post-steal, or every Unison voice, since
+    // Unison always retriggers, DESIGN.md §10.5) resets envF/envA/
+    // vcaGainStart/vcaGainEnd to a clean 0 before noteOn(). Without this, a
+    // STOLEN slot's leftover envelope/vcaGain values (the stolen SIGNAL
+    // itself lives on, unaffected, in its own fade slot; only this
+    // physical slot's bookkeeping is being repurposed) would let a freshly
+    // phase-reset (DESIGN.md §3.2), cold oscillator suddenly appear at
+    // whatever gain the UNRELATED stolen note happened to be at -- found by
+    // measurement (G7.3's own click test): an envelope delta of 6.8dB/ms
+    // and a 0.47 sample-to-sample jump, both over bound, traced to exactly
+    // this. The ONE caller that passes false (Poly's "retrigger a note
+    // already sounding ON THIS SAME SLOT", G7.5, no steal involved) is
+    // exactly the case AdsrEnv::noteOn()'s own "no reset of y" click-free
+    // continuity is FOR, and is deliberately left unreset.
+    v.note = note;
+    // DESIGN.md §3.2: "both oscillators reset to 0" at note-on -- PHASE
+    // only (resetPhase()), not the full reset() SynthCore::reset()/init()
+    // use (G3's own established choice, kept here unchanged: filter/DC-
+    // blocker state is deliberately left running across a note-on, exactly
+    // like a real analogue voice card's own capacitors do not discharge
+    // between notes).
+    v.osc1.resetPhase();
+    v.osc2.resetPhase();
+    v.sub.reset();  // keep the sub's wrap-index counter consistent with osc1's fresh phase=0
+    // Noise is deliberately NOT reset at note-on (only reset()/init()
+    // reseed it) -- a real analogue noise source runs continuously;
+    // DESIGN.md/R13 only require voice-index seeding at init()/reset().
+    if (freshEnvelope) {
+        v.envF.reset();
+        v.envA.reset();
+        v.vcaGainStart = 0.0;
+        v.vcaGainEnd = 0.0;
+    }
+    v.envF.noteOn();
+    v.envA.noteOn();
+    setVoiceState(mainPoolIndex, nassau_alloc::SlotState::Playing);
+    v.startedAt = ++mVoiceClock;
+
+    // DESIGN.md §10.6: glide is a SMOOTHED pitch target -- a fresh strike
+    // (fresh-Idle allocation, post-steal reuse, or a Unison retrigger) has
+    // nothing to glide FROM (that would be an unrelated previous note's
+    // pitch bleeding into this new one), so it snaps immediately. Only
+    // legatoRetargetVoice() (Mono legato) leaves this to actually glide.
+    v.glideTargetSemis = static_cast<double>(note);
+    v.glideCurrentSemis = v.glideTargetSemis;
+
+    // DESIGN.md §11 kVelToVca/kVelToFilter (G7.11). At 100%: vel=0.5 gives
+    // a VCA peak 6.02dB below vel=1.0 -- exactly linear vel->gain, since
+    // 20*log10(0.5) == -6.02dB -- and lowers the filter corner by one
+    // octave. At 0%: velocity has NO effect, for either destination. Both
+    // formulas below hit vel==1.0 -> {gain=1.0, octOffset=0.0} EXACTLY,
+    // regardless of the percent setting (1.0 - frac*(1.0-1.0) == 1.0;
+    // 2.0*(1.0-1.0)*frac == 0.0) -- which is what keeps every existing
+    // vel==1.0f test/golden case in this codebase bit-exact (G7 gate
+    // report).
+    const double velToVcaFrac = static_cast<double>(snapshot.velToVcaPercent) * 0.01;
+    v.velVcaGain = 1.0 - velToVcaFrac * (1.0 - static_cast<double>(vel));
+    const double velToFilterFrac = static_cast<double>(snapshot.velToFilterPercent) * 0.01;
+    v.velFilterOct = 2.0 * (static_cast<double>(vel) - 1.0) * velToFilterFrac;
+
+    v.unisonDetuneCents = unisonDetuneCentsVal;
+}
+
+void SynthCore::legatoRetargetVoice(Voice& v, int note, float vel, const ParamSnapshot& snapshot) {
+    // DESIGN.md §10.5 Mono: "legato -- no envelope retrigger while a key is
+    // still held". Deliberately does NOT touch envF/envA/oscillator phase/
+    // state/startedAt, and deliberately does NOT snap glideCurrentSemis --
+    // this is the one path where a real audible glide happens.
+    v.note = note;
+    v.glideTargetSemis = static_cast<double>(note);
+    const double velToVcaFrac = static_cast<double>(snapshot.velToVcaPercent) * 0.01;
+    v.velVcaGain = 1.0 - velToVcaFrac * (1.0 - static_cast<double>(vel));
+    const double velToFilterFrac = static_cast<double>(snapshot.velToFilterPercent) * 0.01;
+    v.velFilterOct = 2.0 * (static_cast<double>(vel) - 1.0) * velToFilterFrac;
+}
+
+void SynthCore::releaseVoiceOrHold(int mainPoolIndex) {
+    Voice& v = mVoices[mainPoolIndex];
+    if (mSustainHeld) {
+        // DESIGN.md §10.3: "Note-off with sustain (CC 64) held moves the
+        // voice to a Held state; it releases when the pedal lifts." The
+        // envelope is deliberately NOT told noteOff() here -- it keeps
+        // sounding exactly as if the key were still down.
+        setVoiceState(mainPoolIndex, nassau_alloc::SlotState::Held);
+    } else {
+        v.envF.noteOff();
+        v.envA.noteOff();
+        setVoiceState(mainPoolIndex, nassau_alloc::SlotState::Released);
+        v.releasedAt = ++mVoiceClock;
+    }
+}
+
+void SynthCore::pushMonoNote(int note, float vel) {
+    if (mMonoStackCount >= kMaxMonoStack) return;  // [voicing] bounded silent drop, R3 (see header comment)
+    mMonoNoteStack[mMonoStackCount] = note;
+    mMonoVelStack[mMonoStackCount] = vel;
+    ++mMonoStackCount;
+}
+
+void SynthCore::popMonoNote(int note) {
+    for (int i = mMonoStackCount - 1; i >= 0; --i) {
+        if (mMonoNoteStack[i] == note) {
+            for (int j = i; j < mMonoStackCount - 1; ++j) {
+                mMonoNoteStack[j] = mMonoNoteStack[j + 1];
+                mMonoVelStack[j] = mMonoVelStack[j + 1];
+            }
+            --mMonoStackCount;
+            return;
+        }
+    }
+}
+
+void SynthCore::handleNoteOn(int note, float vel, const ParamSnapshot& snapshot, double fs) {
+    const VoiceMode mode = static_cast<VoiceMode>(snapshot.voiceMode);
+    const int poly = nassau_alloc::polyphonyVoiceCount(snapshot.polyphony);
+
+    // ---- Mono: DESIGN.md §10.5, always physical voice 0 ----
+    if (mode == VoiceMode::Mono) {
+        const bool wasHeldBefore = (mMonoStackCount > 0);
+        pushMonoNote(note, vel);
+        Voice& v = mVoices[0];
+        if (!wasHeldBefore) {
+            if (v.state != nassau_alloc::SlotState::Idle) stealToFadeSlot(0, fs);
+            hardRetrigger(0, note, vel, snapshot, 0.0, /*freshEnvelope=*/true);
+        } else {
+            legatoRetargetVoice(v, note, vel, snapshot);  // legato: no retrigger, glide continues
+        }
+        return;
+    }
+
+    // ---- Unison: DESIGN.md §10.5, all `poly` voices retrigger together ----
+    if (mode == VoiceMode::Unison) {
+        for (int i = 0; i < poly; ++i) {
+            if (mVoices[i].state != nassau_alloc::SlotState::Idle) stealToFadeSlot(i, fs);
+            const double detune =
+                nassau_alloc::unisonDetuneCentsFor(i, poly, static_cast<double>(snapshot.stereoDetuneCents));
+            hardRetrigger(i, note, vel, snapshot, detune, /*freshEnvelope=*/true);
+        }
+        mUnisonActive = true;
+        mUnisonNote = note;
+        return;
+    }
+
+    // ---- Poly: DESIGN.md §10.3 ----
+    // G7.5: retriggering a note already sounding on this exact pitch reuses
+    // that voice rather than allocating a second.
+    for (int i = 0; i < poly; ++i) {
+        if (mVoices[i].state != nassau_alloc::SlotState::Idle && mVoices[i].note == note) {
+            hardRetrigger(i, note, vel, snapshot, 0.0, /*freshEnvelope=*/false);  // G7.5: in-place, click-free continuity
+            return;
+        }
+    }
+
+    // G7.2: Idle first, then oldest Released, then oldest Playing/Held
+    // (nassau_alloc::chooseVoiceForSteal, synth_alloc.h). `infos` is a
+    // small fixed on-stack array (R3: not an allocation).
+    nassau_alloc::SlotInfo infos[kMaxVoices];
+    for (int i = 0; i < poly; ++i) {
+        infos[i].state = mVoices[i].state;
+        infos[i].startedAt = mVoices[i].startedAt;
+        infos[i].releasedAt = mVoices[i].releasedAt;
+    }
+    const int idx = nassau_alloc::chooseVoiceForSteal(infos, poly);
+    if (idx < 0) return;  // defensive; poly >= 4 always (DESIGN.md §11), never reached
+    if (mVoices[idx].state != nassau_alloc::SlotState::Idle) stealToFadeSlot(idx, fs);
+    hardRetrigger(idx, note, vel, snapshot, 0.0, /*freshEnvelope=*/true);
+}
+
+void SynthCore::handleNoteOff(int note, const ParamSnapshot& snapshot) {
+    const VoiceMode mode = static_cast<VoiceMode>(snapshot.voiceMode);
+
+    if (mode == VoiceMode::Mono) {
+        popMonoNote(note);
+        Voice& v = mVoices[0];
+        if (mMonoStackCount > 0) {
+            // DESIGN.md §10.5 last-note-priority: a key is STILL held (the
+            // stack isn't empty), so this is a legato retarget back to that
+            // older note, not a release.
+            const int fallbackNote = mMonoNoteStack[mMonoStackCount - 1];
+            const float fallbackVel = mMonoVelStack[mMonoStackCount - 1];
+            legatoRetargetVoice(v, fallbackNote, fallbackVel, snapshot);
+        } else if (v.state != nassau_alloc::SlotState::Idle) {
+            releaseVoiceOrHold(0);
+        }
+        return;
+    }
+
+    if (mode == VoiceMode::Unison) {
+        if (mUnisonActive && mUnisonNote == note) {
+            const int poly = nassau_alloc::polyphonyVoiceCount(snapshot.polyphony);
+            for (int i = 0; i < poly; ++i) {
+                if (mVoices[i].state != nassau_alloc::SlotState::Idle) releaseVoiceOrHold(i);
+            }
+            mUnisonActive = false;
+        }
+        return;
+    }
+
+    // ---- Poly ----
+    const int poly = nassau_alloc::polyphonyVoiceCount(snapshot.polyphony);
+    for (int i = 0; i < poly; ++i) {
+        if (mVoices[i].state == nassau_alloc::SlotState::Playing && mVoices[i].note == note) {
+            releaseVoiceOrHold(i);
+            break;  // first match only, matches G7.2's own single-voice-per-note invariant
+        }
+    }
+}
+
+void SynthCore::handleSustain(bool down) {
+    const bool wasDown = mSustainHeld;
+    mSustainHeld = down;
+    if (wasDown && !down) {
+        // DESIGN.md §10.3: "CC 64 off -> all Held voices release together"
+        // (G7.6). Held voices only ever exist in the main pool.
+        for (int i = 0; i < kMaxVoices; ++i) {
+            if (mVoices[i].state == nassau_alloc::SlotState::Held) {
+                mVoices[i].envF.noteOff();
+                mVoices[i].envA.noteOff();
+                setVoiceState(i, nassau_alloc::SlotState::Released);
+                mVoices[i].releasedAt = ++mVoiceClock;
+            }
+        }
+    }
+}
+
+void SynthCore::handleAllNotesOff() {
+    // DESIGN.md §10.3: "CC 123 (all notes off) releases every voice
+    // normally" -- an ordinary envelope Release, unconditionally (a panic/
+    // all-off command bypasses the sustain pedal's Held detour, unlike an
+    // individual NoteOff).
+    for (int i = 0; i < kMaxVoices; ++i) {
+        if (mVoices[i].state != nassau_alloc::SlotState::Idle) {
+            mVoices[i].envF.noteOff();
+            mVoices[i].envA.noteOff();
+            setVoiceState(i, nassau_alloc::SlotState::Released);
+            mVoices[i].releasedAt = ++mVoiceClock;
+        }
+    }
+    mMonoStackCount = 0;
+    mUnisonActive = false;
+}
+
+void SynthCore::handleAllSoundOff(double fs) {
+    // DESIGN.md §10.3/§10.4: "CC 120 (all sound off) routes every voice
+    // through the fade-out slots" -- every currently-sounding voice is
+    // stolen (click-free, DESIGN.md §10.4) and its physical slot freed
+    // immediately, rather than released normally.
+    for (int i = 0; i < kMaxVoices; ++i) {
+        if (mVoices[i].state != nassau_alloc::SlotState::Idle) {
+            stealToFadeSlot(i, fs);
+            // The STOLEN SIGNAL lives on, unaffected, in its own fade slot
+            // (the copy stealToFadeSlot() just made). This main-pool slot's
+            // OWN envF/envA must be reset to Idle here (not merely marked
+            // Idle allocation-wise) -- unlike a normal Release, nothing
+            // ever calls envA.noteOff() for a CC120-freed voice, so without
+            // this its envelope would stay parked in whatever state it was
+            // in (e.g. Sustain) forever, which getDebugActiveVoiceCount()
+            // (DESIGN.md §10.7, driven by envA.isIdle()) would then never
+            // count as silent even though state==Idle already makes this
+            // slot's OWN audio-loop contribution exactly 0 -- found by
+            // G7.7's own CC120 timing measurement (R11).
+            mVoices[i].envF.reset();
+            mVoices[i].envA.reset();
+            setVoiceState(i, nassau_alloc::SlotState::Idle);
+            mVoices[i].note = -1;
+            mVoices[i].vcaGainStart = 0.0;
+            mVoices[i].vcaGainEnd = 0.0;
+        }
+    }
+    mMonoStackCount = 0;
+    mUnisonActive = false;
 }
 
 // ===== G3: the control-rate update point (DESIGN.md §2) =====
@@ -656,8 +991,10 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
     mHpfBypassed = snapshot.hpfCutoffHz <= kHpfCutoffMinHz;
     mHpfNumPoles = (snapshot.hpfSlope == static_cast<int>(HpfSlope::Db24)) ? 4 : 2;
 
-    for (int i = 0; i < kG3Voices; ++i) {
+    int activeCount = 0;  // G7.14/PERF-7: recomputed fresh every control block, see the loop body below
+    for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
         Voice& v = mVoices[i];
+        const bool isMainPool = i < kMaxVoices;
 
         v.envF.aCoeff = snapshot.envFAttackCoeff;
         v.envF.dCoeff = snapshot.envFDecayCoeff;
@@ -671,15 +1008,52 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         v.envA.sustainLevel = snapshot.envASustainLevel;
         v.envA.step();
 
-        if (v.active && v.envA.isIdle()) {
-            v.active = false;
-            --mActiveVoiceCount;
+        // G7: a MAIN-POOL voice's natural release-to-silence transition
+        // (unchanged from G3-G6: ENV-A reaching Idle) retires it from the
+        // allocator's Playing/Held/Released bookkeeping. A FADE SLOT's
+        // envelope reaching Idle mid-fade means nothing to the allocator --
+        // it was never counted in mHeldVoiceCount and is retired purely by
+        // its own sample counter (the audio-rate loop, DESIGN.md §10.4).
+        if (isMainPool && v.state != nassau_alloc::SlotState::Idle && v.envA.isIdle()) {
+            setVoiceState(i, nassau_alloc::SlotState::Idle);
+            v.note = -1;
         }
 
         v.vcaGainStart = v.vcaGainEnd;
-        v.vcaGainEnd = mDebugForceUnityVca ? 1.0 : v.envA.y;  // G3.5: unity-gain reference render
+        // G7.11 (DESIGN.md §11 kVelToVca): velVcaGain==1.0 exactly at
+        // vel==1.0 regardless of the percent setting (hardRetrigger()'s own
+        // comment) -- x*1.0 is a bit-exact IEEE-754 identity, so this does
+        // not perturb any existing vel==1.0f test/golden case.
+        v.vcaGainEnd = mDebugForceUnityVca ? 1.0 : (v.envA.y * v.velVcaGain);  // G3.5: unity-gain reference render
 
-        if (!v.active) continue;  // idle voices don't need pitch/PW recomputed (nor rendered, see process())
+        // G7/DESIGN.md §10.7 [PERF-7]: fold this control block's
+        // accumulated peak into `peakPrevBlock` (the quantity the AC names,
+        // "peak over the PREVIOUS control block") and reset the
+        // accumulator for the block about to render. Done for every slot
+        // (main pool AND fade), even one about to be skipped below, so a
+        // freshly-idled voice's peak reading is never stale.
+        v.peakPrevBlock = v.curBlockPeakAccum;
+        v.curBlockPeakAccum = 0.0;
+
+        if (isMainPool) {
+            // DESIGN.md §10.7's exact predicate: skippable iff ENV-A Idle
+            // AND last block's peak was below -100dBFS.
+            const bool silentSkippable = v.envA.isIdle() && v.peakPrevBlock < kSilentSkipThreshold;
+            if (!silentSkippable) ++activeCount;
+        }
+
+        // Idle voices (main pool) / fully-faded slots (fade pool) don't
+        // need pitch/PW/filter-coefficient recompute (nor rendering, see
+        // process()'s own skip condition, which uses exactly this same
+        // isMainPool ? state==Idle : !fadeActive test).
+        if (isMainPool ? (v.state == nassau_alloc::SlotState::Idle) : !v.fadeActive) continue;
+
+        // DESIGN.md §10.6: advance this voice's glide one control step
+        // toward its target (snapshot.glideStepCoeff==1.0 exactly at
+        // kGlideTime==0, per finishSnapshot()'s own comment -- reaches the
+        // target on the very first step, i.e. "instantaneous (first control
+        // block)", G7.10).
+        v.glideCurrentSemis += snapshot.glideStepCoeff * (v.glideTargetSemis - v.glideCurrentSemis);
 
         v.debugLfoPitchModSemis = lfoPitchModSemis;
 
@@ -694,7 +1068,7 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // of an oscillator "key track" switch (a fixed-pitch drone/FM-
         // operator use case), and no G3 AC exercises it either way. Flagged
         // per R11 as a decision the plan did not cover.
-        const double noteForOsc2 = snapshot.osc2KeyTrack ? static_cast<double>(v.note) : 60.0;
+        const double noteForOsc2 = snapshot.osc2KeyTrack ? v.glideCurrentSemis : 60.0;
 
         // [ref] DESIGN.md §8 [PERF-6]: Poly-Mod, control-rate only.
         // kPmEnvFToOsc2 -- ENV-F to VCO2 pitch, bipolar, +/-24 semitones at
@@ -708,13 +1082,25 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         const double pmPwModPercent =
             (static_cast<double>(snapshot.pmEnvFToPwPercent) * 0.01) * 45.0 * v.envF.y;
 
-        const double osc1Semis = static_cast<double>(v.note) + lfoPitchModSemis +
+        // DESIGN.md §3.2: semitones = note + bend*BendRange + glide +
+        // octave*12 + semi + fine/100 + lfoPitch + pmEnvFToOsc2 (VCO2 only).
+        // `v.glideCurrentSemis` IS the glide-smoothed "note" term (this
+        // struct field's own comment); `mBendSemis` (G7.9) and
+        // `v.unisonDetuneCents/100` (G7.13, Unison only, 0 otherwise) are
+        // APPENDED after the original G3-G6 term order rather than
+        // interleaved, and are EXACTLY 0.0 outside Unison/bend use --
+        // appending an exact +0.0 to a finite sum is a bit-exact IEEE-754
+        // identity, which is what keeps every existing G0-G6 test/golden
+        // case (no bend, no Unison) bit-for-bit unchanged (G7 gate report).
+        const double osc1Semis = v.glideCurrentSemis + lfoPitchModSemis +
                                   octaveOffsetSemis(static_cast<Octave>(snapshot.osc1Octave)) +
-                                  static_cast<double>(snapshot.osc1FineCents) * 0.01;
+                                  static_cast<double>(snapshot.osc1FineCents) * 0.01 +
+                                  mBendSemis + v.unisonDetuneCents * 0.01;
         const double osc2Semis = noteForOsc2 + lfoPitchModSemis + pmOsc2Semis +
                                   octaveOffsetSemis(static_cast<Octave>(snapshot.osc2Octave)) +
                                   static_cast<double>(snapshot.osc2Semi) +
-                                  static_cast<double>(snapshot.osc2FineCents) * 0.01;
+                                  static_cast<double>(snapshot.osc2FineCents) * 0.01 +
+                                  mBendSemis + v.unisonDetuneCents * 0.01;
 
         // [dsp] DESIGN.md §3.2: f = 440 * 2^((semitones-69)/12), phaseInc clamped to 0.49.
         const double f1 = 440.0 * std::exp2((osc1Semis - 69.0) / 12.0);
@@ -744,13 +1130,17 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // [10, 0.45*fs] robustness clamp (tan(pi*fc/fs) diverges at
         // Nyquist, same clamp as the unmodulated lpfFcClamped above).
         const double lpfKeyFollowOct = (static_cast<double>(snapshot.lpfKeyFollowPercent) * 0.01) *
-                                        (static_cast<double>(v.note) - 60.0) / 12.0;
+                                        (v.glideCurrentSemis - 60.0) / 12.0;
         const double lpfEnvOct =
             6.0 * (static_cast<double>(snapshot.lpfEnvAmountPercent) * 0.01) * v.envF.y;
         const double lpfLfoOct =
             2.0 * (static_cast<double>(snapshot.lpfLfoAmountPercent) * 0.01) * mLastLfoValue;
-        const double lpfFcRaw =
-            static_cast<double>(snapshot.lpfCutoffHz) * std::exp2(lpfKeyFollowOct + lpfEnvOct + lpfLfoOct);
+        // G7.11 (DESIGN.md §11 kVelToFilter): velFilterOct==0.0 exactly at
+        // vel==1.0 regardless of the percent setting (hardRetrigger()'s own
+        // comment) -- appended exactly like osc1Semis/osc2Semis's own bend/
+        // unison terms above, for the identical bit-exactness reason.
+        const double lpfFcRaw = static_cast<double>(snapshot.lpfCutoffHz) *
+                                 std::exp2(lpfKeyFollowOct + lpfEnvOct + lpfLfoOct + v.velFilterOct);
         const double lpfFcVoice = std::clamp(lpfFcRaw, 10.0, 0.45 * fs);
         v.debugLpfCutoffHz = lpfFcVoice;  // G5.6 readback
 
@@ -796,7 +1186,7 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // prepGInterp" convention (DESIGN.md §5.1 [PERF-8]).
         if (!mHpfBypassed) {
             const double hpfKeyFollowOct = (static_cast<double>(snapshot.hpfKeyFollowPercent) * 0.01) *
-                                            (static_cast<double>(v.note) - 60.0) / 12.0;
+                                            (v.glideCurrentSemis - 60.0) / 12.0;
             const double hpfFcRaw = static_cast<double>(snapshot.hpfCutoffHz) * std::exp2(hpfKeyFollowOct);
             const double hpfFcVoice = std::clamp(hpfFcRaw, 10.0, 0.45 * fs);
             v.debugHpfCutoffHz = hpfFcVoice;  // G6.5 readback
@@ -809,6 +1199,7 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
             v.debugHpfCutoffHz = 0.0;  // G6.5: 0 while bypassed, matches this class's convention
         }
     }
+    mDebugActiveVoiceCount = activeCount;  // G7.14/PERF-7 readback, see getDebugActiveVoiceCount()
 }
 
 double SynthCore::octaveOffsetSemis(Octave o) {

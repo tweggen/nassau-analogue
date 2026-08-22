@@ -5,7 +5,7 @@
 #include <cstdint>
 
 // G3 (docs/GATES.md): SynthCore now wires a real (minimal, provisional --
-// see the kG3Voices comment below) voice section together from the
+// see the kMaxVoices comment below) voice section together from the
 // primitives G1/G2 already proved: synth_dsp.h's AdsrEnv/Lfo and
 // synth_osc.h's Osc/SubOsc/NoiseSource/MixerBlock. Both are R2-legal,
 // dependency-free siblings within Source/DSP/ (no SDK/IPlug2 dependency,
@@ -13,6 +13,7 @@
 #include "synth_dsp.h"
 #include "synth_osc.h"
 #include "synth_filter.h"
+#include "synth_alloc.h"
 
 // G5 (docs/GATES.md): the LPF is now GENUINELY WIRED into the per-voice
 // audio path (mixer -> DC block -> LPF -> VCA, DESIGN.md §1) -- G4 built and
@@ -30,6 +31,31 @@
 // run simultaneously and are cross-faded (DESIGN.md §5.1, docs/GATES.md
 // G5.4) -- which is why every voice owns both structures unconditionally
 // rather than only the currently-selected one.
+
+// G7 (docs/GATES.md): the provisional "kG3Voices=8, reuse-same-note-else-
+// first-idle-else-slot-0" array G3 built as a placeholder (its own comment
+// named G7 as the gate that would replace it) is now the REAL allocator of
+// DESIGN.md §10.3-§10.7: kMaxVoices=16 fixed physical voices plus 2 dedicated
+// fade-out slots (kNumFadeSlots), Idle/oldest-Released/oldest-Playing
+// allocation order (Source/DSP/synth_alloc.h's nassau_alloc::
+// chooseVoiceForSteal, kept deliberately framework-free and decoupled from
+// this file's heavy per-voice DSP state so it is unit-testable with no
+// SynthCore at all), click-free 2ms-fade stealing, sustain pedal (CC64)
+// Held state, CC120/123, pitch bend, glide, velocity->VCA/filter, and the
+// three voice modes (Poly/Unison/Mono legato). `mVoices` is now sized
+// kMaxVoices+kNumFadeSlots: indices [0,kMaxVoices) are the physical voice
+// pool every getDebugVoice*(int) accessor addresses (unchanged shape from
+// G3-G6's own use of indices 0-7, which remain valid physical slots),
+// indices [kMaxVoices, kMaxVoices+kNumFadeSlots) are the two fade slots,
+// addressed only internally (never by index from outside) and observed
+// externally only via getDebugFadeSlotActive(). Both pools share the SAME
+// Voice struct and the SAME per-voice control-rate/audio-rate processing
+// code (a fade slot is literally a moved COPY of a stolen voice, still
+// running its full DSP chain, DESIGN.md §10.4) -- the two differ only in
+// how they enter/leave "active": a physical voice's state machine
+// (nassau_alloc::SlotState) is driven by NoteEvents via applyEvent(); a
+// fade slot's `fadeActive`/`fadeGainCur` are driven purely by its own
+// 2ms sample counter, decoupled from any NoteEvent once started.
 
 /**
  * NoteEvent — the framework-free MIDI-event wire format SynthCore::process()
@@ -396,22 +422,21 @@ public:
     /// value per voice, not one per chain" pattern DESIGN.md/docs/GATES.md
     /// already uses for the analogous G8.5 shared-modulation AC.
     double getDebugVoiceLfoPitchModSemis(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugLfoPitchModSemis;
     }
 
     /// G3.10 (and generally useful for driving deterministic multi-voice
-    /// tests): true iff voice slot `voiceIndex` currently has a sounding
-    /// note (Attack/Decay/Sustain/Release, not Idle).
+    /// tests): true iff physical voice slot `voiceIndex` (0..kMaxVoices-1)
+    /// currently has a sounding note -- Playing, Held or Released (any
+    /// nassau_alloc::SlotState other than Idle), matching this accessor's
+    /// original G3 meaning exactly (that gate's single `active` bool has
+    /// become G7's 4-state nassau_alloc::SlotState, but "not Idle" is the
+    /// same predicate either way).
     bool getDebugVoiceActive(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return false;
-        return mVoices[voiceIndex].active;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return false;
+        return mVoices[voiceIndex].state != nassau_alloc::SlotState::Idle;
     }
-
-    /// Number of voice slots this GATE's minimal, provisional multi-voice
-    /// path provides (see kG3Voices's own comment below) -- NOT DESIGN.md
-    /// §10.3's kMaxVoices=16 (+2 fade slots), which is G7's job.
-    static int getDebugNumVoiceSlotsG3() { return kG3Voices; }
 
     /// G3.6: ENV-F has no audible destination until G4/G5 (it does not drive
     /// the filter yet), so its own zipper-freedom cannot be measured from
@@ -422,11 +447,11 @@ public:
     /// to read it. Also anticipates G8.5's "getDebugEnvF()/getDebugEnvA()
     /// per voice" pattern.
     double getDebugEnvFValue(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].envF.y;
     }
     double getDebugEnvAValue(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].envA.y;
     }
 
@@ -452,7 +477,7 @@ public:
     /// getDebugVoiceLfoPitchModSemis's own "0 for a slot that is not active"
     /// convention).
     double getDebugVoiceLpfCutoff(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugLpfCutoffHz;
     }
 
@@ -462,7 +487,7 @@ public:
     /// block, pre-drive) for the most recently processed sample -- see
     /// Voice::debugMixOut's own comment.
     double getDebugVoiceMixOut(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugMixOut;
     }
     /// G6.4: voice slot `voiceIndex`'s DRIVE-stage output for the most
@@ -470,22 +495,70 @@ public:
     /// 0.0 for an inactive slot (matches this class's established
     /// "0 for a slot that is not active" convention).
     double getDebugVoiceDriveOut(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugDriveOut;
     }
     /// G6.4: voice slot `voiceIndex`'s HPF-stage output for the most
     /// recently processed sample -- see Voice::debugHpfOut's own comment.
     double getDebugVoiceHpfOut(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugHpfOut;
     }
     /// G6.5: voice slot `voiceIndex`'s actual modulated+clamped HPF cutoff
     /// (Hz) -- see Voice::debugHpfCutoffHz's own comment. 0.0 while
     /// bypassed or inactive.
     double getDebugVoiceHpfCutoff(int voiceIndex) const {
-        if (voiceIndex < 0 || voiceIndex >= kG3Voices) return 0.0;
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return 0.0;
         return mVoices[voiceIndex].debugHpfCutoffHz;
     }
+
+    // ===== Test-only debug accessors (G7, docs/GATES.md) =====
+
+    /// DESIGN.md §10.3's real allocator's fixed physical-voice-pool size
+    /// (16), constructed once in init(), never resized (R3). Public so
+    /// Tests/ can size its own scratch arrays against the real number
+    /// instead of a magic literal.
+    static constexpr int kMaxVoices = 16;
+    /// DESIGN.md §10.4: exactly two dedicated fade-out slots.
+    static constexpr int kNumFadeSlots = 2;
+
+    /// G7.2: physical voice slot `voiceIndex`'s (0..kMaxVoices-1) current
+    /// nassau_alloc::SlotState, as a plain int (0=Idle, 1=Playing, 2=Held,
+    /// 3=Released) so a G7.2 allocation-order test can assert exactly which
+    /// index chooseVoiceForSteal() picked for each of the three
+    /// Idle/Released/Playing scenarios the AC asks be constructed
+    /// explicitly, by reading back the resulting state at specific indices.
+    int getDebugVoiceState(int voiceIndex) const {
+        if (voiceIndex < 0 || voiceIndex >= kMaxVoices) return static_cast<int>(nassau_alloc::SlotState::Idle);
+        return static_cast<int>(mVoices[voiceIndex].state);
+    }
+
+    /// G7.3/G7.4: number of the two fade-out slots (DESIGN.md §10.4)
+    /// currently mid-fade (0, 1 or 2) -- proves the STEALING MECHANISM
+    /// itself, not merely the absence of a click, per this gate's own
+    /// "assert the mechanism" instruction.
+    int getDebugFadeSlotActive() const {
+        int n = 0;
+        for (int i = kMaxVoices; i < kMaxVoices + kNumFadeSlots; ++i) {
+            if (mVoices[i].fadeActive) ++n;
+        }
+        return n;
+    }
+
+    /// G7.14/DESIGN.md §10.7 [PERF-7]: count of physical voices NOT yet
+    /// eligible for the silent-voice skip -- i.e. NOT (ENV-A Idle AND this
+    /// voice's stored peak over the previous control block was below
+    /// -100dBFS), recomputed once per control block in controlRateUpdate().
+    /// This is exactly the DESIGN.md §10.7 predicate, not merely the old G3
+    /// "active" bool: because the VCA sits AFTER the filter in this design's
+    /// signal chain (DESIGN.md §1), ENV-A reaching Idle already pins every
+    /// subsequent sample's contribution at exactly 0.0 regardless of any
+    /// filter ring-out, so in practice the two conditions coincide within
+    /// one control block of each other here -- but the peak term is still
+    /// computed and gated for real (not a no-op stand-in), matching DESIGN's
+    /// literal two-part predicate and giving G11 a genuine per-voice peak
+    /// signal to build real CPU savings on top of.
+    int getDebugActiveVoiceCount() const { return mDebugActiveVoiceCount; }
 
 private:
     // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
@@ -586,6 +659,16 @@ private:
         double drivePre = 1.0;            ///< [dsp] DESIGN.md §4: 1 + 2*(Drive/100); ==1.0 EXACTLY at Drive=0
         double driveKnee = 0.0;           ///< [dsp] DESIGN.md §4: 3*(Drive/100)^1.5; ==0.0 EXACTLY at Drive=0
         double masterVolumeLinear = 1.0;  ///< [dsp] DESIGN.md §11: 10^(masterVolumeDb/20)
+
+        // ---- G7: derived, BLOCK-RATE constant (DESIGN.md §2.2/§10.6) ----
+        // kGlideTime is a single instrument-wide param (not per-voice), so
+        // its one-pole step coefficient belongs here alongside the ADSR
+        // coefficients above -- DESIGN.md §10.6 directs reusing "the same
+        // convention as the envelope decay (§6)", so this IS
+        // AdsrEnv::coeffForMs(glideTimeMs, AdsrEnv::decayDivisor(), ...),
+        // not a separately re-derived formula (finishSnapshot(), block-rate
+        // only, R12 -- involves std::exp via coeffForMs).
+        double glideStepCoeff = 0.0;
     };
 
     /// Loads every one of the 53 atomics exactly once (relaxed ordering — a
@@ -693,30 +776,127 @@ private:
         /// does not apply" convention throughout.
         double debugHpfCutoffHz = 0.0;
 
-        bool active = false;   ///< sounding (Attack/Decay/Sustain/Release), not Idle
         int note = -1;
         double vcaGainStart = 0.0;   ///< interpolation endpoints for THIS control block
         double vcaGainEnd = 0.0;     ///< (DESIGN.md §2: vcaGain is one of the 3 interpolated scalars)
         double debugLfoPitchModSemis = 0.0;  ///< test-only readback, G3.10
+
+        // ===== G7: allocation state (DESIGN.md §10.3-§10.6) =====
+        // `state` replaces G3's plain `active` bool: nassau_alloc::SlotState
+        // (synth_alloc.h) is the 4-way Idle/Playing/Held/Released lifecycle
+        // DESIGN.md §10.3 actually specifies. Idle here means EXACTLY what
+        // the old `!active` meant (ENV-A has reached AdsrEnv::State::Idle --
+        // see controlRateUpdate()), so every G3-G6 accessor/AC that read
+        // `active` continues to read the equivalent `state != Idle`
+        // predicate unchanged (getDebugVoiceActive()'s own comment).
+        nassau_alloc::SlotState state = nassau_alloc::SlotState::Idle;
+        uint32_t startedAt = 0;   ///< set at note-on; oldest-Playing tie-break (synth_alloc.h)
+        uint32_t releasedAt = 0;  ///< set at note-off; oldest-Released tie-break (synth_alloc.h)
+
+        /// DESIGN.md §10.6: exponential one-pole toward the target pitch, in
+        /// semitones, at control rate -- `glideCurrentSemis` IS this voice's
+        /// smoothed "note" term (DESIGN.md §3.2's pitch formula uses this in
+        /// place of the bare integer note number; the two are bit-identical
+        /// whenever glide has fully converged or kGlideTime==0, which is
+        /// every existing G0-G6 AC's own scenario -- see the G7 gate report
+        /// for the bit-exactness argument this depends on). Snapped equal to
+        /// `glideTargetSemis` on any FRESH voice take-over (a new physical
+        /// strike -- DESIGN.md §3.2's phase-reset note-on, Poly/Unison), left
+        /// alone (so it keeps gliding) on a Mono-legato retarget.
+        double glideCurrentSemis = 0.0;
+        double glideTargetSemis = 0.0;
+
+        /// DESIGN.md §11 kVelToVca/kVelToFilter, captured once per note-on
+        /// (or per Mono-legato retarget) from that NoteEvent's own velocity
+        /// -- see SynthCore::hardRetrigger()/legatoRetargetVoice()'s own
+        /// comments for the two anchor points (100%: linear vel->gain /
+        /// -1 octave-per-half-velocity; 0%: velocity has no effect either
+        /// way) these formulas are built to hit exactly.
+        double velVcaGain = 1.0;
+        double velFilterOct = 0.0;
+
+        /// DESIGN.md §10.5 Unison: this voice's fixed fine-detune offset
+        /// (cents), added into BOTH oscillators' pitch (not just one) so the
+        /// whole voice card is detuned, not one VCO within it. 0 outside
+        /// Unison mode (nassau_alloc::unisonDetuneCentsFor() with groupSize
+        /// <= 1, or simply never written).
+        double unisonDetuneCents = 0.0;
+
+        // ===== G7: fade-out slot state (DESIGN.md §10.4) =====
+        // Meaningful ONLY for the two physical slots at index
+        // [kMaxVoices, kMaxVoices+kNumFadeSlots) -- a main-pool voice's
+        // `fadeActive` is always false and `fadeGainCur` always exactly
+        // 1.0, which is why the audio-rate loop can multiply EVERY voice's
+        // output by `fadeGainCur` unconditionally (mixSum += ... *
+        // fadeGainCur) with zero cost to main-pool voices: x*1.0 is a
+        // bit-exact IEEE-754 identity, so this extra multiply does not
+        // perturb GoldenParityG5 (G7 gate report).
+        bool fadeActive = false;
+        int fadeSamplesTotal = 0;
+        int fadeSamplesElapsed = 0;
+        double fadeGainCur = 1.0;
+        double fadeGainStep = 0.0;
+
+        // ===== G7: silent-voice skip bookkeeping (DESIGN.md §10.7 [PERF-7]) ===
+        // `curBlockPeakAccum` is the running max |contribution| over the
+        // control block IN PROGRESS, updated every audio-rate sample (plain
+        // std::max/fabs, no transcendental, R12-legal); at each control-rate
+        // boundary controlRateUpdate() copies it into `peakPrevBlock` (the
+        // quantity DESIGN.md §10.7 actually names, "peak over the previous
+        // control block") and resets the accumulator for the next block.
+        double curBlockPeakAccum = 0.0;
+        double peakPrevBlock = 0.0;
     };
 
-    /// Minimal, PROVISIONAL voice count for this gate only. DESIGN.md §10.3's
-    /// real allocator (kMaxVoices=16 + 2 fade-out slots, Idle/oldest-Released/
-    /// oldest-Playing allocation order, click-free stealing, sustain pedal,
-    /// unison/mono voice modes, kPolyphony honoured) is G7's job (docs/
-    /// GATES.md), not G3's -- G3's job is ENV-F/ENV-A/LFO/control-rate wiring.
-    /// 8 fixed slots with a trivial "reuse same note, else first idle, else
-    /// slot 0" policy is enough to prove ENV-A genuinely drives the VCA and
-    /// that the LFO is genuinely global/shared (G3.10) without building G7's
-    /// machinery early (scope discipline, docs/GATES.md's own "G3 only" note
-    /// for this gate). [voicing] chosen only as "comfortably more than the
-    /// 1-2 voices any G3 AC exercises simultaneously".
-    static constexpr int kG3Voices = 8;
-    Voice mVoices[kG3Voices];
-    int mActiveVoiceCount = 0;   ///< DESIGN.md §7: LFO delay retriggers only on 0->1 of this
+    /// DESIGN.md §10.3: the real allocator's pool is kMaxVoices=16 fixed
+    /// physical voices (public constexpr, see this class's public section)
+    /// plus kNumFadeSlots=2 dedicated fade-out slots (DESIGN.md §10.4) --
+    /// ALL constructed here, in this fixed-size member array, never resized
+    /// or allocated in process() (R3). Indices [0,kMaxVoices) are the
+    /// physical pool every getDebugVoice*(int)/applyEvent() addresses by
+    /// index; indices [kMaxVoices, kMaxVoices+kNumFadeSlots) are the two
+    /// fade slots, entered only via stealToFadeSlot() (a plain struct copy,
+    /// not an allocation) and left only by their own 2ms sample counter.
+    Voice mVoices[kMaxVoices + kNumFadeSlots];
+    int mHeldVoiceCount = 0;   ///< DESIGN.md §7: LFO delay retriggers only on 0->1 of this
     Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
                                   ///< control block, read by every voice -- never per-voice.
     double mLastLfoValue = 0.0;  ///< test-only readback of the most recent mLfo.step() result (G3.10)
+
+    // ===== G7: allocation bookkeeping (DESIGN.md §10.3-§10.6) =====
+    uint32_t mVoiceClock = 0;   ///< monotonic counter, ++'d on every note-on/note-off; feeds
+                                 ///< Voice::startedAt/releasedAt for chooseVoiceForSteal()'s
+                                 ///< oldest-first tie-breaks (synth_alloc.h).
+    int mNextFadeSlot = 0;      ///< 0/1 round-robin (DESIGN.md §10.4: "the oldest fade slot is
+                                 ///< simply overwritten" -- alternating guarantees exactly that
+                                 ///< with only 2 slots).
+    bool mSustainHeld = false;  ///< CC64 (DESIGN.md §10.3).
+    double mBendSemis = 0.0;    ///< DESIGN.md §3.2/§10: current pitch-bend offset, applied to
+                                 ///< EVERY sounding voice every control block (G7.9), not just
+                                 ///< new ones -- set by a PitchBend NoteEvent, DESIGN.md §10.1.
+
+    /// DESIGN.md §10.5 Mono: last-note-priority held-note stack. Index
+    /// [count-1] is the currently-sounding (topmost/most-recent) note.
+    /// Fixed-size (R3) -- see pushMonoNote()'s own comment for the bound.
+    static constexpr int kMaxMonoStack = 32;  // [voicing] generous fixed bound, no realistic
+                                               // performance holds this many keys at once
+    int mMonoNoteStack[kMaxMonoStack] = {};
+    float mMonoVelStack[kMaxMonoStack] = {};
+    int mMonoStackCount = 0;
+
+    /// DESIGN.md §10.5 Unison: which note the fixed [0,poly) voice group is
+    /// currently all playing, so a NoteOff can tell "this releases the
+    /// group" from "this is a stray/mismatched note-off" apart. `false`
+    /// once released.
+    bool mUnisonActive = false;
+    int mUnisonNote = -1;
+
+    /// G7.14/DESIGN.md §10.7 [PERF-7]: count of physical voices not yet
+    /// silent-skippable, recomputed once per control block -- see
+    /// getDebugActiveVoiceCount()'s own (public) comment for the exact
+    /// predicate.
+    int mDebugActiveVoiceCount = 0;
+    static constexpr double kSilentSkipThreshold = 1e-5;  // [ref] DESIGN.md §10.7: -100dBFS == 10^(-100/20)
 
     /// G6 (DESIGN.md §1/§11 "Output stage", §5.6's same rationale one stage
     /// further downstream): a THIRD 5 Hz one-pole DC blocker, on the FINAL
@@ -807,12 +987,74 @@ private:
 
     static constexpr uint32_t kLfoShSeed = 0x5EED1234u;  // [voicing] fixed S&H seed, R8/R13
 
-    /// Applies a single note-scoped event to the voice array / mLfo (NoteOn/
-    /// NoteOff/AllNotesOff/AllSoundOff). PitchBend/Sustain are no-ops at G3
-    /// (G7's job, DESIGN.md §10.3/§10.6/§7.6) -- accepted (not touched) so
-    /// they do not crash, matching G0.8's existing "every event type, no
-    /// crash" coverage.
-    void applyEvent(const NoteEvent& ev);
+    /// Applies a single note-scoped event to the voice pool / mLfo (NoteOn/
+    /// NoteOff/PitchBend/Sustain/AllNotesOff/AllSoundOff -- G7 wires all six,
+    /// DESIGN.md §10.3/§10.6/§7.6). `snapshot` supplies the instrument-wide,
+    /// non-per-voice terms an event needs (kPolyphony, kVoiceMode,
+    /// kBendRange, kVelToVca/Filter, kStereoDetune for Unison's spread);
+    /// `fs` is process()'s own already-read-once sample rate (DESIGN.md §2.2
+    /// -- passed in rather than re-loading the mSampleRate atomic here, so
+    /// this stays a single read per host block).
+    void applyEvent(const NoteEvent& ev, const ParamSnapshot& snapshot, double fs);
+
+    void handleNoteOn(int note, float vel, const ParamSnapshot& snapshot, double fs);
+    void handleNoteOff(int note, const ParamSnapshot& snapshot);
+    void handleSustain(bool down);
+    void handleAllNotesOff();
+    void handleAllSoundOff(double fs);
+
+    /// Moves `mainPoolIndex`'s CURRENT occupant, unchanged, into the
+    /// oldest-used of the two fade slots (DESIGN.md §10.4) and starts its
+    /// 2ms linear fade -- a plain struct copy (Voice is POD-shaped: no
+    /// pointers, no owning resources), never an allocation (R3). The caller
+    /// is responsible for then overwriting `mainPoolIndex` itself (via
+    /// hardRetrigger() or setVoiceState(..., Idle)); this function only
+    /// evicts, it never assigns the freed slot's new content.
+    void stealToFadeSlot(int mainPoolIndex, double fs);
+
+    /// A full, fresh strike of physical voice `mainPoolIndex` for `note`
+    /// (DESIGN.md §3.2: oscillator phase reset to 0; envelope noteOn(); a
+    /// fresh glide-target snap, no portamento from whatever this slot's
+    /// PREVIOUS occupant -- if any -- was playing). Used for every Poly
+    /// allocation (fresh-Idle or post-steal) and for every Unison voice's
+    /// per-note-on retrigger; NOT used for Mono-legato (legatoRetargetVoice
+    /// below) or for Poly's "retrigger a sounding SAME note" reuse path,
+    /// each of which has different envelope/glide semantics of its own.
+    /// Does NOT decide whether to steal first -- the caller does that.
+    void hardRetrigger(int mainPoolIndex, int note, float vel, const ParamSnapshot& snapshot,
+                        double unisonDetuneCentsVal, bool freshEnvelope);
+
+    /// Re-targets an ALREADY-SOUNDING voice at a new note WITHOUT touching
+    /// its envelope or oscillator phase (DESIGN.md §10.5 Mono: "legato --
+    /// no envelope retrigger while a key is still held"). Glide is NOT
+    /// snapped here (the whole point: the pitch actually glides from
+    /// wherever it currently is toward the new target). Velocity terms ARE
+    /// updated (a genuine new NoteEvent's own velocity, or -- on a
+    /// NoteOff-triggered fallback to an older held note -- that older
+    /// note's OWN originally-captured velocity).
+    void legatoRetargetVoice(Voice& v, int note, float vel, const ParamSnapshot& snapshot);
+
+    /// A note-off that is actually silencing physical voice `mainPoolIndex`
+    /// right now (as opposed to Mono's "revert to an older held note"
+    /// non-event): routes to Held if the sustain pedal is currently down
+    /// (DESIGN.md §10.3), else starts the envelope Release and marks
+    /// Released.
+    void releaseVoiceOrHold(int mainPoolIndex);
+
+    /// Transitions physical voice `mainPoolIndex` to `newState`, maintaining
+    /// mHeldVoiceCount (DESIGN.md §7's LFO 0->1 note-on edge) on every
+    /// Idle<->non-Idle boundary crossed. The ONE place that ever writes
+    /// Voice::state, so this invariant cannot be forgotten at a call site.
+    void setVoiceState(int mainPoolIndex, nassau_alloc::SlotState newState);
+
+    /// Removes `note` from the Mono-mode last-note-priority stack (the LAST
+    /// matching occurrence, standard last-note-priority semantics) if
+    /// present; a no-op if `note` is not on the stack (e.g. a stray
+    /// NoteOff). Fixed-size, bounded silent drop past kMaxMonoStack on push
+    /// (R3, mirrors mPendingEvents' own convention) -- not reachable by any
+    /// realistic performance.
+    void pushMonoNote(int note, float vel);
+    void popMonoNote(int note);
 
     /// The DESIGN.md §2 "control-rate update point": steps both envelopes
     /// and the LFO one control step, and recomputes each active voice's

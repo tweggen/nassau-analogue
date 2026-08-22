@@ -332,6 +332,24 @@ inline std::vector<NoteEvent> seqHoldNote(int note, float vel, double onSec, dou
   };
 }
 
+// ---- seqChord (G7, docs/GATES.md "Shared test harness") --------------------
+// A simultaneous chord: NoteOn for every note in `notes` at sample 0 (all
+// the same velocity `vel`, matching seqHoldNote's own single-velocity
+// shape), NoteOff for every note at round(onSec*fs). Framework-free (plain
+// NoteEvent, DESIGN.md §10.1) -- no SynthCore-specific state, same
+// convention as seqHoldNote just above. `offSec` is likewise not baked into
+// an event, only into the caller's own total-render-length arithmetic.
+inline std::vector<NoteEvent> seqChord(const std::vector<int>& notes, float vel, double onSec, double offSec,
+                                        double fs) {
+  (void)offSec;
+  const int offOffset = static_cast<int>(std::lround(onSec * fs));
+  std::vector<NoteEvent> ev;
+  ev.reserve(notes.size() * 2);
+  for (int note : notes) ev.push_back({0, NoteEvent::NoteOn, note, vel});
+  for (int note : notes) ev.push_back({offOffset, NoteEvent::NoteOff, note, 0.0f});
+  return ev;
+}
+
 template <typename ProcessBlockFn>
 inline double minus3dBPoint(ProcessBlockFn&& processBlock, double fs, double refHz, double loHz,
                              double hiHz, int iterations = 40) {

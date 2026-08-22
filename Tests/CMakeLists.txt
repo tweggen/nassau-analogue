@@ -98,3 +98,17 @@ target_include_directories(voice_tests PRIVATE
 target_compile_options(voice_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME VoiceTests COMMAND voice_tests)
+
+# ---- G7: voice allocation, MIDI, polyphony, glide, velocity ---------------
+# Links nassau_synth_core: the standalone-allocator ACs drive Source/DSP/
+# synth_alloc.h's nassau_alloc:: functions directly (header-only, no
+# SynthCore needed for THAT group -- same shape as dsp_tests.cpp/
+# osc_tests.cpp), but every numbered G7 AC drives the real SynthCore
+# per-voice/allocation path (NoteEvent in, rendered audio out).
+add_executable(alloc_tests alloc_tests.cpp)
+target_link_libraries(alloc_tests nassau_synth_core)
+target_include_directories(alloc_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(alloc_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME AllocTests COMMAND alloc_tests)
