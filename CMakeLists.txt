@@ -47,6 +47,28 @@ endif()
 set(NASSAU_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nassau-plugin-sdk"
     CACHE PATH "Nassau plugin SDK root")
 
+# Opt-in single-precision DSP path (DESIGN.md §12.2), OFF by default: the
+# double-precision path stays the shipped default and must remain
+# bit-identical to every gate through G11 (both golden batteries verify at
+# exactly 0.000e+00). Turning this ON redefines `nassau_real`
+# (Source/DSP/synth_dsp.h) from `double` to `float` for filter state, filter
+# coefficients and the DC blockers ONLY -- oscillator phase accumulators and
+# everything else stay `double` unconditionally (G2.8 needs 1e-9, float only
+# carries ~1e-7). Targets weak/ARM machines (half-rate double throughput,
+# 4-wide NEON); the benefit is REASONED, NOT MEASURED on this x86-64 dev box
+# -- see docs/DESIGN.md §12.2 and README.md's build section for the measured
+# x86 number. `add_compile_definitions` (directory-wide, inherited by every
+# add_subdirectory() below, including Tests' header-only binaries that never
+# link nassau_synth_core) is deliberate: every translation unit that sees
+# synth_dsp.h must agree on `nassau_real`'s width, or ODR-violating disagreement
+# between TUs becomes possible.
+option(NASSAU_DSP_FLOAT
+    "Use single-precision (float) for DSP filter state/coefficients and DC blockers -- opt-in, weak/ARM targets, default OFF (DESIGN.md §12.2)"
+    OFF)
+if(NASSAU_DSP_FLOAT)
+    add_compile_definitions(NASSAU_DSP_FLOAT)
+endif()
+
 # DSP core (always builds — no framework dependencies, R2/R14).
 add_subdirectory(Source/DSP)
 

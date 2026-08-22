@@ -809,9 +809,14 @@ private:
             // `g` before/after calling setControlRate(). Both structures carry
             // their own independent interpolation state because either can be
             // live in a given control block (the currently-selected slope, or
-            // both during a crossfade).
-            double gLpfLadderCur = 0.0, gLpfLadderStep = 0.0;
-            double gLpfSvfCur = 0.0, gLpfSvfStep = 0.0;
+            // both during a crossfade). `nassau_real` (DESIGN.md §12.2): this
+            // IS the per-sample-interpolated filter coefficient the
+            // weak-machine path targets, so it carries the same type as the
+            // structure's own `g` it feeds, not `double` narrowed at the
+            // advanceCoeff() call boundary (which would waste the interpolation
+            // add itself at full width for nothing).
+            nassau_real gLpfLadderCur = 0.0, gLpfLadderStep = 0.0;
+            nassau_real gLpfSvfCur = 0.0, gLpfSvfStep = 0.0;
 
             // ===== G6: per-chain HPF state (DESIGN.md §5.5) =====
             // ONE structure per chain (unlike the LPF's two: the HPF has no
@@ -826,7 +831,7 @@ private:
             // note terms), so both chains' `g` end up bit-identical whenever fed
             // the same Hz value -- which SynthCore::controlRateUpdate() does.
             HpfCascade hpf;
-            double gHpfCur = 0.0, gHpfStep = 0.0;
+            nassau_real gHpfCur = 0.0, gHpfStep = 0.0;  // [dsp] nassau_real, same reasoning as gLpf*Cur/Step above
 
             /// G6.4 test-only readback: this CHAIN's DRIVE-stage output (post
             /// mixer DC block, post shapeTriodeK, pre-HPF) and HPF-stage output

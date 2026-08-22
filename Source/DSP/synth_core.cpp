@@ -1446,11 +1446,18 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // it by this step afterward. `lpfFcVoice`/`lpfResonancePercent` are
         // the SAME (voice-level, not chain-level) values for every chain
         // this lambda is called with, matching G8.5.
-        auto prepGInterp = [&](auto& filter, double& gCur, double& gStep) {
-            const double gStart = filter.g;
+        // `gCur`/`gStep` are `nassau_real` (DESIGN.md §12.2), matching
+        // Voice::Chain::gLpfLadderCur/Step's own field comment: `gStart`/the
+        // subtraction/division below stay `double` (this whole lambda runs
+        // once per control block, not per sample -- R12 does not gate it),
+        // narrowed once into `gStep`/`gCur` on store, same convention as
+        // LadderFilter::setControlRate() itself.
+        auto prepGInterp = [&](auto& filter, nassau_real& gCur, nassau_real& gStep) {
+            const double gStart = static_cast<double>(filter.g);
             filter.setControlRate(lpfFcVoice, fs, lpfResonancePercent);
-            gStep = (filter.g - gStart) / static_cast<double>(std::max(1, mControlBlock));
-            gCur = gStart;
+            gStep = static_cast<nassau_real>(
+                (static_cast<double>(filter.g) - gStart) / static_cast<double>(std::max(1, mControlBlock)));
+            gCur = static_cast<nassau_real>(gStart);
         };
 
         // G8 (DESIGN.md §9): the per-CHAIN loop -- everything that genuinely
@@ -1559,10 +1566,12 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
             // [PERF-8]). `hpfFcVoice` is the SAME (voice-level) value for
             // every chain (G8.5).
             if (!mHpfBypassed) {
-                const double gHpfStart = ch.hpf.g;
+                // nassau_real (DESIGN.md §12.2), same prepGInterp convention above.
+                const double gHpfStart = static_cast<double>(ch.hpf.g);
                 ch.hpf.setControlRate(hpfFcVoice, fs);
-                ch.gHpfStep = (ch.hpf.g - gHpfStart) / static_cast<double>(std::max(1, mControlBlock));
-                ch.gHpfCur = gHpfStart;
+                ch.gHpfStep = static_cast<nassau_real>(
+                    (static_cast<double>(ch.hpf.g) - gHpfStart) / static_cast<double>(std::max(1, mControlBlock)));
+                ch.gHpfCur = static_cast<nassau_real>(gHpfStart);
             }
         }
     }

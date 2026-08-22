@@ -1060,6 +1060,237 @@ worth more to the next person than silence.
 **No `-ffast-math` and no `-march=native`, ever** (R7). The ZDF solve and every
 IIR recursion in §5 are unsafe under fast-math.
 
+### 12.2 Opt-in single-precision DSP path (weak-machine build)
+
+> **VERDICT AFTER MEASUREMENT: do not enable this on x86-64.** Independently
+> re-measured on this box, whole instrument, alone, best of 7:
+>
+> | config | double | float | |
+> |---|---|---|---|
+> | 8 voices mono | **478.3 ns · 43.6×** | **513.0 ns · 40.6×** | **7.3 % SLOWER** |
+> | idle | 19.0 ns | 24.5 ns | 29 % slower |
+> | 16 voices unison | 946.6 ns | 991.1 ns | 4.7 % slower |
+>
+> x86-64 runs doubles at full rate, so there is no throughput to win, while
+> every filter call pays a `double`↔`nassau_real` boundary conversion the
+> default build does not. The prior §12.1 entry said "1.03×, no gain" from an
+> isolated prototype; the whole instrument is worse than that — an actual
+> regression.
+>
+> **And the accuracy cost is real**: the golden battery differs from the double
+> build by **−76.6 dBFS** (G11) and **−78.6 dBFS** (G5). Both are *worse* than
+> the −80 dBFS line normally treated as inaudible. Small, but it is a cost, and
+> it is not hidden here.
+>
+> The flag is kept because the ARM case it was built for is genuinely different
+> — half-rate doubles and 4-wide NEON instead of 2-wide — and because it is the
+> groundwork any future NEON kernel needs. **That benefit is reasoned and
+> entirely unmeasured: no ARM hardware was available.** Run
+> `Tests/synth_bench.cpp` on the target before trusting it. On any x86 host,
+> including the Windows build, leave it OFF.
+
+
+**This deviates from this document's own stated non-negotiable** (inherited
+from `nassau-eq`, quoted verbatim at the top of `synth_dsp.h`): *"Coefficient
+math and filter state will use double; public I/O stays float."* §12.1's own
+rejection table already logged why: `float` measured only **1.03×** in an
+isolated scalar prototype on this x86-64 dev box, so it was rejected for the
+default build -- but flagged "still open for a weak-machine build" specifically
+because many ARM cores run double-precision at HALF the throughput of single
+and offer 4-wide NEON where x86-64's SSE2 baseline is only 2-wide for doubles.
+That is the actual motivation for this section: **it is an opt-in build flag
+for weak (typically ARM) machines, not a conversion** -- the default build
+stays `double` throughout and remains bit-identical to every gate through G11.
+
+**Mechanism.** `Source/DSP/synth_dsp.h` defines:
+
+```cpp
+#if defined(NASSAU_DSP_FLOAT)
+using nassau_real = float;
+#else
+using nassau_real = double;
+#endif
+```
+
+`-DNASSAU_DSP_FLOAT=ON` (a CMake `option()`, OFF by default, root
+`CMakeLists.txt`) redefines `nassau_real` to `float` for exactly three things,
+matching the measured cost table at the top of §12 -- filter state, filter
+coefficients, and the DC blockers:
+
+* `OnePoleHP` (`synth_dsp.h`) -- the mixer/post-LPF/output DC blockers.
+* `TptOnePole` (`synth_dsp.h`) -- the shared per-pole primitive backing every
+  filter structure below.
+* `LadderFilter`, `SvfFilter`, `HpfCascade` (`synth_filter.h`) -- their own
+  coefficient members (`g`/`G`/`G2`/`G3`/`G4`/`k`/`invDenom`/`A`/`B`/`twoG` on
+  the ladder; `g`/`Reff`/`d`/`twoReffPlusG` on the SVF; `g` on the HPF
+  cascade) and, for the SVF, its integrator/peak-tracking state (`ic1`, `ic2`,
+  `peakBpPrev`, `peakBpAccum`).
+* `Voice::Chain`'s own per-sample interpolation state (`gLpfLadderCur/Step`,
+  `gLpfSvfCur/Step`, `gHpfCur/Step`, `synth_core.h`) -- these ARE the
+  per-sample-interpolated filter coefficient DESIGN.md §2 names, so they carry
+  the same `nassau_real` width as the structure they feed, not `double`
+  narrowed only at the call boundary (which would leave the interpolation
+  add itself at full width for nothing).
+
+**What stays `double` unconditionally, and why.** Oscillator phase
+accumulators (`Osc::phase`, `SubOsc`'s derived phase) are excluded ON
+PRINCIPLE, not merely because nothing measured badly: G2.8 asserts the
+sub-oscillator's period ratio is exact to **1e-9**, and `float` carries only
+~1e-7 relative precision, so a float phase fails that AC outright regardless
+of tuning. Phase accumulation is also a negligible share of the cost (~2
+ns/sample against a 56 ns voice, §12's own table), so there is nothing to
+win there. `SmoothedValue`, `AdsrEnv`, `Lfo`, `Xorshift32`, `PinkFilter` and
+every oscillator/noise primitive in `synth_osc.h` also stay `double`
+unconditionally: none of them is the measured cost centre, and each is a
+plausible future precision-sensitive corner (envelope timing, LFO phase, the
+noise-flatness ACs) not worth the R11 risk of touching for no measured gain.
+`shapeTriodeK`/`shapeCubic` (the saturators, shared with the drive/output
+stages) also stay `double` -- `LadderFilter::process()` widens its one
+`nassau_real` value into that call and narrows the result straight back, a
+single, deliberate crossing at each end, not a conversion of the shaper
+itself.
+
+**Two-tier arithmetic width inside the filters.** `setControlRate()` (called
+once per CONTROL BLOCK, 32 samples) keeps its own internal arithmetic in
+`double` and narrows only once, on final store into each `nassau_real`
+member -- maximum coefficient precision at negligible cost, since this runs
+768× less often than the audio-rate loop at the default `kControlBlock`.
+`advanceCoeff()` (called once per SAMPLE, implementing §2's `gLpf`/`gHpf`
+per-sample interpolation) does its arithmetic ENTIRELY in `nassau_real` --
+this is the actual audio-rate cost the weak-machine path exists to reduce, so
+computing it in `double` and narrowing only the result would buy a weak
+machine nothing.
+
+**Correctness in the float build (measured, this box, both `ctest`
+configurations green, 12/12 binaries, zero `-Wall -Wextra -Wpedantic`
+warnings in either):**
+
+| AC | quantity measured | float-build result |
+|---|---|---|
+| G4.4 self-oscillation, ladder | peak amplitude at res=100% | **0.590** (design estimate ≈0.59) |
+| G4.4 self-oscillation, SVF | peak amplitude at res=100% | **0.500** (design estimate ≈0.50) |
+| G4.4 drift, ladder / SVF | level drift 5s→10s | **-0.0057 dB / 0.0 dB** (bound < 0.5 dB) |
+| G4.7 excited decay | worst corner settles below -80 dBFS | 442 ms (48 {fc,res,slope,fs} corners) |
+| G4.8 finite/bounded | worst \|y\| across the res=100 grid | 2.49 (bound < 8.0) |
+| G2.15 finite-everywhere | worst \|y\| across 1440 osc/sub/noise combos | 7.86 (bound < 8.0) |
+| G6.17 finite, full voice | 4096 randomised param-corner configs | all finite, \|y\| < 8.0 |
+| G2.1 / G2.2 tuning | measured Hz vs the tuning-table reference | unaffected -- oscillator pitch never touches `nassau_real` |
+| G3.12 DC | mean of the last 4096 samples, every waveform / PW corner | unaffected -- still < 1e-4 |
+
+Every stability, tuning and DC acceptance criterion **still holds in the
+float build**, with comfortable margin -- including G4.4, the case flagged in
+advance as the one most likely to break (*"a resonant ZDF ladder near
+self-oscillation is exactly where reduced precision bites"*): it did not.
+
+Two test-methodology issues were found and fixed in `Tests/dsp_tests.cpp`
+(R11 -- an AC measuring the wrong quantity, not a DSP defect):
+
+1. **G1.2's `hp() == x - lp()` exactness check** compared `TptOnePole`'s
+   internally-computed `hp()` against `x - lp` recomputed with the CALLER's
+   full-`double` `x` -- correct only when `nassau_real == double`. Under
+   `NASSAU_DSP_FLOAT`, `process()` narrows its argument before ever touching
+   it, so comparing against the un-narrowed `double` compares two different
+   roundings of the input and fails even though the identity `TptOnePole`
+   actually guarantees (`hp = x_used - lp`, exactly, in its own arithmetic)
+   still holds bit-for-bit. Fixed by narrowing the reference `x` to
+   `nassau_real` before the comparison, which is a no-op (and therefore
+   behaviourally identical) whenever `nassau_real == double`.
+2. **G1.2's zero-DC-gain bound** (`|hp| < 1e-9` after 5 s of a constant 1.0
+   input) is calibrated for `double`'s ~1e-16 relative precision. Under
+   `NASSAU_DSP_FLOAT` the recursion cannot represent an update smaller than
+   roughly `FLT_EPSILON` (~1.19e-7) at the unity magnitude it is converging
+   toward, and settles at **2.265e-6** (~19× `FLT_EPSILON`) -- three orders
+   of magnitude above the double-build bound, by construction, not by defect.
+   The double-build bound stays **exactly 1e-9, unchanged**; a separate,
+   still-tight float-build bound (1e-5, ~4× the measured floor) applies only
+   under `NASSAU_DSP_FLOAT`.
+
+**The golden battery does not, and structurally cannot, hold at the shared
+1e-6 tolerance in the float build, and that is expected, not a defect** (both
+fixtures were captured from — and stay — the double-precision core; they are
+never regenerated for this path). The double build's own `kTol` in
+`Tests/synth_golden.cpp` is **unchanged at 1e-6** — that IS the "shared
+tolerance" R11 says not to loosen, and it was not: `GoldenParityG5`/
+`GoldenParity` still verify at 7.105e-15 / 0.000e+00 max abs error in the
+default build, identical to pre-G12.2. Comparing the float build's rendered
+battery against that same double-precision fixture already IS the
+float-vs-double difference measurement this section exists to report — a
+separate, wider, still-meaningful `kTol` (5e-4, chosen with ~3-4× headroom
+over the measured worst case and roughly three decades below the scale of
+every real regression this project has actually caught this way, e.g.
+G3.12's undetected 2.3e-2 mixer DC) applies only under `NASSAU_DSP_FLOAT`.
+
+**Measured float-vs-double error, both golden batteries, dBFS relative to
+full scale (0 dBFS = amplitude 1.0):**
+
+| battery | max abs error | dBFS |
+|---|---|---|
+| G5 (`golden_g5.bin`, 1,104,000 values) | 1.174e-04 | **-78.6 dBFS** |
+| G11 (`golden.bin`, 2,448,000 values) | 1.481e-04 | **-76.6 dBFS** |
+
+**Stated plainly: both figures are worse than -80 dBFS**, the line this
+section's own brief called "inaudible." -76.6 / -78.6 dBFS is roughly 74-76 dB
+below full scale -- at or just past the edge of audibility depending on
+programme material and monitoring, not clearly inaudible. This is a genuine
+cost of the float path, not hidden or rounded away: anyone shipping this flag
+should treat it as a real (small, but not negligible) timbral difference from
+the reference double-precision rendering, concentrated in the resonant
+filters (LadderFilter is the single largest coefficient/state footprint this
+path touches).
+
+**Measured x86-64 speed (this box only, Xeon E5-1650 v3 @ 3.5 GHz, Release,
+`Tests/synth_bench.cpp`, best of 7, run alone with no concurrent `ctest`,
+average of two independent alone-on-the-box runs each):**
+
+| config | double (ns/sample) | float (ns/sample) | float/double |
+|---|---|---|---|
+| idle | 18.07 | 18.49 | 1.023× (2.3 % slower) |
+| 1 voice | 72.75 | 76.62 | 1.053× (5.3 % slower) |
+| **8 voices mono** | **471.8** | **500.1** | **1.060× (6.0 % slower)** |
+| 8 voices stereo | 859.4 | 919.3 | 1.070× (7.0 % slower) |
+| 16 voices unison | 924.2 | 983.7 | 1.064× (6.4 % slower) |
+
+Per-voice marginal cost: **56.7 ns (double) vs 60.2 ns (float)**.
+
+**On this x86-64 box the opt-in float path is not merely "no measurable
+gain" (as §12.1's isolated 1.03× prototype found) -- in the FULL instrument
+it is a measured 6-7 % REGRESSION.** This is a real finding, not tuned away:
+x86-64 doubles are not half-rate relative to floats the way many ARM cores'
+are, so there is no throughput to win, while every filter call now crosses a
+`double`⟷`nassau_real` boundary (the surrounding mixer/drive/pan signal path
+stays `double` throughout, per this section's own scope) that the default
+build never pays. **This regression is x86-64-specific and expected**: it is
+exactly the architectural asymmetry §12.1 named as the reason to keep the
+flag OFF by default and open for weak/ARM hardware rather than adopting it
+generally.
+
+**The ARM benefit this path targets is REASONED, NOT MEASURED.** No ARM
+hardware was available to this work. The reasoning: many ARM cores (notably
+Cortex-A-class parts common in low-power/embedded contexts) execute
+double-precision NEON/VFP operations at roughly half the throughput of
+single-precision, and NEON is natively 4-wide for `float32` against 2-wide
+for `float64` -- so the SAME arithmetic reduction that cost 6-7% here, on
+such hardware, trades a real throughput deficit for potential gain instead of
+a real one for none. Whether that gain, net of the same `double`⟷`float`
+boundary-crossing cost measured above, clears the actual regression margin on
+any specific ARM target is **unverified** and should not be assumed from this
+document -- it is a plausible, motivated hypothesis, not a result. Anyone
+shipping this flag on ARM should re-run `Tests/synth_bench.cpp` there before
+relying on it.
+
+**Verification commands** (separate build directories; run the benchmark
+alone, never alongside `ctest` — concurrent contention was measured to
+inflate every figure by ~40% during G11):
+
+```sh
+cmake -S . -B build       -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build-float -DCMAKE_BUILD_TYPE=Release -DNASSAU_DSP_FLOAT=ON
+cmake --build build       -j && ctest --test-dir build       --output-on-failure
+cmake --build build-float -j && ctest --test-dir build-float --output-on-failure
+./build/Tests/synth_bench
+./build-float/Tests/synth_bench
+```
+
 ---
 
 ## 13. Non-goals for v1

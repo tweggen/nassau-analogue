@@ -23,6 +23,27 @@
 //
 // Explicitly NOT delivered here: fastTan, fastExp2 (DESIGN.md §2.1 -- a
 // documented, deliberate non-goal; do not add "while we're here").
+//
+// [WEAK-MACHINE PATH, opt-in, DESIGN.md §12.2] `nassau_real` below is `double`
+// by default (bit-identical to every gate through G11) and `float` only when
+// the build is configured with `-DNASSAU_DSP_FLOAT=ON`. It is applied ONLY to
+// OnePoleHP (the DC blockers) and TptOnePole (the filter primitive that backs
+// LadderFilter/SvfFilter/HpfCascade, Source/DSP/synth_filter.h) -- the cost
+// centre DESIGN.md §12 measured. OnePoleHP therefore is no longer a
+// character-for-character verbatim copy of nassau-zermatt's amp_dsp.h (its
+// field types are now `nassau_real`, not the literal token `double`); it
+// remains behaviourally IDENTICAL to the verbatim original whenever
+// `nassau_real` resolves to `double`, i.e. always in the default build.
+// OnePoleLP/SmoothedValue/PinkFilter/AdsrEnv/Lfo/Xorshift32 -- and every
+// oscillator phase accumulator in synth_osc.h -- stay plain `double`
+// unconditionally: phase accumulators are excluded on principle (G2.8 needs
+// 1e-9, float carries ~1e-7), and the others are not the measured cost centre
+// (DESIGN.md §12.2).
+#if defined(NASSAU_DSP_FLOAT)
+using nassau_real = float;
+#else
+using nassau_real = double;
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -44,12 +65,16 @@ constexpr double kAmpPi = 3.14159265358979323846;
 // point); R<0 has no physical meaning for a real fc>=0.
 // ============================================================================
 struct OnePoleHP {
-  double R = 0.0;
-  double x1 = 0.0, y1 = 0.0;
+  nassau_real R = 0.0;
+  nassau_real x1 = 0.0, y1 = 0.0;
 
+  // fc/fs stay `double` (control-rate/init-time only, R12 does not apply
+  // here) -- only the coefficient's STORAGE and the per-sample process()
+  // arithmetic below narrow to nassau_real (DESIGN.md §12.2).
   void setFc(double fc, double fs) {
     fc = std::clamp(fc, 0.0, 0.49 * fs);
-    R = std::clamp(std::exp(-2.0 * kAmpPi * fc / fs), 0.0, 1.0 - 1e-7);  // [dsp] DESIGN.md C2
+    R = static_cast<nassau_real>(
+        std::clamp(std::exp(-2.0 * kAmpPi * fc / fs), 0.0, 1.0 - 1e-7));  // [dsp] DESIGN.md C2
   }
 
   void reset() {
@@ -57,8 +82,8 @@ struct OnePoleHP {
     y1 = 0.0;
   }
 
-  inline double process(double x) {
-    const double y = x - x1 + R * y1;
+  inline nassau_real process(nassau_real x) {
+    const nassau_real y = x - x1 + R * y1;
     x1 = x;
     y1 = y;
     return y;
@@ -240,11 +265,20 @@ inline double shapeCubic(double x, double L) {
 // this primitive itself is a plain single-pole recursion driven one sample
 // at a time. [dsp] Zavalishin, "The Art of VA Filter Design".
 // ============================================================================
+// [WEAK-MACHINE PATH, DESIGN.md §12.2]: `g`/`s`/`curLp`/`curHp` are
+// `nassau_real` -- this is the one primitive every filter structure in
+// synth_filter.h (LadderFilter/SvfFilter/HpfCascade, the measured cost
+// centre) is built from, so it is the actual target of the opt-in
+// single-precision path, not phase accumulation (which stays double
+// everywhere, unconditionally). `setFc()` still computes `g` in `double`
+// (control-rate only, R12 does not apply there) and narrows just once when
+// storing it, so the coefficient itself loses no more precision than a
+// single final rounding.
 struct TptOnePole {
-  double g = 0.0;   // [dsp] tan(pi*fc/fs)
-  double s = 0.0;   // integrator state
-  double curLp = 0.0;
-  double curHp = 0.0;
+  nassau_real g = 0.0;   // [dsp] tan(pi*fc/fs)
+  nassau_real s = 0.0;   // integrator state
+  nassau_real curLp = 0.0;
+  nassau_real curHp = 0.0;
 
   // fc is clamped just inside (0, 0.5*fs) so the tan() argument never
   // reaches +-pi/2, where tan() diverges (a robustness clamp; callers apply
@@ -252,7 +286,7 @@ struct TptOnePole {
   // §5.4 -- themselves). [dsp]
   void setFc(double fc, double fs) {
     fc = std::clamp(fc, 1.0, 0.49 * fs);
-    g = std::tan(kAmpPi * fc / fs);
+    g = static_cast<nassau_real>(std::tan(kAmpPi * fc / fs));
   }
 
   void reset() {
@@ -262,19 +296,22 @@ struct TptOnePole {
   }
 
   // One sample in, both outputs available afterward via lp()/hp() (or the
-  // return value, which is lp).
-  inline double process(double x) {
-    const double G = g / (1.0 + g);
-    const double v = (x - s) * G;
-    const double lp = v + s;
+  // return value, which is lp). Every intermediate here is `nassau_real`
+  // (not `double` narrowed only at the end) -- this is the per-sample loop
+  // DESIGN.md §12.2 targets, so the arithmetic itself must run at the
+  // reduced width for a weak-ARM build to see any benefit from it.
+  inline nassau_real process(nassau_real x) {
+    const nassau_real G = g / (nassau_real(1.0) + g);
+    const nassau_real v = (x - s) * G;
+    const nassau_real lp = v + s;
     s = lp + v;
     curLp = lp;
     curHp = x - lp;  // [dsp] DESIGN.md §5: HP = x - LP exactly, zero DC gain
     return lp;
   }
 
-  double lp() const { return curLp; }
-  double hp() const { return curHp; }
+  nassau_real lp() const { return curLp; }
+  nassau_real hp() const { return curHp; }
 };
 
 // ============================================================================

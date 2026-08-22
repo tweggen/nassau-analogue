@@ -48,6 +48,23 @@
 // slope crossfade, and the golden fixture were explicitly out of scope for
 // G4 (this file's own filters) -- they, and the audio-rate g interpolation
 // above, are G5's job (Source/DSP/synth_core.cpp), landed there.
+//
+// [WEAK-MACHINE PATH, opt-in, DESIGN.md §12.2]: every structure below is
+// built on synth_dsp.h's TptOnePole/OnePoleHP, whose coefficient/state
+// fields are `nassau_real` (`double` by default, `float` under
+// `-DNASSAU_DSP_FLOAT=ON`). This file's own per-structure coefficient
+// members (g/G/G2/G3/G4/k/invDenom/A/B/twoG on LadderFilter; g/Reff/d/
+// twoReffPlusG on SvfFilter; g on HpfCascade) are `nassau_real` for the same
+// reason: these are exactly the "filter state and filter coefficients"
+// DESIGN.md §12.2 targets -- LadderFilter alone is 19.3 of the measured
+// 56.1 ns/voice. `setControlRate()` (once per control block) keeps its
+// internal arithmetic in `double` and narrows only when storing, for
+// maximum coefficient precision at negligible cost; `advanceCoeff()` (once
+// per SAMPLE, per DESIGN.md §2's `gLpf`/`gHpf` interpolation) does its
+// arithmetic entirely in `nassau_real` -- that per-sample recompute
+// (division included) is the actual audio-rate cost this path exists to
+// reduce, so computing it in `double` and narrowing only the result would
+// buy nothing on a weak machine.
 
 #include "synth_dsp.h"
 
@@ -82,18 +99,18 @@
 struct LadderFilter {
   TptOnePole p1, p2, p3, p4;
 
-  double g = 0.0;   // [dsp] tan(pi*fc/fs), control-rate (DESIGN.md §5.2)
-  double G = 0.0;   // [dsp] g/(1+g)
-  double G2 = 0.0, G3 = 0.0, G4 = 0.0;  // [dsp] powers of G, control-rate cache
-  double k = 0.0;   // [voicing] resonance: k = 4.2*(Resonance/100), DESIGN.md §5.2 --
+  nassau_real g = 0.0;   // [dsp] tan(pi*fc/fs), control-rate (DESIGN.md §5.2)
+  nassau_real G = 0.0;   // [dsp] g/(1+g)
+  nassau_real G2 = 0.0, G3 = 0.0, G4 = 0.0;  // [dsp] powers of G, control-rate cache
+  nassau_real k = 0.0;   // [voicing] resonance: k = 4.2*(Resonance/100), DESIGN.md §5.2 --
                      // theoretical self-osc threshold of the 4-pole loop is exactly 4.0,
                      // so 4.2 puts self-oscillation comfortably inside the knob's top end.
-  double invDenom = 1.0;  // [dsp] 1/(1 + k*G^4) -- see the class comment: computed HERE
+  nassau_real invDenom = 1.0;  // [dsp] 1/(1 + k*G^4) -- see the class comment: computed HERE
                            // (control rate), never in process() (R12/G4.11).
   // [dsp] G11-opt: control-rate caches for the parallel pole form below.
   // A = 1-G is the per-pole zero-input gain; B = 1-2G and twoG come from
   // rewriting the TPT state update  s' = y + v  as  s' = 2G*in + (1-2G)*s.
-  double A = 1.0, B = 1.0, twoG = 0.0;
+  nassau_real A = 1.0, B = 1.0, twoG = 0.0;
 
   // [voicing] DESIGN.md §5.2: the feedback saturator's knee. Sets the
   // self-oscillation amplitude (describing-function estimate A ~= 0.6, see
@@ -127,6 +144,9 @@ struct LadderFilter {
     G4 = 0.0;
     k = 0.0;
     invDenom = 1.0;
+    A = 1.0;
+    B = 1.0;
+    twoG = 0.0;
   }
 
   // G5 (DESIGN.md §5.1's 20ms slope crossfade, docs/GATES.md G5.4): seed
@@ -159,17 +179,30 @@ struct LadderFilter {
   /// kLpfResonance). Robustness clamp here too (TptOnePole::setFc's own
   /// [1, 0.49*fs] guard) so a caller that forgot §5.4's clamp cannot make
   /// tan() diverge.
+  // [WEAK-MACHINE PATH, DESIGN.md §12.2]: this runs once per CONTROL BLOCK,
+  // not per sample, so its own internal arithmetic stays `double` for
+  // maximum precision regardless of `nassau_real` -- only the final store
+  // into each member narrows (once), matching TptOnePole::setFc's own
+  // convention. This is the opposite of advanceCoeff() below, which runs
+  // per SAMPLE and therefore computes entirely in `nassau_real`.
   void setControlRate(double fc, double fs, double resonancePercent) {
-    g = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.2/§5.4
-    G = g / (1.0 + g);
-    G2 = G * G;
-    G3 = G2 * G;
-    G4 = G3 * G;
-    A = 1.0 - G;
-    B = 1.0 - 2.0 * G;
-    twoG = 2.0 * G;
-    k = 4.2 * (resonancePercent * 0.01);  // [voicing] DESIGN.md §5.2
-    invDenom = 1.0 / (1.0 + k * G4);      // [dsp] THE control-rate division (G4.11)
+    const double gD = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.2/§5.4
+    const double GD = gD / (1.0 + gD);
+    const double G2D = GD * GD;
+    const double G3D = G2D * GD;
+    const double G4D = G3D * GD;
+    const double kD = 4.2 * (resonancePercent * 0.01);  // [voicing] DESIGN.md §5.2
+
+    g = static_cast<nassau_real>(gD);
+    G = static_cast<nassau_real>(GD);
+    G2 = static_cast<nassau_real>(G2D);
+    G3 = static_cast<nassau_real>(G3D);
+    G4 = static_cast<nassau_real>(G4D);
+    A = static_cast<nassau_real>(1.0 - GD);
+    B = static_cast<nassau_real>(1.0 - 2.0 * GD);
+    twoG = static_cast<nassau_real>(2.0 * GD);
+    k = static_cast<nassau_real>(kD);            // [voicing] DESIGN.md §5.2
+    invDenom = static_cast<nassau_real>(1.0 / (1.0 + kD * G4D));  // [dsp] THE control-rate division (G4.11)
 
     p1.g = g;
     p2.g = g;
@@ -204,16 +237,16 @@ struct LadderFilter {
   // G1-proven) already does the analogous G=g/(1+g) recompute every
   // sample from its own `g` member, so this is the same established
   // pattern, not a new category of cost.
-  inline void advanceCoeff(double gValue) {
+  inline void advanceCoeff(nassau_real gValue) {
     g = gValue;
-    G = g / (1.0 + g);
+    G = g / (nassau_real(1.0) + g);
     G2 = G * G;
     G3 = G2 * G;
     G4 = G3 * G;
-    A = 1.0 - G;
-    B = 1.0 - 2.0 * G;
-    twoG = 2.0 * G;
-    invDenom = 1.0 / (1.0 + k * G4);
+    A = nassau_real(1.0) - G;
+    B = nassau_real(1.0) - nassau_real(2.0) * G;
+    twoG = nassau_real(2.0) * G;
+    invDenom = nassau_real(1.0) / (nassau_real(1.0) + k * G4);
     p1.g = g;
     p2.g = g;
     p3.g = g;
@@ -228,14 +261,20 @@ struct LadderFilter {
   // process() itself free of them, and keep the marked region free of any
   // comment containing a literal division character too.
   // ---- PER-SAMPLE PROCESS BEGIN ----
-  inline double process(double x) {
-    const double S1 = A * p1.s;
-    const double S2 = A * p2.s;
-    const double S3 = A * p3.s;
-    const double S4 = A * p4.s;
-    const double Sigma = G3 * S1 + G2 * S2 + G * S3 + S4;
-    const double y4lin = (G4 * x + Sigma) * invDenom;
-    const double u = x - k * shapeTriodeK(y4lin, kLadderSat);
+  // Every quantity here is `nassau_real` EXCEPT the one call out to
+  // shapeTriodeK (a shared shaper, also used by the drive stage -- not
+  // "filter state or coefficients", DESIGN.md §12.2's scope, so it stays
+  // `double`): y4lin widens for that one call and u narrows the result back
+  // immediately after. That crossing is deliberate, not an oversight -- see
+  // this file's own header comment.
+  inline nassau_real process(nassau_real x) {
+    const nassau_real S1 = A * p1.s;
+    const nassau_real S2 = A * p2.s;
+    const nassau_real S3 = A * p3.s;
+    const nassau_real S4 = A * p4.s;
+    const nassau_real Sigma = G3 * S1 + G2 * S2 + G * S3 + S4;
+    const nassau_real y4lin = (G4 * x + Sigma) * invDenom;
+    const nassau_real u = x - k * static_cast<nassau_real>(shapeTriodeK(y4lin, kLadderSat));
 
     // G11-opt: the four poles were a SERIAL chain (y1 -> y2 -> y3 -> y4), so
     // every sample paid four dependent TPT latencies back to back, on top of
@@ -252,10 +291,10 @@ struct LadderFilter {
     // Measured 25.12 -> 19.27 ns/sample, 1.30x, agreeing with the serial form
     // to 3.886e-16 over 200k samples (golden tolerance is 1e-6, and both
     // batteries in fact still verify at exactly 0.0). [dsp]
-    const double y1 = G * u + S1;
-    const double y2 = G2 * u + G * S1 + S2;
-    const double y3 = G3 * u + G2 * S1 + G * S2 + S3;
-    const double y4 = G4 * u + Sigma;
+    const nassau_real y1 = G * u + S1;
+    const nassau_real y2 = G2 * u + G * S1 + S2;
+    const nassau_real y3 = G3 * u + G2 * S1 + G * S2 + S3;
+    const nassau_real y4 = G4 * u + Sigma;
 
     p1.s = twoG * u + B * p1.s;
     p2.s = twoG * y1 + B * p2.s;
@@ -295,15 +334,15 @@ struct LadderFilter {
 // the division `d`) is recomputed once per control block, not per sample.
 // ============================================================================
 struct SvfFilter {
-  double g = 0.0;       // [dsp] tan(pi*fc/fs), control-rate
-  double Reff = 1.0;    // [dsp] control-rate damping, see the class comment
-  double d = 1.0;       // [dsp] 1/(1+2*Reff*g+g*g), control-rate reciprocal (G4.11)
-  double twoReffPlusG = 0.0;  // [dsp] cached (2*Reff+g), control-rate
+  nassau_real g = 0.0;       // [dsp] tan(pi*fc/fs), control-rate
+  nassau_real Reff = 1.0;    // [dsp] control-rate damping, see the class comment
+  nassau_real d = 1.0;       // [dsp] 1/(1+2*Reff*g+g*g), control-rate reciprocal (G4.11)
+  nassau_real twoReffPlusG = 0.0;  // [dsp] cached (2*Reff+g), control-rate
 
-  double ic1 = 0.0, ic2 = 0.0;  // [dsp] TPT integrator state (bp/lp memories)
+  nassau_real ic1 = 0.0, ic2 = 0.0;  // [dsp] TPT integrator state (bp/lp memories)
 
-  double peakBpPrev = 0.0;   // [dsp] peak |bp| over the PREVIOUS control block (feeds Reff)
-  double peakBpAccum = 0.0;  // [dsp] peak |bp| accumulated over THIS (in-progress) control block
+  nassau_real peakBpPrev = 0.0;   // [dsp] peak |bp| over the PREVIOUS control block (feeds Reff)
+  nassau_real peakBpAccum = 0.0;  // [dsp] peak |bp| accumulated over THIS (in-progress) control block
 
   // [voicing] DESIGN.md §5.3: R0 mapping constant (res=100 -> R0=-0.005) and
   // the damping-regulation gain. Sets the self-oscillation limit amplitude to
@@ -353,15 +392,22 @@ struct SvfFilter {
   /// peak |bp| into peakBpPrev before resetting the accumulator for the new
   /// block, exactly matching the "previous control block" wording of
   /// DESIGN.md §5.3.
+  // [WEAK-MACHINE PATH, DESIGN.md §12.2]: control-rate only (see
+  // LadderFilter::setControlRate's identical rationale) -- internal
+  // arithmetic stays `double`, narrowed once per member on store.
   void setControlRate(double fc, double fs, double resonancePercent) {
+    const double peakBpPrevD = static_cast<double>(peakBpAccum);
     peakBpPrev = peakBpAccum;
     peakBpAccum = 0.0;
 
-    g = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.3/§5.4
+    const double gD = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.3/§5.4
     const double R0 = 1.0 - kR0Scale * (resonancePercent * 0.01);  // [voicing] DESIGN.md §5.3
-    Reff = std::clamp(R0 + kSvfSat * peakBpPrev * peakBpPrev, -0.02, 2.0);  // [voicing]
-    twoReffPlusG = 2.0 * Reff + g;
-    d = 1.0 / (1.0 + 2.0 * Reff * g + g * g);  // [dsp] THE control-rate division (G4.11)
+    const double ReffD = std::clamp(R0 + kSvfSat * peakBpPrevD * peakBpPrevD, -0.02, 2.0);  // [voicing]
+
+    g = static_cast<nassau_real>(gD);
+    Reff = static_cast<nassau_real>(ReffD);
+    twoReffPlusG = static_cast<nassau_real>(2.0 * ReffD + gD);
+    d = static_cast<nassau_real>(1.0 / (1.0 + 2.0 * ReffD * gD + gD * gD));  // [dsp] THE control-rate division (G4.11)
   }
 
   // G5 (DESIGN.md §2's "gLpf...interpolated per sample" -- see
@@ -373,22 +419,22 @@ struct SvfFilter {
   // (and its two PURE-FUNCTION derivatives twoReffPlusG, d) move faster.
   // Deliberately outside the per-sample-process marker comments below,
   // same reasoning as the ladder's advanceCoeff.
-  inline void advanceCoeff(double gValue) {
+  inline void advanceCoeff(nassau_real gValue) {
     g = gValue;
-    twoReffPlusG = 2.0 * Reff + g;
-    d = 1.0 / (1.0 + 2.0 * Reff * g + g * g);
+    twoReffPlusG = nassau_real(2.0) * Reff + g;
+    d = nassau_real(1.0) / (nassau_real(1.0) + nassau_real(2.0) * Reff * g + g * g);
   }
 
   // R12/G4.11: no division, no transcendental, no atomic load anywhere in
   // this function -- see LadderFilter::process's identical note above.
   // ---- PER-SAMPLE PROCESS BEGIN ----
-  inline double process(double x) {
-    const double hp = (x - twoReffPlusG * ic1 - ic2) * d;
-    const double bp = g * hp + ic1;
+  inline nassau_real process(nassau_real x) {
+    const nassau_real hp = (x - twoReffPlusG * ic1 - ic2) * d;
+    const nassau_real bp = g * hp + ic1;
     ic1 = g * hp + bp;
-    const double lp = g * bp + ic2;
+    const nassau_real lp = g * bp + ic2;
     ic2 = g * bp + lp;
-    const double absBp = bp < 0.0 ? -bp : bp;
+    const nassau_real absBp = bp < nassau_real(0.0) ? -bp : bp;
     if (absBp > peakBpAccum) peakBpAccum = absBp;
     return lp;
   }
@@ -418,7 +464,7 @@ struct SvfFilter {
 // ============================================================================
 struct HpfCascade {
   TptOnePole p1, p2, p3, p4;
-  double g = 0.0;  // [dsp] tan(pi*fc/fs), control-rate (DESIGN.md §5.5)
+  nassau_real g = 0.0;  // [dsp] tan(pi*fc/fs), control-rate (DESIGN.md §5.5)
 
   void reset() {
     p1.reset();
@@ -436,7 +482,8 @@ struct HpfCascade {
   /// (TptOnePole::setFc's own guard) so a caller that forgot it cannot make
   /// tan() diverge.
   void setControlRate(double fc, double fs) {
-    g = std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs);  // [dsp] DESIGN.md §5.5/§5.4
+    g = static_cast<nassau_real>(
+        std::tan(kAmpPi * std::clamp(fc, 10.0, 0.45 * fs) / fs));  // [dsp] DESIGN.md §5.5/§5.4
     p1.g = g;
     p2.g = g;
     p3.g = g;
@@ -448,7 +495,7 @@ struct HpfCascade {
   /// shares the same `g`, no resonance term to re-derive). Applies an
   /// already-interpolated `gValue` (the caller ramps it via plain addition,
   /// R12's own "adds, not transcendentals" exception).
-  inline void advanceCoeff(double gValue) {
+  inline void advanceCoeff(nassau_real gValue) {
     g = gValue;
     p1.g = g;
     p2.g = g;
@@ -467,9 +514,9 @@ struct HpfCascade {
   /// pre-existing pattern as LadderFilter's four poles -- see
   /// LadderFilter::process()'s own comment on why that is not a new R12
   /// concern).
-  inline double process(double x, int nPoles) {
+  inline nassau_real process(nassau_real x, int nPoles) {
     p1.process(x);
-    double h = p1.hp();
+    nassau_real h = p1.hp();
     if (nPoles >= 2) {
       p2.process(h);
       h = p2.hp();

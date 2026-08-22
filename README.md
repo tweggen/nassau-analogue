@@ -147,6 +147,45 @@ ctest --test-dir build -C Release --output-on-failure
 Point at a non-default SDK location with `-DNASSAU_SDK_DIR=/path/to/nassau-plugin-sdk`,
 and force a no-UI build with `-DNASSAU_FORCE_HEADLESS=ON`.
 
+### Opt-in single-precision DSP path (`-DNASSAU_DSP_FLOAT=ON`), weak/ARM machines
+
+**This deviates from this project's stated double-precision non-negotiable**
+("coefficient math and filter state will use double; public I/O stays
+float") for filter state, filter coefficients and the DC blockers only —
+oscillator phase accumulators stay `double` unconditionally in both builds
+(a G2.8 acceptance criterion needs 1e-9 precision; `float` only carries
+~1e-7). It is **off by default**; the default build is untouched and stays
+bit-identical to every gate through G11. See `docs/DESIGN.md` §12.2 for the
+full mechanism, correctness results and measured numbers. Build it in a
+**separate** build directory:
+
+```sh
+cmake -S . -B build-float -DCMAKE_BUILD_TYPE=Release -DNASSAU_DSP_FLOAT=ON
+cmake --build build-float -j
+ctest --test-dir build-float --output-on-failure
+```
+
+Every stability/tuning/DC acceptance criterion still holds in the float
+build (self-oscillation stays bounded at ≈0.59/0.50 for the ladder/SVF, as
+in the default build). The golden battery cannot and does not hold at the
+shared 1e-6 tolerance once the audio-rate arithmetic itself runs in `float`
+(the fixtures are, and stay, double-precision references — a separate,
+still-tight tolerance applies only in this build); the measured
+float-vs-double difference is **-76.6 to -78.6 dBFS relative to full
+scale** — small, but past this project's own "-80 dBFS is inaudible" line,
+so treat it as a real, if minor, timbral difference from the reference
+rendering, not a free option.
+
+**Measured on this project's x86-64 dev box (Xeon E5-1650 v3), the flag is a
+6–7 % SLOWDOWN, not a speedup** — x86-64 doubles are not half-rate relative
+to floats the way many ARM cores' are, so there is no throughput to win here,
+while every filter call now crosses a `double`↔`float` boundary the default
+build never pays. **The motivating ARM benefit (many ARM cores: half-rate
+double throughput, 4-wide NEON for `float32`) is reasoned, not measured** —
+no ARM hardware was available for this work. Re-run
+`Tests/synth_bench.cpp` on the target hardware (alone, never alongside
+`ctest`) before relying on this flag anywhere.
+
 ### If the build fails on `File can't be removed and still exist`
 
 iPlug2 auto-installs the built plugin to the system plugin folder after every
