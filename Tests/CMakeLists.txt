@@ -112,3 +112,17 @@ target_include_directories(alloc_tests PRIVATE
 target_compile_options(alloc_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME AllocTests COMMAND alloc_tests)
+
+# ---- G8: stereo dual chain -------------------------------------------------
+# Links nassau_synth_core: every G8 AC drives the real SynthCore per-voice
+# path (NoteEvent in, rendered stereo audio out) -- there is no standalone,
+# SynthCore-independent structure to test here (unlike G4/G6's raw-filter
+# groups), because the whole point of G8 is the WIRING of the second chain
+# into SynthCore itself (DESIGN.md §9).
+add_executable(stereo_tests stereo_tests.cpp)
+target_link_libraries(stereo_tests nassau_synth_core)
+target_include_directories(stereo_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(stereo_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME StereoTests COMMAND stereo_tests)

@@ -429,9 +429,33 @@ int main() {
         // at 48 kHz. Every setter stores into a std::atomic (R3), so this
         // must run to completion with no crash / UB regardless of
         // interleaving. This is a liveness/no-crash proof, not a magnitude
-        // assertion (there is nothing to measure: G0's process() ignores
-        // params entirely). Mirrors nassau-zermatt/Tests/amp_tests.cpp's
-        // G0.9 group.
+        // assertion. Mirrors nassau-zermatt/Tests/amp_tests.cpp's G0.9 group.
+        //
+        // G8 FINDING (R11): the setter thread's own randomisation includes
+        // kVoiceMode/kPolyphony/kStereoMode (params 44/45/50, landed by
+        // G7/G8), so the worst case this loop can land on -- Unison mode,
+        // 16-voice polyphony, kStereoMode on, the SAME NoteOn re-sent every
+        // 512-sample block (a fresh full-polyphony Unison retrigger every
+        // call) -- now does REAL, doubled per-chain work (DESIGN.md §9),
+        // where before G8 kStereoMode was a stored-but-unread atomic. Measured
+        // standalone (no contending thread): mono-equivalent worst case 1913
+        // iterations/s (521 ns/sample), stereo worst case 1014 iterations/s
+        // (983 ns/sample) -- a 1.89x ratio, matching DESIGN.md §9's own
+        // "near 1.85x" expectation almost exactly, and nowhere near a stall.
+        // Adding the ACTUAL contending setter thread (hammering 53 atomics in
+        // a tight loop, no sleep) drops this further, to ~880 iterations/s
+        // measured on this box -- BELOW this AC's original `> 1000` bound,
+        // which was calibrated before G8 existed and never reasoned about a
+        // stereo cost model. This is not a stall or a regression in the sense
+        // R1 cares about (no correctness AC moved); it is G8 legitimately
+        // making an already-adversarial corner (worst-case polyphony x
+        // worst-case voice mode x per-block full retrigger x atomic-hammering
+        // contention) cost what DESIGN.md §9 always said it would. The bound
+        // is lowered to `> 100` -- roughly 9x below the measured contended
+        // worst case on this box, so it still fails hard on an actual
+        // deadlock/livelock (which would read single-digit or zero
+        // iterations), while no longer being hostage to a performance ratio
+        // G11, not G0.9, owns the budget for.
         SynthCore core;
         core.init(48000.0f);
 
@@ -520,7 +544,7 @@ int main() {
         check("1 s of process() blocks concurrent with continuous setter calls across all 53 "
               "params completes with no crash",
               true);
-        check("process() thread made many iterations over the 1 s window", processIterations > 1000);
+        check("process() thread made many iterations over the 1 s window", processIterations > 100);
         check("setter thread actually ran concurrently (made substantial progress)",
               setterIterations.load(std::memory_order_relaxed) > 1000);
     }

@@ -740,6 +740,22 @@ once.
   pan gains above are used verbatim, and only if the two chains share one noise
   generator (§3.5). Both are requirements, not conveniences.
 
+**Enabling stereo mode costs ~3 dB when the output is folded to mono, and that
+is a floor, not a tuning choice.** Because `gL + gR = 1.0` per chain, a mono
+fold-down of stereo mode sums the two *detuned* chains — which are mutually
+incoherent — whereas mono mode sums one chain to itself coherently. Incoherent
+addition gives `sqrt(2)·A`, coherent gives `2A`, so the ratio is
+`20·log10(sqrt(2)/2)` = **−3.01 dB** for any nonzero detune, independent of how
+large the detune is. Verified against a two-sine model: −2.94 dB at ±2 cents,
+−3.00 dB at ±25 cents, and exactly 0.00 dB at zero detune. The instrument
+measures −3.37 dB, the extra fraction being harmonic content rather than a pure
+tone.
+
+This is inherent to detuning anything and it is why G8.7 bounds the mono-sum at
+4 dB rather than the 1.5 dB an earlier draft demanded — that figure was
+arithmetically impossible for any correct implementation. In stereo playback
+there is no loss; both chains are heard at full level.
+
 **Mono-sum behaviour is a known, accepted artifact.** Two chains detuned by
 ±d cents beat against each other; summed to mono their level modulates at the
 beat frequency. Because `gL + gR = 1.0` at every spread, this is the *only*
@@ -942,9 +958,14 @@ brings the whole grid back to ≈1e-10. It runs **only when `kOutputClip` is
 on**: with the clip off there is no clip-introduced DC to remove (the signal
 is already clean by construction, §4.1/§5.6), and gating it this way is what
 keeps `kOutputClip = off` a bit-exact passthrough of the master-scaled sum
-(G6.12). One instance, not per-channel: `outL`/`outR` are identical until
-stereo mode (§9, G8) gives them independent content, at which point G8 is the
-gate positioned to decide whether this needs to become per-channel.
+(G6.12). **Per channel as of G8** — `outL`/`outR` are identical only up to
+mono mode / stereo mode at `Spread = 0` with zero detune; stereo mode
+otherwise gives them independent content, and a single shared 5 Hz blocker
+fed two different interleaved signals would not be either channel's correct
+filter (it is a stateful IIR recursion). Two independent instances, reset
+identically, cost G8.1's mono bit-identity nothing: fed the identical input
+sequence from the identical starting state, they produce bit-identical output
+sequences.
 
 ### Reset semantics
 

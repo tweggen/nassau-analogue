@@ -1423,6 +1423,162 @@ Everything here is framework-free and tested with the SDK absent (R14).
 
 # G8 — Stereo dual chain
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4), both a normal and a from-scratch `rm -rf build` rebuild:
+> `ctest --test-dir build` → **9/9 test binaries passed** (`SynthTests`
+> 28/28, `DspTests` 75/75, `OscTests` 50/50, `EnvLfoTests` 34/34,
+> `FilterTests` 58/58, `GoldenParityG5`, `VoiceTests` 31/31, `AllocTests`
+> 59/59, `StereoTests` 29/29 — the new binary), 0 compiler warnings at
+> `-Wall -Wextra -Wpedantic` across `Source/DSP` + `Tests` on a from-scratch
+> rebuild. **`GoldenParityG5` passes unmodified** with `kStereoMode = Off`
+> and the HPF bypassed — the fixture bytes were never touched; confirms
+> nothing upstream of G8 moved (G8.9's own AC, R1).
+>
+> **The second chain.** `Voice::Chain` (`Source/DSP/synth_core.h`) bundles
+> everything DESIGN.md §9 says is genuinely duplicated per chain — both
+> oscillators, the sub, the mixer DC blocker, both LPF structures + their
+> g-interpolation, the HPF cascade, the post-LPF DC blocker, and the G6.4/
+> G6.7 debug readbacks — into one nested struct; `Voice::chain[2]` is always
+> fully constructed (R3), but `chain[1]` is only ever STEPPED in the
+> audio-rate loop while stereo mode (or its own activation/deactivation
+> blend, G8.9) needs it. `noise` (DESIGN.md §3.5), `envF`/`envA`, and the
+> modulated `debugLpfCutoffHz`/`debugHpfCutoffHz` stayed single, un-indexed
+> Voice fields, unchanged in shape from G7 — [PERF-5]'s "computed once per
+> voice" requirement for ENV-F/ENV-A/LFO/glide/key-follow/filter cutoff is
+> therefore an architectural fact, not merely an observed behaviour: there
+> is only one copy of each to compute. Chain 1's pitch negates
+> `Osc1Fine`/`Osc2Fine`/`StereoDetune` as a trio via a single `chainSign`
+> (+1 for chain 0, −1 for chain 1) — `chainSign*0.0==0.0` is what keeps
+> chain 0's formula bit-identical to every pre-G8 test whenever those three
+> are zero, and the `StereoDetune` term is additionally gated on
+> `snapshot.stereoMode` itself (its own nonzero DEFAULT, 6 cents, must not
+> leak into mono mode — an actual bug this gate found and fixed in itself,
+> see below). `mOutputDcBlock` became `mOutputDcBlock[2]` (one per channel)
+> — the "G8 is the gate positioned to decide" callout DESIGN.md's own
+> "Output stage" section left open; two independently-reset instances fed
+> the identical input sequence in mono mode produce bit-identical output
+> sequences, so this costs G8.1 nothing.
+>
+> **Per-AC results.** G8.1: **bit-exact** (`==`), 240 000/240 000 samples, a
+> busy 5 s sequence (chords, retriggers, sustain, bend, all-notes/sound-off)
+> — PASS. G8.2: **bit-exact** (`==`) against a separately-configured mono
+> render, 144 000/144 000 samples both channels, a non-trivial patch (pulse,
+> sub, pink noise, drive, HPF/LPF modulation, PWM, Poly-Mod, glide) with only
+> `Osc1Fine`/`Osc2Fine`/`StereoDetune`/`Spread` at 0 — PASS. G8.3: chain 0
+> measured **443.316 Hz** (target `440·2^(13/1200)` = 443.316), chain 1
+> **436.708 Hz** (target 436.708), difference **6.61 Hz** (≫0, "not equal")
+> — PASS. G8.4: measured via a frequency-selective (Goertzel) technique with
+> the analysis window chosen so chain 1's ENTIRE harmonic series sits on
+> rejection nulls (an integer number of beat cycles, `docs/GATES.md`'s own
+> "measure signals" R6 discipline applied to a pan-law AC): Spread 0 → chain
+> 0's gain **0.500/0.500** L/R (target 0.5/0.5); Spread 50 → **0.750/0.250**
+> (target 0.75/0.25), ratio **9.544 dB** (target 9.542); Spread 100 → **1.000**
+> / **9.2e-5** (< −40 dB rel.) — PASS. G8.5: (a) `getDebugEnvFValue`/
+> `getDebugEnvAValue` take a voice index, not a (voice, chain) pair — there
+> is no way to ask for "chain 1's ENV-A" (architectural, not measured); (b)
+> both chains' LPF produce the same H3/H1 attenuation to within **0.035 dB**
+> (2-cent detune isolating "same cutoff" from "different pitch") — PASS.
+> G8.6: **bit-exact** (`==`) — `L+R` at Spread 0/50/100 all equal the SAME
+> mono-mode sum, every sample, detune 0 — PASS. G8.7: **−3.37 dB** measured
+> (bound 4.0 dB, R11-corrected from 1.5 dB — see below); peak-to-trough
+> swing **28.9 dB** RECORDED, not bounded — PASS. G8.8: **1.78–1.81×**
+> across repeated runs (bound 2.0×, DESIGN.md's own "near 1.85×" expectation)
+> — PASS. G8.9: both directions, measured via a frame-aligned (1000 Hz, 48
+> samples/cycle) carrier landed at a non-period-aligned switch instant, delta
+> AT the switch compared against the worst delta found ELSEWHERE in the same
+> ±20 ms window (R11 — see below): off→on **0.41 dB/ms** (elsewhere 0.51),
+> on→off **0.085 dB/ms** (elsewhere 0.91) — both also clear the AC's own
+> literal absolute 1 dB/ms bound outright — PASS.
+>
+> **Three R11 findings, all with a mechanism found and fixed (or, for the
+> third, a corrected bound recorded) — none quietly relaxed:**
+>
+> **(1) A genuine bug this gate introduced in itself, caught by its own
+> G3.9/G3.12 regression:** the first draft applied chain 1's negated
+> `StereoDetune` term to chain 0 unconditionally (`chainSign*StereoDetuneCents`,
+> `chainSign=+1` for chain 0 always) without gating it on `stereoMode` —
+> since `kStereoDetune`'s own default is 6 cents (DESIGN.md §11, not 0), this
+> silently detuned chain 0 by 6 cents in **plain mono mode**, the instant G8
+> landed, breaking pre-existing pitch-exact ACs (`EnvLfoTests` read a ~220 Hz
+> carrier as 219.75 Hz). Fixed by gating the whole term on
+> `snapshot.stereoMode`, not just relying on chain 1 never running in mono.
+>
+> **(2) G8.9 needed two real implementation iterations, not just a stricter
+> test.** A first attempt (a 2 ms LINEAR fade on chain 1's contribution only,
+> mirroring DESIGN.md §10.4's voice-steal fade) left the actual click
+> unfixed for two reasons found by measurement: (a) chain 0's OWN pan gain
+> still jumped discontinuously (mono's `gL=gR=1.0` is a different pan STATE
+> from any spread value, not a special case reachable by fading only chain
+> 1); (b) a LINEAR ramp toward a low (and at Spread=100%, exactly zero)
+> target has an unboundED dB/ms rate near the ramp's end, however long the
+> ramp — dB is logarithmic, so a straight-line approach to zero gain always
+> "arrives" at infinite dB/ms. Fixed with an EXPONENTIAL one-pole blend
+> (`mStereoBlend`, 15 ms tau — chosen so the worst case, 8.686/tau dB/ms
+> chasing a target of exactly 0, clears 1 dB/ms with margin) interpolating
+> BOTH chains' pan gains between the mono law and the target spread law, at
+> CONTROL rate (matching `AdsrEnv`'s own stepping shape, DESIGN.md §2's
+> "everything but the three interpolated scalars is held for a control
+> block" precedent). A second bug then made the `on→off` direction read
+> **unchanged** from before any fix existed: `ParamSnapshot::panGainL0/R0/
+> L1/R1` themselves collapsed to the hardcoded mono law `{1,1,0,0}` the
+> INSTANT `stereoMode` went false, so the blend's own "target" became
+> indistinguishable from its "mono" starting point from the very first
+> control block after the toggle — no ramp ever actually happened for that
+> direction. Fixed by having `finishSnapshot()` always compute the true
+> spread-law target regardless of `stereoMode`'s live value; `mStereoBlend`
+> pinned at an exact 0.0 in steady mono mode (via the pre-existing
+> `mControlRateEverRun` first-block snap) is what still keeps G8.1's mono
+> bit-identity exact. Also found and fixed along the way, in the TEST
+> methodology (not the implementation): a coincidental exact-wrap-boundary
+> switch instant reads the oscillator's own worst-case per-cycle transient
+> as a false click (8.6 dB/ms independent of detune, i.e. independent of
+> whether a switch even happened); and a separately-rendered "baseline" is
+> not a fair comparison once `kStereoDetune`'s own beat makes the natural
+> envelope-change rate vary continuously over time even with no switch —
+> both are documented in `Tests/stereo_tests.cpp`'s own G8.9 group comment.
+>
+> **(3) G8.7's literal 1.5 dB bound is not achievable by any correct
+> implementation — arithmetic, not a wiring defect (the direct analogue of
+> G5's own DC-bound correction, "a correct physical explanation").** Proof:
+> `gL+gR==1.0` per chain at every spread (G8.6) makes stereo's own `L+R`
+> reduce EXACTLY to `contribution0 + contribution1`, regardless of spread.
+> Mono's own `L+R` is `contribution0 + contribution0` — the SAME chain
+> signal added COHERENTLY TWICE. For two equal-amplitude sinusoids at
+> different frequencies (any nonzero detune), the cross term in
+> `(A·sin(w0t)+A·sin(w1t))²` time-averages to exactly zero over several beat
+> cycles regardless of how small the detune is (only the TIME needed grows,
+> as the beat period lengthens) — giving mean-square `A²` against mono's
+> coherent-double mean-square `2A²`: a ratio of exactly **0.5 in power,
+> −3.01 dB in level**, that does not shrink as detune shrinks. Verified two
+> independent ways: a standalone two-sine Python model gives **−3.15 dB**;
+> `SynthCore`'s own 4-note-chord render gives **−3.37 dB**. The bound is
+> corrected to **4.0 dB** (margin over both the theoretical floor and the
+> measured worst case) — see the G8.7 table row above for the same
+> explanation recorded at the AC itself, matching this project's own G5
+> precedent of moving a bound WITH its physical mechanism attached, not
+> silently.
+>
+> **Cost:** stereo mode measured **1.78–1.81×** mono's ns/sample across
+> repeated runs (8 voices, best of 7, 48 kHz) — under the 2.0× bound, close
+> to DESIGN.md's own "near 1.85×" expectation; the gap from 2.0× comes from
+> ENV-F/ENV-A/LFO/glide/key-follow/filter-cutoff genuinely being computed
+> once per voice, not once per chain, exactly as [PERF-5] specifies. Zero
+> heap allocations confirmed in STEREO mode specifically (not just mono,
+> which G0.11 already covered), 5 s / 468 blocks of a busy 16-voice-poly
+> event stream, `new`/`delete` delta both 0 — R3.
+>
+> **A decision the plan did not name, made and recorded here (R11):**
+> DESIGN.md §9 states chain 1's fine-tune negation but is silent on whether
+> `StereoDetune`'s cents are ADDED to chain 0 (shifting its own pitch when
+> stereo engages) or merely define chain 1's offset from an unchanged chain
+> 0. G8.3's own worked example (`Osc2Fine=+7`, `StereoDetune=6` → chain 0 at
+> `+13`, chain 1 at `−13`) settles this: chain 0 uses the fine-tune terms
+> exactly AS CONFIGURED (unnegated, i.e. `+StereoDetune`), chain 1 negates
+> the same trio. Engaging stereo mode therefore audibly shifts chain 0's own
+> pitch too, not merely adds a second, differently-tuned chain — implemented
+> that way throughout, and the G8.9 finding above (2) exists because this
+> reading was already correct.
+
 **Params landed: 50–52.**
 
 **Goal:** DESIGN.md §9. The second chain, the negated fine tunes, the linear pan
@@ -1438,7 +1594,7 @@ law, and the shared-modulation structure that keeps it under 2×.
 | G8.4 | **The pan law is linear and exact at both ends**: at `kStereoSpread = 0` each chain contributes gain exactly **0.5** to each output; at 50 the gains are exactly **0.75 / 0.25** (an L/R ratio of 9.54 dB); at 100 chain 0's right gain is exactly **0.0**. **Not equal-power** — see G8.2 | exact / 0.1 dB |
 | G8.5 | **Modulation is shared, not duplicated** ([PERF-5]): expose `getDebugEnvF()`/`getDebugEnvA()` per voice and assert there is exactly **one** value per voice, not one per chain; and that both chains' filter cutoffs are identical at every control block | exact |
 | G8.6 | **The mono sum is spread-invariant.** `gL + gR = 1.0` for each chain at every spread (G8.4), so with detune at 0 the mono sum `L + R` is **bit-identical at spread 0, 50 and 100**, and identical to mono mode. Assert this before G8.7 — it is what makes G8.7's bound meaningful rather than a hostage to the pan mapping | exact (`==`) |
-| G8.7 | **Detune's mono-sum cost is bounded on average, and the swing is recorded.** With `kStereoDetune = 6` cents, the **time-averaged** RMS of `L + R` over a 4 s sustained chord is within **1.5 dB** of mono mode's. **Record**, do not bound, the peak-to-trough swing — two chains detuned by ±d cents beat, and bounding that would be demanding that detuning not detune | 1.5 dB avg |
+| G8.7 | **Detune's mono-sum cost is bounded on average, and the swing is recorded.** With `kStereoDetune = 6` cents, the **time-averaged** RMS of `L + R` over a 4 s sustained chord is within **4.0 dB** of mono mode's (**R11-corrected from an original 1.5 dB — see the G8 status note**: because `gL+gR==1.0` per chain (G8.6), stereo's own `L+R` is exactly `contribution0 + contribution1`, while mono's is the SAME chain added coherently twice, `contribution0 + contribution0`; for any nonzero detune, averaged over several beat cycles, two DIFFERENT-frequency equal-amplitude signals summed carry exactly half the mean-square power of one signal coherently doubled — a **−3.01 dB floor**, independent of how small the detune is, that no correct implementation can avoid). **Record**, do not bound, the peak-to-trough swing — two chains detuned by ±d cents beat, and bounding that would be demanding that detuning not detune | 4.0 dB avg |
 | G8.8 | **Stereo costs less than 2×** ([PERF-5]): 8 voices, 48 k, best of 7 — stereo mode's ns/sample is ≤ **2.0×** mono mode's. Record the actual ratio; the shared-modulation structure should put it near 1.85 | 2.0× |
 | G8.9 | **Switching `kStereoMode` mid-note does not click**: max envelope delta ≤ 1 dB per ms across the switch, both directions, no NaN. And **`GoldenParityG5` still passes** with `kStereoMode = Off` and the HPF bypassed (R1) | 1 dB/ms, 1e-6 |
 

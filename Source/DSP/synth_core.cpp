@@ -40,21 +40,34 @@ void SynthCore::init(float sampleRate) {
     // synth_core.h's own G7 top-of-file note), so they need their
     // sample-rate-dependent state prepared here too, once, in init() (R3:
     // never in process()).
+    // G8: BOTH chain slots (DESIGN.md §9) get their sample-rate-dependent
+    // state prepared here, unconditionally -- chain[1] is only ever STEPPED
+    // in the audio-rate loop while kStereoMode is on, but it is always
+    // CONSTRUCTED (R3), so it must be just as sample-rate-ready as chain[0]
+    // the instant stereo mode is switched on, mid-note or otherwise.
     for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
-        mVoices[i].osc1.setSampleRate(sampleRate);
-        mVoices[i].osc2.setSampleRate(sampleRate);
-        // [dsp] Mixer DC blocker at 5 Hz -- the same corner nassau-zermatt
-        // uses for its coupling-cap models, and far enough below the lowest
-        // musical fundamental (16' at MIDI 0 is 4.1 Hz, but no envelope
-        // sustains a note that low audibly) to be transparent in band.
-        // DESIGN.md §4.
-        mVoices[i].dcBlock.setFc(5.0, sampleRate);
-        mVoices[i].postLpfDcBlock.setFc(5.0, sampleRate);
+        for (int c = 0; c < Voice::kNumChains; ++c) {
+            Voice::Chain& ch = mVoices[i].chain[c];
+            ch.osc1.setSampleRate(sampleRate);
+            ch.osc2.setSampleRate(sampleRate);
+            // [dsp] Mixer DC blocker at 5 Hz -- the same corner nassau-zermatt
+            // uses for its coupling-cap models, and far enough below the lowest
+            // musical fundamental (16' at MIDI 0 is 4.1 Hz, but no envelope
+            // sustains a note that low audibly) to be transparent in band.
+            // DESIGN.md §4.
+            ch.dcBlock.setFc(5.0, sampleRate);
+            ch.postLpfDcBlock.setFc(5.0, sampleRate);
+        }
     }
     // [dsp] G6: the THIRD (final-output) DC blocker -- see its own field
     // comment in synth_core.h for why it exists. Same 5Hz corner as the
-    // other two (DESIGN.md §4/§11), for the identical reason.
-    mOutputDcBlock.setFc(5.0, sampleRate);
+    // other two (DESIGN.md §4/§11), for the identical reason. G8: now ONE
+    // PER CHANNEL (mOutputDcBlock[0]==L, [1]==R) -- see mOutputDcBlock's own
+    // field comment for why a single shared instance stopped being correct
+    // once L and R can carry genuinely different content (DESIGN.md §9).
+    for (int ch = 0; ch < 2; ++ch) {
+        mOutputDcBlock[ch].setFc(5.0, sampleRate);
+    }
 
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
     // G7: kMaxVoices+kNumFadeSlots is already a fixed-size array (synth_core.h).
@@ -70,31 +83,38 @@ void SynthCore::reset() {
     mControlPhase = 0;
 
     for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
-        mVoices[i].dcBlock.reset();
-        mVoices[i].postLpfDcBlock.reset();
         Voice& v = mVoices[i];
-        v.osc1.reset();   // full reset (phase + triangle integrator state) --
-        v.osc2.reset();   // distinct from the PHASE-ONLY resetPhase() a note-on
-                           // uses (DESIGN.md §3.2), see applyEvent()'s comment.
-        v.sub.reset();
-        v.noise.init(i);  // [dsp] DESIGN.md §3.5/R8/R13: seeded from voice index
+        // G8: BOTH chain slots reset unconditionally (DESIGN.md §9) -- see
+        // init()'s own comment on why chain[1] must stay reset-ready even
+        // while kStereoMode is off.
+        for (int c = 0; c < Voice::kNumChains; ++c) {
+            Voice::Chain& ch = v.chain[c];
+            ch.dcBlock.reset();
+            ch.postLpfDcBlock.reset();
+            ch.osc1.reset();   // full reset (phase + triangle integrator state) --
+            ch.osc2.reset();   // distinct from the PHASE-ONLY resetPhase() a note-on
+                               // uses (DESIGN.md §3.2), see applyEvent()'s comment.
+            ch.sub.reset();
+            ch.lpfLadder.reset();  // G5: both structures exist per chain regardless of kLpfSlope
+            ch.lpfSvf.reset();     // (DESIGN.md §5.1 [PERF-8] crossfade), so both must reset here.
+            ch.hpf.reset();        // G6: DESIGN.md §5.5
+            ch.gHpfCur = 0.0;
+            ch.gHpfStep = 0.0;
+            ch.debugMixOut = 0.0;
+            ch.debugDriveOut = 0.0;
+            ch.debugHpfOut = 0.0;
+            ch.lastLpfOutput = 0.0;
+            ch.gLpfLadderCur = 0.0;
+            ch.gLpfLadderStep = 0.0;
+            ch.gLpfSvfCur = 0.0;
+            ch.gLpfSvfStep = 0.0;
+        }
+        v.noise.init(i);  // [dsp] DESIGN.md §3.5/R8/R13: seeded from voice index; ONE
+                           // generator per voice, shared by both chains -- not reset per chain.
         v.envF.reset();
         v.envA.reset();
-        v.lpfLadder.reset();  // G5: both structures exist per voice regardless of kLpfSlope
-        v.lpfSvf.reset();     // (DESIGN.md §5.1 [PERF-8] crossfade), so both must reset here.
-        v.hpf.reset();        // G6: DESIGN.md §5.5
-        v.gHpfCur = 0.0;
-        v.gHpfStep = 0.0;
-        v.debugMixOut = 0.0;
-        v.debugDriveOut = 0.0;
-        v.debugHpfOut = 0.0;
         v.debugHpfCutoffHz = 0.0;
-        v.lastLpfOutput = 0.0;
         v.debugLpfCutoffHz = 0.0;
-        v.gLpfLadderCur = 0.0;
-        v.gLpfLadderStep = 0.0;
-        v.gLpfSvfCur = 0.0;
-        v.gLpfSvfStep = 0.0;
         v.note = -1;
         v.vcaGainStart = 0.0;
         v.vcaGainEnd = 0.0;
@@ -119,7 +139,10 @@ void SynthCore::reset() {
     mHeldVoiceCount = 0;
     mLfo.init(kLfoShSeed);  // [dsp] R8/R13: fixed S&H seed; Lfo::init() also resets phase/delay
     mLastLfoValue = 0.0;
-    mOutputDcBlock.reset();  // G6: see its own field comment in synth_core.h
+    // G6/G8: one instance per channel now -- see mOutputDcBlock's own field
+    // comment in synth_core.h.
+    mOutputDcBlock[0].reset();
+    mOutputDcBlock[1].reset();
 
     // ---- G7: allocator/performance-control reset (DESIGN.md §11 "Reset
     // semantics": clears state, never touches a parameter) ----
@@ -152,6 +175,21 @@ void SynthCore::reset() {
     // pre-reset cache.
     mHpfBypassed = mHpfCutoffHz.load(std::memory_order_relaxed) <= kHpfCutoffMinHz;
     mHpfNumPoles = (mHpfSlope.load(std::memory_order_relaxed) == static_cast<int>(HpfSlope::Db24)) ? 4 : 2;
+
+    // G8.9 (DESIGN.md §9): see the field comments in synth_core.h.
+    // `mControlRateEverRun = false` is what makes the FIRST control block
+    // after this reset() SNAP mChain1Active/mStereoBlend from whatever
+    // kStereoMode currently is, with no ramp -- exactly like
+    // mLpfSlopeSettled/mHpfBypassed just above, a reset() must not leave
+    // stale state that spuriously looks like a "mid-note toggle" on the very
+    // next control block.
+    mControlRateEverRun = false;
+    mChain1Active = false;
+    mStereoBlend = 0.0;
+    mEffPanGainL0 = 1.0;
+    mEffPanGainR0 = 1.0;
+    mEffPanGainL1 = 0.0;
+    mEffPanGainR1 = 0.0;
 
     mPendingCount = 0;
 
@@ -273,7 +311,17 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                                          static_cast<double>(std::max(1, mLpfCrossfadeSamplesTotal)))
                     : 0.0;
 
-            double mixSum = 0.0;
+            double mixSumL = 0.0, mixSumR = 0.0;
+            // G8 (DESIGN.md §9): the number of chains genuinely STEPPED this
+            // sample -- 1 in mono mode, 2 in stereo mode (or still 2 while
+            // `mStereoBlend` has not yet fully settled to 0 after a mid-note
+            // kStereoMode=off toggle, G8.9 -- see mStereoBlend's own field
+            // comment). A single, shared, CONTROL-RATE value (only changes
+            // once per control block, controlRateUpdate()), not a per-voice
+            // or per-sample-recomputed-from-atomics decision (mChain1Active/
+            // mStereoBlend are plain members, not atomics, R3/R12).
+            const bool chain1Needed = mChain1Active || mStereoBlend > 0.0;
+            const int numChains = chain1Needed ? 2 : 1;
             for (int vi = 0; vi < kMaxVoices + kNumFadeSlots; ++vi) {
                 Voice& v = mVoices[vi];
                 // G7: main-pool voices [0,kMaxVoices) skip on Idle (DESIGN.md
@@ -290,114 +338,186 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 const bool isMainPool = vi < kMaxVoices;
                 if (isMainPool ? (v.state == nassau_alloc::SlotState::Idle) : !v.fadeActive) continue;
 
-                const double prePhase1 = v.osc1.phase;
-                const auto r1 = v.osc1.step();
-                double y2 = v.osc2.step().y;
-                if (snapshot.osc2Sync && r1.wrapped) {
-                    y2 = v.osc2.hardSync(r1.wrapFrac / v.osc1.dt, y2);
-                }
-                const double ysub = v.sub.step(prePhase1, v.osc1.dt, r1.wrapped, true);
+                // G8 (DESIGN.md §3.5/§9 [PERF-5]): ONE noise draw per voice
+                // per sample, SHARED by every chain -- not one per chain.
+                // Drawing it here, once, before the per-chain loop below, and
+                // feeding the SAME value into both chains' mixer is what (a)
+                // keeps a mono-mode render's noise sequence identical to a
+                // stereo-mode render's (both draw exactly once per sample),
+                // and (b) is one of the two things G8.2's bit-identity check
+                // depends on (the other being the linear pan law below) --
+                // an independently-seeded second draw per chain would
+                // desynchronise the RNG stream from mono mode's, and would
+                // also be a physically different (wider, hissier) sound
+                // DESIGN.md §3.5 explicitly rejects.
                 const double ynoise = v.noise.step(static_cast<NoiseSource::Color>(snapshot.noiseColor));
 
-                const double mixRaw = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
-                                                    snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
-                                                    ynoise, snapshot.noiseLevelPercent);
-                // DC blocker on the mixer output (DESIGN.md §4). A pulse of
-                // duty d carries DC of exactly (2d - 1); at PW=25% that is
-                // -0.50. Two mul + two add per sample per voice, and it must
-                // sit BEFORE the drive and the resonant filter, not at the
-                // output: DC into a saturator biases it into asymmetric
-                // clipping, which would make the timbre track pulse width in
-                // a way that is not the PWM sound anyone wants.
-                const double mix = v.dcBlock.process(mixRaw);
-                v.debugMixOut = mix;  // G6.7 test-only readback, see Voice::debugMixOut's comment
-
-                // G6 (DESIGN.md §1 step 7, §4): DRIVE sits between the
-                // mixer DC blocker and the HPF -- never after the filters
-                // (DESIGN.md §1's own "ordering constraints": "the mixer's
-                // summed level is what pushes it, exactly as in a real
-                // instrument where the VCA-input stage is what runs out of
-                // headroom first"). snapshot.drivePre/driveKnee are BLOCK-
-                // RATE derived constants (finishSnapshot(), R12) -- at
-                // Drive=0 they are EXACTLY 1.0/0.0, so this whole line is
-                // bit-exact identity (mix*1.0==mix, shapeTriodeK(x,0)==x,
-                // x/1.0==x, DESIGN.md §4's own "bit-exact identity" claim,
-                // docs/GATES.md G6.7).
-                const double driven = shapeTriodeK(mix * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
-                v.debugDriveOut = driven;  // G6.4 test-only readback, see Voice::debugDriveOut's comment
-
-                // G6 (DESIGN.md §1 step 8, §5.5): HPF, hard-bypassed at
-                // kHpfCutoff's minimum (DESIGN.md §5.5: "not a 20Hz filter
-                // -- an actual bypass"). mHpfBypassed/mHpfNumPoles are
-                // shared, instrument-wide, computed once per control block
-                // below (kHpfSlope/kHpfCutoff are single params, not
-                // per-voice) -- this is an ARCHITECTURAL skip (the whole
-                // HpfCascade call is never made), which is what makes the
-                // bypass path BIT-EXACT (docs/GATES.md G6.4) rather than
-                // merely "a very low corner". gHpfCur/Step is this voice's
-                // own per-sample gHpf interpolation (DESIGN.md §2's third
-                // interpolated quantity, alongside gLpf/vcaGain).
-                double hpfOut;
-                if (mHpfBypassed) {
-                    hpfOut = driven;
-                } else {
-                    v.hpf.advanceCoeff(v.gHpfCur);
-                    v.gHpfCur += v.gHpfStep;
-                    hpfOut = v.hpf.process(driven, mHpfNumPoles);
-                }
-                v.debugHpfOut = hpfOut;  // G6.4 test-only readback, see Voice::debugHpfOut's comment
-
-                // G5 (DESIGN.md §1 step 9, §5): the LPF is now GENUINELY IN
-                // THE SIGNAL PATH -- the interaction G4's gate note flagged
-                // (wiring the SVF's causal, previous-control-block Reff into
-                // a real periodic voice signal broke G3.12's "no DC" bound,
-                // measured up to -7.96e-4) no longer applies: the mixer DC
-                // blocker just above now sits BEFORE this stage (it did not
-                // yet exist in that form when G4's attempt was made), so the
-                // filter's own input is already DC-free (DESIGN.md §4.1
-                // measures 1e-9..1e-10 residual at every duty).
-                //
-                // That is NOT sufficient on its own, and an earlier version of
-                // this comment wrongly claimed it was. A DC-free INPUT does not
-                // give a DC-free OUTPUT here: both structures' feedback
-                // saturators are odd functions, and an odd function fed a
-                // zero-mean but not half-wave-symmetric signal re-introduces a
-                // nonzero time-average. Measured with only the mixer blocker:
-                // 2.3e-2 DC / 3.69 peak at {SVF, res 99%, PW 30%, fc 500 Hz},
-                // against a 1e-4 bound -- while a symmetric 50% pulse at the
-                // same resonance gave 1.5e-6, which is what identifies the
-                // mechanism. Hence postLpfDcBlock below (DESIGN.md §5.6).
-                double lpfOut;
-                if (mLpfCrossfadeActive) {
-                    const double yFrom = runLpfStructure(v, mLpfCrossfadeFromSlope, hpfOut);
-                    const double yTo = runLpfStructure(v, mLpfCrossfadeToSlope, hpfOut);
-                    lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
-                } else {
-                    lpfOut = runLpfStructure(v, mLpfSlopeSettled, hpfOut);
-                }
-                v.lastLpfOutput = lpfOut;
-                lpfOut = v.postLpfDcBlock.process(lpfOut);
-
+                // G8 (DESIGN.md §2's third interpolated scalar, vcaGain):
+                // SHARED across chains ([PERF-5], ENV-A is one Voice-level
+                // field, not per-chain) -- computed ONCE per sample here,
+                // used identically by every chain's contribution below.
                 const double gain = mDebugDisableVcaInterpolation
                                          ? v.vcaGainEnd
                                          : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
 
-                // G7 (DESIGN.md §10.4): `fadeGainCur` is 1.0, permanently,
-                // for every main-pool voice (never written outside the fade
-                // branch below), so this multiply is a bit-exact IEEE-754
-                // identity (x*1.0==x) there -- it only actually attenuates a
-                // fade slot's copied signal. Plain multiply, R12-legal.
-                const double contribution = lpfOut * gain * v.fadeGainCur;
-                mixSum += contribution;
+                // G8: this voice's per-CHANNEL contribution this sample,
+                // panned per DESIGN.md §9's linear law (snapshot.panGainL0/
+                // R0/L1/R1, computed once per host block, finishSnapshot()).
+                // In mono mode (numChains==1) only chain 0 runs and
+                // panGainL0==panGainR0==1.0 exactly, so voiceL==voiceR
+                // bit-for-bit -- G8.1.
+                double voiceL = 0.0, voiceR = 0.0;
+                double peakThisSample = 0.0;
+                for (int c = 0; c < numChains; ++c) {
+                    Voice::Chain& ch = v.chain[c];
+
+                    const double prePhase1 = ch.osc1.phase;
+                    const auto r1 = ch.osc1.step();
+                    double y2 = ch.osc2.step().y;
+                    if (snapshot.osc2Sync && r1.wrapped) {
+                        y2 = ch.osc2.hardSync(r1.wrapFrac / ch.osc1.dt, y2);
+                    }
+                    const double ysub = ch.sub.step(prePhase1, ch.osc1.dt, r1.wrapped, true);
+
+                    const double mixRaw = MixerBlock::mix(r1.y, snapshot.osc1LevelPercent, y2,
+                                                        snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
+                                                        ynoise, snapshot.noiseLevelPercent);
+                    // DC blocker on the mixer output (DESIGN.md §4). A pulse of
+                    // duty d carries DC of exactly (2d - 1); at PW=25% that is
+                    // -0.50. Two mul + two add per sample per chain, and it must
+                    // sit BEFORE the drive and the resonant filter, not at the
+                    // output: DC into a saturator biases it into asymmetric
+                    // clipping, which would make the timbre track pulse width in
+                    // a way that is not the PWM sound anyone wants. G8: this
+                    // chain's OWN dcBlock instance (Voice::Chain), never shared
+                    // with the other chain -- see Voice::Chain::dcBlock's own
+                    // comment for why a shared instance would be wrong.
+                    const double mix = ch.dcBlock.process(mixRaw);
+                    ch.debugMixOut = mix;  // G6.7/G8 test-only readback, see Voice::Chain::debugMixOut
+
+                    // G6 (DESIGN.md §1 step 7, §4): DRIVE sits between the
+                    // mixer DC blocker and the HPF -- never after the filters
+                    // (DESIGN.md §1's own "ordering constraints": "the mixer's
+                    // summed level is what pushes it, exactly as in a real
+                    // instrument where the VCA-input stage is what runs out of
+                    // headroom first"). snapshot.drivePre/driveKnee are BLOCK-
+                    // RATE derived constants (finishSnapshot(), R12), SHARED by
+                    // both chains (kDrive is one instrument-wide param, not
+                    // per-chain) -- at Drive=0 they are EXACTLY 1.0/0.0, so this
+                    // whole line is bit-exact identity (mix*1.0==mix,
+                    // shapeTriodeK(x,0)==x, x/1.0==x, DESIGN.md §4's own
+                    // "bit-exact identity" claim, docs/GATES.md G6.7).
+                    // shapeTriodeK itself is memoryless (no per-chain STATE to
+                    // duplicate), so sharing snapshot.drivePre/driveKnee here
+                    // is not a shortcut -- it is simply what "shared params,
+                    // per-chain signal" means for a stateless stage.
+                    const double driven = shapeTriodeK(mix * snapshot.drivePre, snapshot.driveKnee) / snapshot.drivePre;
+                    ch.debugDriveOut = driven;  // G6.4/G8 test-only readback
+
+                    // G6 (DESIGN.md §1 step 8, §5.5): HPF, hard-bypassed at
+                    // kHpfCutoff's minimum (DESIGN.md §5.5: "not a 20Hz filter
+                    // -- an actual bypass"). mHpfBypassed/mHpfNumPoles are
+                    // shared, instrument-wide, computed once per control block
+                    // below (kHpfSlope/kHpfCutoff are single params, not
+                    // per-voice/per-chain) -- this is an ARCHITECTURAL skip (the
+                    // whole HpfCascade call is never made), which is what makes
+                    // the bypass path BIT-EXACT (docs/GATES.md G6.4) rather than
+                    // merely "a very low corner". gHpfCur/Step is THIS CHAIN's
+                    // own per-sample gHpf interpolation (DESIGN.md §2's third
+                    // interpolated quantity, alongside gLpf/vcaGain) -- both
+                    // chains' HPF `g` targets are fed the SAME already-modulated
+                    // Hz value (controlRateUpdate(), G8.5), but each chain's
+                    // HpfCascade is its own instance with its own state.
+                    double hpfOut;
+                    if (mHpfBypassed) {
+                        hpfOut = driven;
+                    } else {
+                        ch.hpf.advanceCoeff(ch.gHpfCur);
+                        ch.gHpfCur += ch.gHpfStep;
+                        hpfOut = ch.hpf.process(driven, mHpfNumPoles);
+                    }
+                    ch.debugHpfOut = hpfOut;  // G6.4/G8 test-only readback
+
+                    // G5 (DESIGN.md §1 step 9, §5): the LPF is now GENUINELY IN
+                    // THE SIGNAL PATH -- the interaction G4's gate note flagged
+                    // (wiring the SVF's causal, previous-control-block Reff into
+                    // a real periodic voice signal broke G3.12's "no DC" bound,
+                    // measured up to -7.96e-4) no longer applies: the mixer DC
+                    // blocker just above now sits BEFORE this stage (it did not
+                    // yet exist in that form when G4's attempt was made), so the
+                    // filter's own input is already DC-free (DESIGN.md §4.1
+                    // measures 1e-9..1e-10 residual at every duty).
+                    //
+                    // That is NOT sufficient on its own, and an earlier version of
+                    // this comment wrongly claimed it was. A DC-free INPUT does not
+                    // give a DC-free OUTPUT here: both structures' feedback
+                    // saturators are odd functions, and an odd function fed a
+                    // zero-mean but not half-wave-symmetric signal re-introduces a
+                    // nonzero time-average. Measured with only the mixer blocker:
+                    // 2.3e-2 DC / 3.69 peak at {SVF, res 99%, PW 30%, fc 500 Hz},
+                    // against a 1e-4 bound -- while a symmetric 50% pulse at the
+                    // same resonance gave 1.5e-6, which is what identifies the
+                    // mechanism. Hence postLpfDcBlock below (DESIGN.md §5.6). G8:
+                    // this chain's OWN postLpfDcBlock instance, same reasoning as
+                    // dcBlock above -- G8's own DC measurement (see the gate
+                    // report) confirms a shared blocker across two detuned
+                    // chains was NOT accidentally introduced here.
+                    double lpfOut;
+                    if (mLpfCrossfadeActive) {
+                        const double yFrom = runLpfStructure(ch, mLpfCrossfadeFromSlope, hpfOut);
+                        const double yTo = runLpfStructure(ch, mLpfCrossfadeToSlope, hpfOut);
+                        lpfOut = yFrom * (1.0 - crossfadeT) + yTo * crossfadeT;
+                    } else {
+                        lpfOut = runLpfStructure(ch, mLpfSlopeSettled, hpfOut);
+                    }
+                    ch.lastLpfOutput = lpfOut;
+                    lpfOut = ch.postLpfDcBlock.process(lpfOut);
+
+                    // G7 (DESIGN.md §10.4): `fadeGainCur` is 1.0, permanently,
+                    // for every main-pool voice (never written outside the fade
+                    // branch below), so this multiply is a bit-exact IEEE-754
+                    // identity (x*1.0==x) there -- it only actually attenuates a
+                    // fade slot's copied signal. `gain` (vcaGain*velocity) is
+                    // SHARED across chains (computed once above, [PERF-5]).
+                    // Plain multiply, R12-legal.
+                    const double contribution = lpfOut * gain * v.fadeGainCur;
+
+                    // DESIGN.md §9 PAN: linear law. Chain 0 uses
+                    // mEffPanGainL0/R0, chain 1 uses mEffPanGainL1/R1 --
+                    // these are the CONTROL-RATE-updated effective gains
+                    // (SynthCore::controlRateUpdate(), G8.9's mono<->stereo
+                    // blend), EXACTLY equal to snapshot.panGainL0/R0/L1/R1
+                    // whenever `mStereoBlend`==1.0 (the ordinary,
+                    // continuously-stereo case, G8.1/G8.2/G8.4/G8.6/G8.7/
+                    // G8.8's own scenario) or to the mono law {1,1,0,0}
+                    // whenever `mStereoBlend`==0.0 -- G8.4's exact-at-every-
+                    // spread property and G8.6's gL+gR==1.0 both still hold
+                    // bit-exactly in that settled state; only a genuine
+                    // MID-NOTE toggle sees a value strictly between.
+                    if (c == 0) {
+                        voiceL += contribution * mEffPanGainL0;
+                        voiceR += contribution * mEffPanGainR0;
+                    } else {
+                        voiceL += contribution * mEffPanGainL1;
+                        voiceR += contribution * mEffPanGainR1;
+                    }
+
+                    const double absContribution = contribution < 0.0 ? -contribution : contribution;
+                    if (absContribution > peakThisSample) peakThisSample = absContribution;
+                }
+                mixSumL += voiceL;
+                mixSumR += voiceR;
 
                 // G7/DESIGN.md §10.7 [PERF-7]: track this voice's own peak
-                // |contribution| over the control block IN PROGRESS (plain
+                // |contribution| (pre-pan, the larger of whichever chains ran
+                // this sample) over the control block IN PROGRESS (plain
                 // fabs/max, no transcendental/atomic, R12) -- copied into
                 // `peakPrevBlock` at the next control-rate boundary
                 // (controlRateUpdate()), which is the quantity
-                // getDebugActiveVoiceCount() actually reads.
-                const double absContribution = contribution < 0.0 ? -contribution : contribution;
-                if (absContribution > v.curBlockPeakAccum) v.curBlockPeakAccum = absContribution;
+                // getDebugActiveVoiceCount() actually reads. Pre-pan is a
+                // deliberately conservative (never-smaller) bound: every pan
+                // gain is <= 1.0, so this never UNDER-counts an audible voice.
+                if (peakThisSample > v.curBlockPeakAccum) v.curBlockPeakAccum = peakThisSample;
 
                 // G7 (DESIGN.md §10.4): advance a live fade slot's own 2ms
                 // linear ramp by one sample and retire it the instant it
@@ -427,6 +547,7 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 }
             }
 
+
             // G6 (DESIGN.md §11 "Output stage"): master volume then output
             // clip, applied to the SUMMED voice accumulator -- "post-
             // summation and post-master, so it limits the stack, not the
@@ -434,10 +555,18 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
             // snapshot.masterVolumeLinear is a BLOCK-RATE derived constant
             // (finishSnapshot(), R12); shapeCubic() itself is pure
             // arithmetic (no transcendental), so it is audio-rate legal
-            // (same category as shapeTriodeK above).
-            double outSample = mixSum * snapshot.masterVolumeLinear;
+            // (same category as shapeTriodeK above). G8: now applied
+            // INDEPENDENTLY to mixSumL/mixSumR -- see mOutputDcBlock's own
+            // field comment for the "G8 decision" this codifies. In mono
+            // mode mixSumL==mixSumR bit-exact (established above), both
+            // branches below run the IDENTICAL scalar math on IDENTICAL
+            // inputs, so outL[n+i]==outR[n+i] bit-exact (G8.1) even though
+            // each channel now goes through its OWN mOutputDcBlock[] instance.
+            double outSampleL = mixSumL * snapshot.masterVolumeLinear;
+            double outSampleR = mixSumR * snapshot.masterVolumeLinear;
             if (snapshot.outputClip) {
-                outSample = shapeCubic(outSample, 2.0);  // [dsp] DESIGN.md §11, L=2.0 -> +6dBFS ceiling
+                outSampleL = shapeCubic(outSampleL, 2.0);  // [dsp] DESIGN.md §11, L=2.0 -> +6dBFS ceiling
+                outSampleR = shapeCubic(outSampleR, 2.0);
                 // G6 finding (see mOutputDcBlock's own field comment): the
                 // clip just above is an odd nonlinearity with nothing
                 // downstream to remove the DC it can re-introduce from a
@@ -450,10 +579,11 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                 // gating it this way is what keeps kOutputClip=off a
                 // bit-exact passthrough of the master-scaled sum (DESIGN.md
                 // §11, docs/GATES.md G6.12).
-                outSample = mOutputDcBlock.process(outSample);
+                outSampleL = mOutputDcBlock[0].process(outSampleL);
+                outSampleR = mOutputDcBlock[1].process(outSampleR);
             }
-            outL[n + i] = static_cast<float>(outSample);
-            outR[n + i] = static_cast<float>(outSample);
+            outL[n + i] = static_cast<float>(outSampleL);
+            outR[n + i] = static_cast<float>(outSampleR);
         }
         // ---- AUDIO-RATE LOOP END ----
 
@@ -589,6 +719,53 @@ void SynthCore::finishSnapshot(ParamSnapshot& s, double fsControl) {
     // block)", G7.10) -- and matches AdsrEnv's own "y += coeff*(target-y)"
     // stepping convention used throughout this class (controlRateUpdate()).
     s.glideStepCoeff = AdsrEnv::coeffForMs(static_cast<double>(s.glideTimeMs), AdsrEnv::decayDivisor(), fsControl);
+
+    // [dsp] G8/DESIGN.md §9: the linear pan law, verbatim. kStereoSpread is a
+    // single instrument-wide param (not per-voice, not per-chain, not
+    // modulated by anything), so -- like drivePre/driveKnee/masterVolumeLinear
+    // above -- its derived gains are computed ONCE per host block here, not
+    // per control block or per sample (pure add/mul, no transcendental --
+    // R12 would be satisfied either way, but there is no reason to redo this
+    // more than once per block). s = Spread/100; chain 0: gL=0.5+0.5s,
+    // gR=0.5-0.5s; chain 1: gL=0.5-0.5s, gR=0.5+0.5s. Deliberately written as
+    // PLAIN 0.5 +/- (0.5*s) -- never as `1.0 - gR` or any other reconstruction
+    // -- so that `0.5*x + 0.5*x == x` bit-exactly (IEEE-754: halving and
+    // doubling are both exact) at s==0, which is what DESIGN.md §9's/
+    // docs/GATES.md G8.2's mono/stereo bit-identity property is built on, and
+    // so that gL+gR==1.0 EXACTLY at every spread (G8.6 -- verified over a
+    // fine grid of spread values as part of this gate's own testing, not
+    // merely at the three named checkpoints 0/50/100).
+    // G8.9 R11 FINDING: this used to branch on `s.stereoMode` (spread law
+    // when on, hardcoded mono law {1,1,0,0} when off) -- but
+    // SynthCore::controlRateUpdate()'s mono<->stereo BLEND (mStereoBlend,
+    // mEffPanGainL0/R0/L1/R1) needs `s.panGainL0/R0/L1/R1` to always hold
+    // the TRUE SPREAD-LAW TARGET, not a value that has ALREADY collapsed to
+    // the mono law the instant `stereoMode` goes false -- otherwise, on a
+    // mid-note kStereoMode=off toggle, the blend's own "target" (this
+    // snapshot's pan gains) becomes indistinguishable from its "mono"
+    // starting point on the VERY FIRST control block after the toggle, and
+    // no actual ramp ever happens (found by measurement: an earlier draft
+    // of this fix left G8.9's on->off direction at an UNCHANGED ~3.3dB/ms,
+    // identical to before the blend existed, because both sides of that
+    // blend were silently the same value). Always compute the spread law
+    // here; `mStereoBlend`==0.0 EXACTLY in steady mono mode is what zeroes
+    // its contribution out (0.0*x==0.0 for any finite x), which is what
+    // keeps G8.1's mono bit-identity unaffected by this change.
+    const double spread01 = std::clamp(static_cast<double>(s.stereoSpreadPercent), 0.0, 100.0) * 0.01;
+    const double halfSpread = 0.5 * spread01;  // exact: multiplying by 0.5 never rounds
+    s.panGainL0 = 0.5 + halfSpread;
+    s.panGainR0 = 0.5 - halfSpread;
+    s.panGainL1 = 0.5 - halfSpread;
+    s.panGainR1 = 0.5 + halfSpread;
+
+    // [dsp] G8.9: mStereoBlend's control-rate one-pole coefficient -- a
+    // PLAIN exponential approach (divisor 1.0, i.e. AdsrEnv::coeffForMs's
+    // own `tau = ms/divisor` collapses to `tau = kStereoBlendMs` exactly),
+    // not one of AdsrEnv's own overshoot-target-calibrated divisors (those
+    // are for the ENVELOPE's specific 1.15/100x/1.05-0.05 crossing
+    // conventions, DESIGN.md §6 -- this is a generic "reach the target
+    // asymptotically" ramp, no overshoot semantics at all).
+    s.stereoBlendCoeff = AdsrEnv::coeffForMs(kStereoBlendMs, 1.0, fsControl);
 }
 
 // ===== G7: event application (DESIGN.md §10.1/§10.3-§10.6) =====
@@ -687,9 +864,19 @@ void SynthCore::hardRetrigger(int mainPoolIndex, int note, float vel, const Para
     // blocker state is deliberately left running across a note-on, exactly
     // like a real analogue voice card's own capacitors do not discharge
     // between notes).
-    v.osc1.resetPhase();
-    v.osc2.resetPhase();
-    v.sub.reset();  // keep the sub's wrap-index counter consistent with osc1's fresh phase=0
+    // G8 (DESIGN.md §9): BOTH chains' oscillators reset unconditionally,
+    // regardless of whether kStereoMode is currently on. Chain 1 is only
+    // ever STEPPED in the audio-rate loop while stereo mode is on, but
+    // resetting it here too means it is always at a clean, deterministic
+    // phase=0 the instant stereo mode is toggled on for an already-sounding
+    // voice -- never a stale phase left over from whatever it was doing (or
+    // not doing) the last time it ran. Cheap: this runs once per note-on,
+    // not per sample.
+    for (int c = 0; c < Voice::kNumChains; ++c) {
+        v.chain[c].osc1.resetPhase();
+        v.chain[c].osc2.resetPhase();
+        v.chain[c].sub.reset();  // keep the sub's wrap-index counter consistent with osc1's fresh phase=0
+    }
     // Noise is deliberately NOT reset at note-on (only reset()/init()
     // reseed it) -- a real analogue noise source runs continuously;
     // DESIGN.md/R13 only require voice-index seeding at init()/reset().
@@ -1002,6 +1189,44 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
     mHpfBypassed = snapshot.hpfCutoffHz <= kHpfCutoffMinHz;
     mHpfNumPoles = (snapshot.hpfSlope == static_cast<int>(HpfSlope::Db24)) ? 4 : 2;
 
+    // G8.9 (DESIGN.md §9, synth_core.h's own field comments): detect a
+    // GENUINE mid-note kStereoMode toggle and retarget the mono<->stereo
+    // pan-law blend, ONCE per control block, shared by every voice --
+    // exactly like the LPF slope crossfade's own startingLpfCrossfade
+    // detection above. `mControlRateEverRun` distinguishes "stereo mode was
+    // already configured before the first process() call" (snap instantly,
+    // no ramp -- required for G8.2/G8.4/G8.6's bit-exactness) from an
+    // actual runtime toggle. `mStereoBlend` itself is a control-rate
+    // one-pole (see its own field comment for the exponential-vs-linear
+    // reasoning): it keeps stepping toward WHATEVER `mChain1Active` says
+    // right now every block, so re-toggling mid-ramp simply retargets it
+    // from its current position, no special-casing needed.
+    if (!mControlRateEverRun) {
+        mControlRateEverRun = true;
+        mChain1Active = snapshot.stereoMode;
+        mStereoBlend = mChain1Active ? 1.0 : 0.0;
+    } else {
+        mChain1Active = snapshot.stereoMode;
+        const double target = mChain1Active ? 1.0 : 0.0;
+        mStereoBlend += snapshot.stereoBlendCoeff * (target - mStereoBlend);
+    }
+    // The EFFECTIVE pan gains the audio-rate loop actually multiplies by
+    // (process(), G8.9): interpolate between the MONO law {1,1,0,0} and the
+    // snapshot's own exact TARGET stereo law -- bit-exact identity at
+    // mStereoBlend==0.0 or ==1.0 (x*1.0==x, x+0.0==x), see mStereoBlend's
+    // own field comment for the full argument.
+    mEffPanGainL0 = (1.0 - mStereoBlend) * 1.0 + mStereoBlend * snapshot.panGainL0;
+    mEffPanGainR0 = (1.0 - mStereoBlend) * 1.0 + mStereoBlend * snapshot.panGainR0;
+    mEffPanGainL1 = (1.0 - mStereoBlend) * 0.0 + mStereoBlend * snapshot.panGainL1;
+    mEffPanGainR1 = (1.0 - mStereoBlend) * 0.0 + mStereoBlend * snapshot.panGainR1;
+
+    // Chain 1 needs a full control-rate prep (pitch, filter coefficients)
+    // whenever it is either the logical target OR the blend has not yet
+    // fully settled back to 0 after a mid-note "off" toggle -- SAME
+    // predicate the audio-rate loop uses (below, process()) to decide
+    // whether to STEP it this block.
+    const bool chain1NeededThisBlock = mChain1Active || mStereoBlend > 0.0;
+
     int activeCount = 0;  // G7.14/PERF-7: recomputed fresh every control block, see the loop body below
     for (int i = 0; i < kMaxVoices + kNumFadeSlots; ++i) {
         Voice& v = mVoices[i];
@@ -1068,9 +1293,16 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
 
         v.debugLfoPitchModSemis = lfoPitchModSemis;
 
-        v.osc1.wave = static_cast<Osc::Wave>(snapshot.osc1Wave);
-        v.osc2.wave = static_cast<Osc::Wave>(snapshot.osc2Wave);
-        v.sub.octave = static_cast<SubOsc::Octave>(snapshot.subOctave);
+        // G8 (DESIGN.md §9 [PERF-5]): number of chains genuinely prepared
+        // this control block -- SAME predicate as the audio-rate loop's own
+        // `numChains` (process()), so a chain that is not stepped in the
+        // audio-rate loop is not given stale/wasted control-rate work either
+        // (DESIGN.md's own "run only when kStereoMode is on"). G8.9:
+        // `chain1NeededThisBlock` (not the raw `snapshot.stereoMode`) is what
+        // keeps chain 1 getting real pitch/filter updates throughout its 2ms
+        // fade-out tail after a mid-note kStereoMode=off toggle, instead of
+        // freezing mid-ramp.
+        const int numChains = chain1NeededThisBlock ? 2 : 1;
 
         // [voicing] kOsc2KeyTrack off -> VCO2 ignores the played note and
         // sits at a fixed reference pitch (note 60, middle C) instead --
@@ -1078,7 +1310,9 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // behaviour; this is the conventional Prophet/Jupiter-family reading
         // of an oscillator "key track" switch (a fixed-pitch drone/FM-
         // operator use case), and no G3 AC exercises it either way. Flagged
-        // per R11 as a decision the plan did not cover.
+        // per R11 as a decision the plan did not cover. SHARED across chains
+        // (DESIGN.md §9 [PERF-5]: glide is one of the shared terms) --
+        // computed ONCE, outside the per-chain loop below.
         const double noteForOsc2 = snapshot.osc2KeyTrack ? v.glideCurrentSemis : 60.0;
 
         // [ref] DESIGN.md §8 [PERF-6]: Poly-Mod, control-rate only.
@@ -1087,53 +1321,22 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // bipolar, +/-45% at 100%. `v.envF.y` is this SAME control step's
         // freshly-advanced ENV-F value (v.envF.step() ran a few lines above,
         // matching the way lfoPitchModSemis/lfoPwmModPercent above already
-        // reuse this control block's freshly-stepped LFO value).
+        // reuse this control block's freshly-stepped LFO value). SHARED
+        // across chains ([PERF-5]: ENV-F is one Voice-level field) --
+        // computed ONCE, outside the per-chain loop below.
         const double pmOsc2Semis =
             (static_cast<double>(snapshot.pmEnvFToOsc2Percent) * 0.01) * 24.0 * v.envF.y;
         const double pmPwModPercent =
             (static_cast<double>(snapshot.pmEnvFToPwPercent) * 0.01) * 45.0 * v.envF.y;
 
-        // DESIGN.md §3.2: semitones = note + bend*BendRange + glide +
-        // octave*12 + semi + fine/100 + lfoPitch + pmEnvFToOsc2 (VCO2 only).
-        // `v.glideCurrentSemis` IS the glide-smoothed "note" term (this
-        // struct field's own comment); `mBendSemis` (G7.9) and
-        // `v.unisonDetuneCents/100` (G7.13, Unison only, 0 otherwise) are
-        // APPENDED after the original G3-G6 term order rather than
-        // interleaved, and are EXACTLY 0.0 outside Unison/bend use --
-        // appending an exact +0.0 to a finite sum is a bit-exact IEEE-754
-        // identity, which is what keeps every existing G0-G6 test/golden
-        // case (no bend, no Unison) bit-for-bit unchanged (G7 gate report).
-        const double osc1Semis = v.glideCurrentSemis + lfoPitchModSemis +
-                                  octaveOffsetSemis(static_cast<Octave>(snapshot.osc1Octave)) +
-                                  static_cast<double>(snapshot.osc1FineCents) * 0.01 +
-                                  mBendSemis + v.unisonDetuneCents * 0.01;
-        const double osc2Semis = noteForOsc2 + lfoPitchModSemis + pmOsc2Semis +
-                                  octaveOffsetSemis(static_cast<Octave>(snapshot.osc2Octave)) +
-                                  static_cast<double>(snapshot.osc2Semi) +
-                                  static_cast<double>(snapshot.osc2FineCents) * 0.01 +
-                                  mBendSemis + v.unisonDetuneCents * 0.01;
-
-        // [dsp] DESIGN.md §3.2: f = 440 * 2^((semitones-69)/12), phaseInc clamped to 0.49.
-        const double f1 = 440.0 * std::exp2((osc1Semis - 69.0) / 12.0);
-        const double f2 = 440.0 * std::exp2((osc2Semis - 69.0) / 12.0);
-        v.osc1.setDt(std::clamp(f1 / std::max(fs, 1.0), 0.0, 0.49));
-        v.osc2.setDt(std::clamp(f2 / std::max(fs, 1.0), 0.0, 0.49));
-
-        v.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent + pmPwModPercent);
-        v.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent + pmPwModPercent);
-
-        // G5.4: THIS voice's own most recent LPF output seeds the incoming
-        // structure -- each voice carries a different signal, so each needs
-        // its own seed (the shared crossfade TIMING above is instrument-wide,
-        // this per-voice STATE seeding is not).
-        if (startingLpfCrossfade) {
-            if (mLpfCrossfadeToSlope == static_cast<int>(LpfSlope::Db24)) {
-                v.lpfLadder.seedFromOutput(v.lastLpfOutput);
-            } else {
-                v.lpfSvf.seedFromOutput(v.lastLpfOutput);
-            }
-        }
-
+        // G8 (DESIGN.md §5.4/§9 [PERF-5]): the LPF's modulated+clamped
+        // cutoff (key follow, ENV-F, LFO, velocity -- all SHARED terms) is
+        // computed ONCE PER VOICE here, not once per chain, and the SAME
+        // `lpfFcVoice` value below is fed to EVERY chain's own filter
+        // instance's setControlRate() call -- this is exactly what
+        // docs/GATES.md G8.5 asserts ("both chains' filter cutoffs are
+        // identical at every control block") and is stored in the single,
+        // un-indexed `v.debugLpfCutoffHz` field (Voice, not Voice::Chain).
         // [dsp] DESIGN.md §5.4, folded into ONE exp2 call per §2.1 ("write
         // them as one exp2 of a summed octave offset per filter, not one
         // per term"): key follow (referred to note 60), ENV-F (bipolar,
@@ -1149,11 +1352,27 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // G7.11 (DESIGN.md §11 kVelToFilter): velFilterOct==0.0 exactly at
         // vel==1.0 regardless of the percent setting (hardRetrigger()'s own
         // comment) -- appended exactly like osc1Semis/osc2Semis's own bend/
-        // unison terms above, for the identical bit-exactness reason.
+        // unison terms below, for the identical bit-exactness reason.
         const double lpfFcRaw = static_cast<double>(snapshot.lpfCutoffHz) *
                                  std::exp2(lpfKeyFollowOct + lpfEnvOct + lpfLfoOct + v.velFilterOct);
         const double lpfFcVoice = std::clamp(lpfFcRaw, 10.0, 0.45 * fs);
-        v.debugLpfCutoffHz = lpfFcVoice;  // G5.6 readback
+        v.debugLpfCutoffHz = lpfFcVoice;  // G5.6/G8.5 readback -- ONE value, not one per chain
+
+        // G8 (DESIGN.md §5.5/§9 [PERF-5]): same "computed once per voice"
+        // treatment for the HPF's modulated+clamped cutoff -- fc_hp =
+        // clamp(HpfCutoff * exp2(HpfKeyFollow/100 * (note-60)/12), 10,
+        // 0.45*fs). Only computed (and fed to each chain's own HpfCascade)
+        // when the HPF is NOT bypassed this control block.
+        double hpfFcVoice = 0.0;
+        if (!mHpfBypassed) {
+            const double hpfKeyFollowOct = (static_cast<double>(snapshot.hpfKeyFollowPercent) * 0.01) *
+                                            (v.glideCurrentSemis - 60.0) / 12.0;
+            const double hpfFcRaw = static_cast<double>(snapshot.hpfCutoffHz) * std::exp2(hpfKeyFollowOct);
+            hpfFcVoice = std::clamp(hpfFcRaw, 10.0, 0.45 * fs);
+            v.debugHpfCutoffHz = hpfFcVoice;  // G6.5/G8.5 readback -- ONE value, not one per chain
+        } else {
+            v.debugHpfCutoffHz = 0.0;  // G6.5: 0 while bypassed, matches this class's convention
+        }
 
         // DESIGN.md §2: gLpf (the coefficient `g` itself) is linearly
         // interpolated PER SAMPLE across the control block -- one of
@@ -1166,7 +1385,9 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // two. runLpfStructure() (synth_core.h) applies the interpolated
         // value via advanceCoeff() every sample (an audio-rate division,
         // deliberately, see synth_filter.h's own G5 comment) and advances
-        // it by this step afterward.
+        // it by this step afterward. `lpfFcVoice`/`lpfResonancePercent` are
+        // the SAME (voice-level, not chain-level) values for every chain
+        // this lambda is called with, matching G8.5.
         auto prepGInterp = [&](auto& filter, double& gCur, double& gStep) {
             const double gStart = filter.g;
             filter.setControlRate(lpfFcVoice, fs, lpfResonancePercent);
@@ -1174,40 +1395,117 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
             gCur = gStart;
         };
 
-        // DESIGN.md §5.1 [PERF-8]: only the currently-selected structure
-        // runs a control block's worth of coefficient recompute, EXCEPT
-        // during the 20ms crossfade, when BOTH must (G4's own gate note:
-        // "recompute both, unconditionally, every control block... G5 is
-        // where that becomes the live design").
-        if (mLpfCrossfadeActive) {
-            prepGInterp(v.lpfLadder, v.gLpfLadderCur, v.gLpfLadderStep);
-            prepGInterp(v.lpfSvf, v.gLpfSvfCur, v.gLpfSvfStep);
-        } else if (mLpfSlopeSettled == static_cast<int>(LpfSlope::Db24)) {
-            prepGInterp(v.lpfLadder, v.gLpfLadderCur, v.gLpfLadderStep);
-        } else {
-            prepGInterp(v.lpfSvf, v.gLpfSvfCur, v.gLpfSvfStep);
-        }
+        // G8 (DESIGN.md §9): the per-CHAIN loop -- everything that genuinely
+        // differs between chain 0 and chain 1: oscillator pitch (fine tunes
+        // + stereo detune, NEGATED for chain 1), and each chain's own
+        // filter/DC-blocker STATE (seeded/coefficient-prepped here from the
+        // SHARED lpfFcVoice/hpfFcVoice computed once above).
+        for (int c = 0; c < numChains; ++c) {
+            Voice::Chain& ch = v.chain[c];
 
-        // G6 (DESIGN.md §5.5): fc_hp = clamp(HpfCutoff * exp2(HpfKeyFollow/100
-        // * (note-60)/12), 10, 0.45*fs). Only recomputed (and the per-sample
-        // gHpf ramp only prepared) when the HPF is NOT bypassed this control
-        // block -- when bypassed, DESIGN.md §5.5's skip means nothing ever
-        // reads v.hpf's coefficients anyway (see process()'s own comment),
-        // matching the LPF's own "only the currently-selected structure gets
-        // prepGInterp" convention (DESIGN.md §5.1 [PERF-8]).
-        if (!mHpfBypassed) {
-            const double hpfKeyFollowOct = (static_cast<double>(snapshot.hpfKeyFollowPercent) * 0.01) *
-                                            (v.glideCurrentSemis - 60.0) / 12.0;
-            const double hpfFcRaw = static_cast<double>(snapshot.hpfCutoffHz) * std::exp2(hpfKeyFollowOct);
-            const double hpfFcVoice = std::clamp(hpfFcRaw, 10.0, 0.45 * fs);
-            v.debugHpfCutoffHz = hpfFcVoice;  // G6.5 readback
+            ch.osc1.wave = static_cast<Osc::Wave>(snapshot.osc1Wave);
+            ch.osc2.wave = static_cast<Osc::Wave>(snapshot.osc2Wave);
+            ch.sub.octave = static_cast<SubOsc::Octave>(snapshot.subOctave);
 
-            const double gHpfStart = v.hpf.g;
-            v.hpf.setControlRate(hpfFcVoice, fs);
-            v.gHpfStep = (v.hpf.g - gHpfStart) / static_cast<double>(std::max(1, mControlBlock));
-            v.gHpfCur = gHpfStart;
-        } else {
-            v.debugHpfCutoffHz = 0.0;  // G6.5: 0 while bypassed, matches this class's convention
+            // DESIGN.md §9: "fine tunings NEGATED when c == 1" -- Osc1Fine,
+            // Osc2Fine AND StereoDetune, all three (§9's own list). `chainSign`
+            // is +1.0 for chain 0 (used AS CONFIGURED, unchanged from every
+            // pre-G8 formula) and -1.0 for chain 1. The stereo-detune term is
+            // ADDED to both oscillators (like Unison's own per-voice detune
+            // just below it), so with Osc2Fine=+7 cents and StereoDetune=6
+            // cents, chain 0's VCO2 sits at +13 cents and chain 1's at -13
+            // (docs/GATES.md G8.3's own worked example) -- kStereoMode being
+            // ON therefore shifts chain 0's OWN pitch too, not merely
+            // introduces a second, differently-tuned chain.
+            //
+            // The `snapshot.stereoMode ? ... : 0.0` gate is load-bearing and
+            // NOT redundant with `numChains==1` in mono mode: chain 0 ALWAYS
+            // runs (mono or stereo), with chainSign==+1.0 either way -- so
+            // without this explicit gate, kStereoDetune's own nonzero DEFAULT
+            // (6 cents, DESIGN.md §11 param 51) would silently detune chain 0
+            // even in plain mono mode, the instant G8 landed. Found by exactly
+            // this: G3.9/G3.12's own pre-G8 pitch/DC ACs (mono, default
+            // params) broke against a ~220 Hz carrier reading ~219.75 Hz
+            // instead, the moment this gate's FIRST draft omitted the gate
+            // (R11) -- restored here. WITH the gate, mono mode's osc1Semis/
+            // osc2Semis are IDENTICAL (bit-exact +0.0) to every pre-G8
+            // formula, which is what G8.2's bit-identity argument (and every
+            // pre-G8 golden/unit test) depends on.
+            const double chainSign = (c == 0) ? 1.0 : -1.0;
+            const double stereoTermCents =
+                snapshot.stereoMode ? chainSign * static_cast<double>(snapshot.stereoDetuneCents) : 0.0;
+
+            // DESIGN.md §3.2: semitones = note + bend*BendRange + glide +
+            // octave*12 + semi + fine/100 + lfoPitch + pmEnvFToOsc2 (VCO2 only).
+            // `v.glideCurrentSemis` IS the glide-smoothed "note" term (this
+            // struct field's own comment); `mBendSemis` (G7.9),
+            // `v.unisonDetuneCents/100` (G7.13, Unison only, 0 otherwise) and
+            // `stereoTermCents/100` (G8, stereo only, 0 otherwise) are
+            // APPENDED after the original G3-G6 term order rather than
+            // interleaved, and are EXACTLY 0.0 outside Unison/bend/stereo use
+            // -- appending an exact +0.0 to a finite sum is a bit-exact
+            // IEEE-754 identity, which is what keeps every existing G0-G7
+            // test/golden case (no bend, no Unison, no stereo) bit-for-bit
+            // unchanged.
+            const double osc1Semis = v.glideCurrentSemis + lfoPitchModSemis +
+                                      octaveOffsetSemis(static_cast<Octave>(snapshot.osc1Octave)) +
+                                      chainSign * static_cast<double>(snapshot.osc1FineCents) * 0.01 +
+                                      mBendSemis + v.unisonDetuneCents * 0.01 + stereoTermCents * 0.01;
+            const double osc2Semis = noteForOsc2 + lfoPitchModSemis + pmOsc2Semis +
+                                      octaveOffsetSemis(static_cast<Octave>(snapshot.osc2Octave)) +
+                                      static_cast<double>(snapshot.osc2Semi) +
+                                      chainSign * static_cast<double>(snapshot.osc2FineCents) * 0.01 +
+                                      mBendSemis + v.unisonDetuneCents * 0.01 + stereoTermCents * 0.01;
+
+            // [dsp] DESIGN.md §3.2: f = 440 * 2^((semitones-69)/12), phaseInc clamped to 0.49.
+            const double f1 = 440.0 * std::exp2((osc1Semis - 69.0) / 12.0);
+            const double f2 = 440.0 * std::exp2((osc2Semis - 69.0) / 12.0);
+            ch.osc1.setDt(std::clamp(f1 / std::max(fs, 1.0), 0.0, 0.49));
+            ch.osc2.setDt(std::clamp(f2 / std::max(fs, 1.0), 0.0, 0.49));
+
+            ch.osc1.setPwPercent(static_cast<double>(snapshot.osc1PwPercent) + lfoPwmModPercent + pmPwModPercent);
+            ch.osc2.setPwPercent(static_cast<double>(snapshot.osc2PwPercent) + lfoPwmModPercent + pmPwModPercent);
+
+            // G5.4: THIS CHAIN's own most recent LPF output seeds the
+            // incoming structure -- each chain carries a different signal,
+            // so each needs its own seed (the shared crossfade TIMING above
+            // is instrument-wide, this per-chain STATE seeding is not).
+            if (startingLpfCrossfade) {
+                if (mLpfCrossfadeToSlope == static_cast<int>(LpfSlope::Db24)) {
+                    ch.lpfLadder.seedFromOutput(ch.lastLpfOutput);
+                } else {
+                    ch.lpfSvf.seedFromOutput(ch.lastLpfOutput);
+                }
+            }
+
+            // DESIGN.md §5.1 [PERF-8]: only the currently-selected structure
+            // runs a control block's worth of coefficient recompute, EXCEPT
+            // during the 20ms crossfade, when BOTH must (G4's own gate note:
+            // "recompute both, unconditionally, every control block... G5 is
+            // where that becomes the live design").
+            if (mLpfCrossfadeActive) {
+                prepGInterp(ch.lpfLadder, ch.gLpfLadderCur, ch.gLpfLadderStep);
+                prepGInterp(ch.lpfSvf, ch.gLpfSvfCur, ch.gLpfSvfStep);
+            } else if (mLpfSlopeSettled == static_cast<int>(LpfSlope::Db24)) {
+                prepGInterp(ch.lpfLadder, ch.gLpfLadderCur, ch.gLpfLadderStep);
+            } else {
+                prepGInterp(ch.lpfSvf, ch.gLpfSvfCur, ch.gLpfSvfStep);
+            }
+
+            // G6 (DESIGN.md §5.5): only recomputed (and the per-sample gHpf
+            // ramp only prepared) when the HPF is NOT bypassed this control
+            // block -- when bypassed, DESIGN.md §5.5's skip means nothing
+            // ever reads ch.hpf's coefficients anyway (see process()'s own
+            // comment), matching the LPF's own "only the currently-selected
+            // structure gets prepGInterp" convention (DESIGN.md §5.1
+            // [PERF-8]). `hpfFcVoice` is the SAME (voice-level) value for
+            // every chain (G8.5).
+            if (!mHpfBypassed) {
+                const double gHpfStart = ch.hpf.g;
+                ch.hpf.setControlRate(hpfFcVoice, fs);
+                ch.gHpfStep = (ch.hpf.g - gHpfStart) / static_cast<double>(std::max(1, mControlBlock));
+                ch.gHpfCur = gHpfStart;
+            }
         }
     }
     mDebugActiveVoiceCount = activeCount;  // G7.14/PERF-7 readback, see getDebugActiveVoiceCount()
