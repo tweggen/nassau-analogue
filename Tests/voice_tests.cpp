@@ -629,11 +629,17 @@ int main() {
 
   // =========================================================================
   // G6.11: Poly-Mod ENV-F -> VCO2 pitch. kPmEnvFToOsc2=+100, ENV-F full ->
-  // VCO2 +24 semitones; at -100 -> -24.
+  // VCO2 +6 semitones; at -100 -> -6 (SynthCore::kPmEnvFToOsc2Semitones).
   // QUANTITY MEASURED: measuredF0() of a VCO2-only sustained tone (Osc1
   // level 0), ENV-F driven to settle near 1.0 (fast A/D, 100% sustain,
   // matching G5.1's own wiring-proof pattern), compared to the UNMODULATED
-  // frequency (pmAmount=0) via the exact 2^(+-24/12) ratio.
+  // frequency (pmAmount=0) via the exact 2^(+-6/12) ratio.
+  //
+  // Was +-24 through G11. Reduced 4x after the first listening test on
+  // Windows: at +-24 the knob was unusably twitchy and the two presets
+  // leaning on it were audibly wrong (Bell Keys' pitch "far off" at 45 % of
+  // +-24 = +-10.8 semitones on a bell). The golden batteries are unaffected
+  // because every golden case runs kPmEnvFToOsc2 at its 0 default.
   // =========================================================================
   std::cout << "\nGroup: Poly-Mod ENV-F -> VCO2 pitch (G6.11)\n";
   {
@@ -654,13 +660,18 @@ int main() {
       return measuredF0(tail, kFs);
     };
 
+    // Derived from the core's own constant rather than hard-coded, so this AC
+    // cannot drift from the implementation again: it was written as literal
+    // 4.0 / 0.25 for the old +-24 range and silently encoded that range.
+    const double kPmRatioUp = std::pow(2.0, SynthCore::kPmEnvFToOsc2Semitones / 12.0);
+    const double kPmRatioDn = std::pow(2.0, -SynthCore::kPmEnvFToOsc2Semitones / 12.0);
     const double f0Base = measureOsc2Hz(0.0f);
     const double f0Plus = measureOsc2Hz(100.0f);
     const double f0Minus = measureOsc2Hz(-100.0f);
-    checkNum("G6.11: kPmEnvFToOsc2=+100, ENV-F full -> VCO2 ratio is 2^(24/12)=4.0 +/- 1%",
-             std::fabs(f0Plus / f0Base - 4.0) <= 0.01 * 4.0, f0Plus / f0Base);
-    checkNum("G6.11: kPmEnvFToOsc2=-100, ENV-F full -> VCO2 ratio is 2^(-24/12)=0.25 +/- 1%",
-             std::fabs(f0Minus / f0Base - 0.25) <= 0.01 * 0.25, f0Minus / f0Base);
+    checkNum("G6.11: kPmEnvFToOsc2=+100, ENV-F full -> VCO2 ratio is 2^(6/12)=1.4142 +/- 1%",
+             std::fabs(f0Plus / f0Base - kPmRatioUp) <= 0.01 * kPmRatioUp, f0Plus / f0Base);
+    checkNum("G6.11: kPmEnvFToOsc2=-100, ENV-F full -> VCO2 ratio is 2^(-6/12)=0.7071 +/- 1%",
+             std::fabs(f0Minus / f0Base - kPmRatioDn) <= 0.01 * kPmRatioDn, f0Minus / f0Base);
   }
 
   // =========================================================================

@@ -96,7 +96,7 @@
 // this size was derived from (was a 360x180 G0 placeholder covering only
 // kMasterVolume/kOutputClip).
 #define PLUG_WIDTH      944
-#define PLUG_HEIGHT     590
+#define PLUG_HEIGHT     672
 #define PLUG_FPS        60
 
 #define PLUG_SHARED_RESOURCES 0

@@ -1482,7 +1482,7 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         const double noteForOsc2 = snapshot.osc2KeyTrack ? v.glideCurrentSemis : 60.0;
 
         // [ref] DESIGN.md §8 [PERF-6]: Poly-Mod, control-rate only.
-        // kPmEnvFToOsc2 -- ENV-F to VCO2 pitch, bipolar, +/-24 semitones at
+        // kPmEnvFToOsc2 -- ENV-F to VCO2 pitch, bipolar, +/-6 semitones at
         // 100%; kPmEnvFToPw -- ENV-F to BOTH oscillators' pulse width,
         // bipolar, +/-45% at 100%. `v.envF.y` is this SAME control step's
         // freshly-advanced ENV-F value (v.envF.step() ran a few lines above,
@@ -1491,7 +1491,7 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
         // across chains ([PERF-5]: ENV-F is one Voice-level field) --
         // computed ONCE, outside the per-chain loop below.
         const double pmOsc2Semis =
-            (static_cast<double>(snapshot.pmEnvFToOsc2Percent) * 0.01) * 24.0 * v.envF.y;
+            (static_cast<double>(snapshot.pmEnvFToOsc2Percent) * 0.01) * kPmEnvFToOsc2Semitones * v.envF.y;
         const double pmPwModPercent =
             (static_cast<double>(snapshot.pmEnvFToPwPercent) * 0.01) * 45.0 * v.envF.y;
 

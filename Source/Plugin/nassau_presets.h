@@ -228,7 +228,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLpfEnvAmount, 55.0},
                        {kLpfKeyFollow, 60.0},
                        {kDrive, 20.0},
-                       {kPmEnvFToOsc2, 8.0},
+                       {kPmEnvFToOsc2, -13.0},
                        {kLfoRate, 5.5},
                        {kLfoDelay, 350.0},
                        {kLfoPitchAmount, 8.0},
@@ -243,7 +243,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       {"Prophet Strings",
        WithOverrides({{kMasterVolume, -14.0},  // headroom: wide detuned stereo ensemble
                        {kOsc1Level, 95.0},
-                       {kOsc2Fine, 9.0},
+                       {kOsc2Fine, 4.5},
                        {kOsc2Level, 90.0},
                        {kEnvFAttack, 450.0},
                        {kEnvFDecay, 2000.0},
@@ -304,7 +304,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kOsc1Wave, 1.0},  // Pulse
                        {kOsc1PW, 50.0},
                        {kOsc2Wave, 1.0},  // Pulse
-                       {kOsc2Fine, 6.0},
+                       {kOsc2Fine, 3.0},
                        {kOsc2PW, 50.0},
                        {kOsc2Level, 85.0},
                        {kEnvFAttack, 300.0},
@@ -347,7 +347,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLpfResonance, 22.0},
                        {kLpfEnvAmount, 15.0},
                        {kDrive, 20.0},
-                       {kPmEnvFToOsc2, 60.0},
+                       {kPmEnvFToOsc2, 15.0},
                        {kVoiceMode, 2.0},  // Mono
                        {kGlideTime, 40.0}})},
 
@@ -435,7 +435,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLpfCutoff, 2600.0},
                        {kLpfResonance, 55.0},
                        {kLpfEnvAmount, 25.0},
-                       {kPmEnvFToOsc2, 45.0},
+                       {kPmEnvFToOsc2, 11.25},
                        {kPmEnvFToPw, 15.0},
                        {kStereoMode, 1.0},
                        {kStereoDetune, 4.0},
@@ -447,7 +447,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // touch of noise adds transient bite.
       {"Resonant Pluck",
        WithOverrides({{kOsc1Level, 100.0},
-                       {kOsc2Fine, -5.0},
+                       {kOsc2Fine, -2.5},
                        {kOsc2Level, 75.0},
                        {kNoiseLevel, 5.0},
                        {kEnvFAttack, 1.0},
@@ -476,7 +476,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kOsc1PW, 30.0},
                        {kOsc1Level, 100.0},
                        {kOsc2Wave, 1.0},  // Pulse
-                       {kOsc2Fine, 4.0},
+                       {kOsc2Fine, 2.0},
                        {kOsc2PW, 35.0},
                        {kOsc2Level, 85.0},
                        {kEnvFAttack, 1.0},
@@ -502,7 +502,7 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // air. The single widest, slowest preset in the bank.
       {"Stereo Wash",
        WithOverrides({{kMasterVolume, -16.0},  // headroom: widest/slowest pad, 4-note chord
-                       {kOsc2Fine, 11.0},
+                       {kOsc2Fine, 5.5},
                        {kOsc2Level, 85.0},
                        {kNoiseColor, 1.0},  // Pink
                        {kNoiseLevel, 8.0},

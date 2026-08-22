@@ -676,7 +676,10 @@ have anyway.
 
 Two Prophet-flavoured routings, both **control-rate only**:
 
-* `kPmEnvFToOsc2` — ENV-F to VCO 2 pitch, bipolar, ± 24 semitones at 100 %.
+* `kPmEnvFToOsc2` — ENV-F to VCO 2 pitch, bipolar, **± 6 semitones** at 100 %
+  (`SynthCore::kPmEnvFToOsc2Semitones`). Was ± 24 through G11; reduced 4× after
+  the first listening test, where the knob was unusably twitchy and the two
+  presets leaning on it were audibly wrong.
 * `kPmEnvFToPw`   — ENV-F to both oscillators' pulse width, bipolar, ± 45 %.
 
 **Audio-rate oscillator-to-oscillator cross-modulation is excluded from v1.**
@@ -861,13 +864,13 @@ contiguous run. `kNumParams == 53 == PLUG_N_PARAMS`.
 | 1 | `kOutputClip` | bool | on | G0 |
 | 2 | `kOsc1Wave` | Saw / Pulse / Tri | Saw | G2 |
 | 3 | `kOsc1Octave` | 16' / 8' / 4' / 2' | 8' | G2 |
-| 4 | `kOsc1Fine` | −50 .. +50 cents | 0 | G2 |
+| 4 | `kOsc1Fine` | −25 .. +25 cents | 0 | G2 |
 | 5 | `kOsc1PW` | 5 .. 95 % | 50 | G2 |
 | 6 | `kOsc1Level` | 0 .. 100 % | 100 | G2 |
 | 7 | `kOsc2Wave` | Saw / Pulse / Tri | Saw | G2 |
 | 8 | `kOsc2Octave` | 16' / 8' / 4' / 2' | 8' | G2 |
 | 9 | `kOsc2Semi` | −12 .. +12 | 0 | G2 |
-| 10 | `kOsc2Fine` | −50 .. +50 cents | −7 | G2 |
+| 10 | `kOsc2Fine` | −25 .. +25 cents | −3.5 | G2 |
 | 11 | `kOsc2PW` | 5 .. 95 % | 50 | G2 |
 | 12 | `kOsc2Level` | 0 .. 100 % | 80 | G2 |
 | 13 | `kOsc2Sync` | bool | off | G2 |

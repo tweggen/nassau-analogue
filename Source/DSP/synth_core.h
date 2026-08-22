@@ -127,6 +127,16 @@ struct NoteEvent {
  */
 class SynthCore {
 public:
+    /// [voicing] ENV-F -> VCO2 pitch depth at 100 %, in semitones.
+    /// Was 24 (+/-2 octaves) through G11. Reduced to 6 after the first
+    /// listening test on Windows: at +/-24 the knob was unusably twitchy and
+    /// the two presets leaning on it were audibly wrong -- Bell Keys' pitch
+    /// was "far off" (45 % of +/-24 = +/-10.8 semitones on a bell), and
+    /// Jupiter Brass needed hand-trimming to -13 %. A 4x reduction makes the
+    /// full knob sweep half an octave, which is the range this modulation is
+    /// actually musical over.
+    static constexpr double kPmEnvFToOsc2Semitones = 6.0;
+
     // ===== Enum-valued parameters (DESIGN.md §11) =====
 
     /// kOsc1Wave (param 2) / kOsc2Wave (param 7). Default Saw for both.
@@ -1398,7 +1408,7 @@ private:
     std::atomic<int>   mOsc2Wave{static_cast<int>(Wave::Saw)};                  // [voicing]
     std::atomic<int>   mOsc2Octave{static_cast<int>(Octave::Ft8)};              // [voicing]
     std::atomic<int>   mOsc2Semi{0};                                            // [voicing]
-    std::atomic<float> mOsc2FineCents{-7.0f};                                   // [voicing]
+    std::atomic<float> mOsc2FineCents{-3.5f};  // [voicing] halved with the ±25c range
     std::atomic<float> mOsc2PwPercent{50.0f};                                   // [voicing]
     std::atomic<float> mOsc2LevelPercent{80.0f};                                // [voicing]
     std::atomic<float> mOsc2Sync{0.0f};                                         // [voicing] off

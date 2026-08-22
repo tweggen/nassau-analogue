@@ -211,13 +211,13 @@ NassauAnaloguePlugin::NassauAnaloguePlugin(const InstanceInfo& info)
     // G2 (oscillators, sub, noise)
     GetParam(kOsc1Wave)->InitEnum("Osc1 Wave", 0, {"Saw", "Pulse", "Tri"});
     GetParam(kOsc1Octave)->InitEnum("Osc1 Range", 1, {"16'", "8'", "4'", "2'"});
-    GetParam(kOsc1Fine)->InitDouble("Osc1 Fine", 0., -50., 50., 0.1, "cents");
+    GetParam(kOsc1Fine)->InitDouble("Osc1 Fine", 0., -25., 25., 0.1, "cents");
     GetParam(kOsc1PW)->InitDouble("Osc1 PW", 50., 5., 95., 0.1, "%");
     GetParam(kOsc1Level)->InitDouble("Osc1 Level", 100., 0., 100., 0.1, "%");
     GetParam(kOsc2Wave)->InitEnum("Osc2 Wave", 0, {"Saw", "Pulse", "Tri"});
     GetParam(kOsc2Octave)->InitEnum("Osc2 Range", 1, {"16'", "8'", "4'", "2'"});
     GetParam(kOsc2Semi)->InitInt("Osc2 Semi", 0, -12, 12, "semi");
-    GetParam(kOsc2Fine)->InitDouble("Osc2 Fine", -7., -50., 50., 0.1, "cents");
+    GetParam(kOsc2Fine)->InitDouble("Osc2 Fine", -3.5, -25., 25., 0.1, "cents");
     GetParam(kOsc2PW)->InitDouble("Osc2 PW", 50., 5., 95., 0.1, "%");
     GetParam(kOsc2Level)->InitDouble("Osc2 Level", 80., 0., 100., 0.1, "%");
     GetParam(kOsc2Sync)->InitBool("Osc2 Sync", false);
