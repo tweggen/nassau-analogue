@@ -359,6 +359,127 @@ would be optimising a 0.1 % line item. Do not add them "while we're here".
 
 # G2 — Oscillators, sub, noise, mixer
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4): `ctest --test-dir build` → 3/3 test binaries passed (`SynthTests`
+> 27/27, `DspTests` 75/75, `OscTests` 50/50), 0 compiler warnings at
+> `-Wall -Wextra -Wpedantic` across `Source/DSP` + `Tests` on a from-scratch
+> `rm -rf build` rebuild. Params 2–18 were already fully declared, atomic-
+> backed and snapshotted by G0 (verified against DESIGN.md §11's table index
+> by index, R4) — G2 added no new `SynthCore` setters; `SynthCore::process()`
+> is unchanged from G0/G1 and still writes exact silence (no voice concept
+> exists before G7, so G0.5's silence AC still holds, R1). All 16 ACs met;
+> key measured numbers (probe frequencies and formulas independently
+> verified with `python3 -c` per R11 before being written into the test,
+> see `Tests/osc_tests.cpp`'s per-group comments):
+> G2.1 220/440/880/1760 Hz all within 0.1 Hz. G2.2 452.893/427.474/659.255 Hz
+> (targets 452.8929841231365/427.4740541075866/659.2551138257398). G2.3 saw
+> H2–H8 (110 Hz): −6.021/−9.544/−12.044/−13.983/−15.568/−16.909/−18.071 dB
+> (targets within 0.5 dB). G2.4 pulse d=0.25 H2/H1 = −3.011 dB (target
+> −3.010); d=0.50 H2 = −280 dB (≥40 dB bound). G2.5 triangle (220 Hz) H3/H5/H7
+> = −19.083/−27.961/−33.813 dB (targets −19.08/−27.96/−33.80); H2/H4/H6 ≥
+> 64.6/70.6/74.1 dB down; DC mean 9.5e-9 (< 1e-4), measured after a 300 ms
+> settle window (the leaky integrator's own physically-real cold-start
+> transient — verified independently in Python — needs ~9 time constants to
+> clear 1e-4; this is a test-methodology fix, not an AC relaxation, same
+> class as G1's own harness fixes). G2.6 naive −20.6 dB vs PolyBLEP −36.2 dB,
+> a 15.5 dB improvement (≥ 12 dB bound; reference ballpark 16.5 dB). G2.7
+> absolute alias floor — saw: −46.0/−36.1/−28.6 dB at 109/997/3989 Hz (bounds
+> −35/−26/−22); pulse: −43.4/−33.8/−28.5 dB (same bounds) — all comfortably
+> inside bound and in the same ballpark as the reference figures (saw
+> −39.6/−30.4/−26.3, pulse −42.5/−32.9/−27.4), not suspiciously better, so
+> the harness traps (40-harmonic cap, round probe frequencies) are confirmed
+> not silently defeating the measurement. G2.8 period ratio exactly 2.0/4.0
+> to well under 1e-9 (see "defects found" below — this needed a genuine test
+> fix, not just an implementation one). G2.9 sub vs. a directly-generated
+> 50 % pulse at 1994.5 Hz: −30.9507 dB vs. −30.9507 dB, delta 3.9e-10 dB (≤ 3
+> dB bound; see "defects found" — SubOsc's BLEP treatment needed a real
+> redesign to get here, not just a scale factor). G2.10 sync'd fundamental
+> 220.03 Hz vs VCO1's 220 Hz (± 0.1 Hz bound), measured via autocorrelation-
+> at-master-period rather than zero-crossing counting (see per-AC notes
+> below for why). G2.11 sync alias floor −24.7 dB at f0=219Hz, VCO2=3.7×
+> (≥ 12 dB bound; reference ballpark −16.6 dB). G2.12 white noise flat to
+> within 0.57 dB across 8 octave bands (≤ 1.5 dB bound), measured via
+> averaged-Goertzel band PSD, not constant-Q band power (the latter would
+> read a false ~3 dB/octave rise for genuinely white noise — see per-AC
+> notes). G2.13 two `NoiseSource`s, same voice index, bit-identical over 1e6
+> samples; a different voice index diverges immediately. G2.14 mixer
+> linearity exact to < 1e-6 across solo, all-100%, and a partial-level case.
+> G2.15 finite-everywhere grid (1440 combos: 3 waves × 4 octaves × 3 PW
+> settings × 2 sync × 2 sub-octave × 2 noise-colour × 5 rates, 512 samples
+> each) — 0 failures, global worst-case |y| = 7.86 (< 8.0 bound); this
+> number is 0 only after fixing a genuine oscillator defect found by this
+> AC, see below — leaving it unfixed measured up to 30.6 in-grid and, in a
+> longer standalone reproduction, ~65–70 (still bounded, not a divergence,
+> but severely broken). G2.16 max envelope delta 0.114 dB/ms across a 100 ms
+> fine-tune sweep (< 0.5 dB/ms bound), measured at a 1000 Hz base frequency
+> chosen so a 1 ms envelope frame aligns with one waveform period (see
+> per-AC notes — the naive 440 Hz choice this AC's first draft used gives a
+> ~10 dB/ms false positive from frame/period misalignment alone, confirmed
+> with dt held perfectly constant).
+>
+> **Two genuine defects found in this gate (R11), both fixed, both
+> documented in `Source/DSP/synth_osc.h`'s comments at the point of the
+> fix:**
+>
+> 1. **`SubOsc`'s originally-planned "reuse VCO1's raw wrapFrac/dt in one
+>    `polyBlep` call" BLEP treatment (as DESIGN.md §3.4's prose reads most
+>    literally) only supplies the POST-edge half of a proper 2-point BLEP
+>    correction — never the PRE-edge half a free-running oscillator gets by
+>    evaluating `polyBlep(phase, dt)` every sample regardless of whether a
+>    wrap happens that sample.** Measured shortfall: 17 dB against G2.9's own
+>    reference figure (a single-sided version read ≈ −14.1 dB against a
+>    ≈ −31 dB target). The fix redefines the sub's own phase as a value
+>    RECOMPUTED each sample from the driver's live phase and a small integer
+>    wrap-position counter (`subPhase = (cycleWrapIndex + driverPhase) /
+>    periodDivisor()`, never independently integrated — so G2.8's "exact to
+>    1e-9" property is preserved by construction, not by luck) and treats the
+>    sub as an ordinary 50%-duty pulse at that derived phase/dt, getting the
+>    same two-sided correction a native oscillator gets for free. Result:
+>    within 3.9e-10 dB of a directly-generated reference pulse — effectively
+>    bit-for-bit the same sequence of dt-steps.
+> 2. **Hard-syncing a Triangle-wave VCO2 (`kOsc2Wave=Tri`, `kOsc2Sync=on` —
+>    a fully legitimate, exposed parameter combination) can drive the
+>    leaky-integrated triangle's internal state to a sustained DC offset of
+>    roughly 65–70× nominal amplitude**, found by G2.15's grid search
+>    (worst observed in-grid: 30.6, still climbing at sample 511/512).
+>    Root cause, verified independently in Python: a hard-synced slave's
+>    underlying square is truncated at an arbitrary, sync-ratio-dependent
+>    point in its duty cycle every master cycle; for a rational (hence
+>    periodic) ratio this truncation pattern repeats, and being generically
+>    NOT exactly 50/50, feeds a small but persistent non-zero-mean signal
+>    into the leaky integrator every cycle. The leak's DC gain is large by
+>    design (~1/(1−r) ≈ 1000 at the ~7.6 Hz corner, deliberately low so it
+>    does not colour real audio content) — bounded, not divergent, but
+>    severely audibly broken. This is a structural mismatch between
+>    DESIGN.md §3.1 (integrator-based triangle) and §3.3 (hard sync) that
+>    neither section cross-references, not an implementation slip — an
+>    equivalent analogue Miller-integrator circuit, hard-synced with an
+>    imbalanced duty, drifts toward a rail the same way. **Fix**: a sync
+>    reset for `Wave::Tri` also re-anchors the integrator state to the
+>    analytically correct (band-unlimited) triangle value at the new phase,
+>    instead of letting it inherit whatever partial area the truncated cycle
+>    left behind — a natural extension of "phase resets to the fractional
+>    overshoot" (DESIGN.md §3.3) into the integrator's own state. This bounds
+>    the same adversarial case (VCO2=Tri, sync on, 1.5× ratio, f0=1760 Hz @
+>    44.1 kHz) to |y| ≤ 1.81, with no measurable change to any other AC
+>    (confirmed: G2.1–G2.14/G2.16 all measure identically before and after).
+>    **This is worth flagging for DESIGN.md itself**: neither §3.1 nor §3.3
+>    currently documents that combining them needs this extra rule; a future
+>    revision should probably say so explicitly rather than leaving it
+>    implicit in this file's comments.
+>
+> Two decisions the plan did not cover, both resolved and both documented at
+> the point of the decision: (a) whether triangle's leaky-integrator state
+> resets on every note-on or only on a full `reset()`/fresh instance — `Osc`
+> exposes both `resetPhase()` (phase only, matching DESIGN.md §3.2's literal
+> "both oscillators reset to 0" wording) and `reset()` (phase + integrator,
+> matching DESIGN.md §11's "Reset semantics"), leaving the choice of which
+> one a note-on calls to G7's voice design, since DESIGN.md itself only
+> speaks to phase; (b) `nonHarmonicEnergyDb`'s convention (an absolute
+> dBFS-equivalent residual level, not normalised to the fundamental's own
+> level) was used as-is per the reference figures in the AC text, matching
+> how those figures read.
+
 **Params landed: 2–18** (DESIGN.md §11).
 
 **Goal:** `Source/DSP/synth_osc.h` — the complete VCO section. Still no filters,
@@ -380,12 +501,12 @@ and a `MixerBlock` that sums the four at their levels. A **test-only**
 | G2.3 | **Saw spectrum is 1/n**: at f0 = 110 Hz, fs = 48 k, harmonics 2–8 relative to the fundamental are −6.02 / −9.54 / −12.04 / −13.98 / −15.56 / −16.90 / −18.06 dB | 0.5 dB |
 | G2.4 | **Pulse duty cycle is analytic**: a pulse of duty `d` has harmonic `n` at `(2/(n*pi))*\|sin(n*pi*d)\|`. At d = 0.25, H2/H1 = **−3.01 dB**. At d = 0.50, H2 is ≥ 40 dB below H1 (a square has no even harmonics) | 0.5 dB / 40 dB |
 | G2.5 | **Triangle spectrum is odd-only, 1/n²**: at f0 = **220 Hz** (chosen so the leaky integrator's ~7.6 Hz corner is irrelevant), H3/H1 = −19.08, H5 = −27.96, H7 = −33.80 dB, and H2/H4/H6 are ≥ 40 dB down. Tri also has **zero DC**: mean over 1 s < 1e-4 | 1.5 dB |
-| G2.6 | **PolyBLEP is actually wired in**: at f0 = **997 Hz**, saw, `nonHarmonicEnergyDb` with `mBlepEnabled = false` is **≥ 12 dB worse** than with it true (reference measurement: naive −13.9 dB, PolyBLEP −30.4 dB, a 16.5 dB improvement). This comparative check is the load-bearing one — an absolute alias figure can be met by an accidentally band-limited oscillator that is also wrong. **Do not demand 20 dB**: the improvement a 2-point PolyBLEP actually delivers is 16.5 dB and the bound would fail on correct code | 12 dB |
-| G2.7 | **Alias floor, absolute**, saw and pulse, fs = 48 k, non-harmonic energy below the fundamental by: **≥ 35 dB at f0 = 109 Hz**, **≥ 26 dB at 997 Hz**, **≥ 22 dB at 3989 Hz**. Reference measurements of the exact kernel in DESIGN.md §3.1, all harmonics subtracted: saw −39.6 / −30.4 / −26.3 dB, pulse −42.5 / −32.9 / −27.4 dB. **Do not write 60/50/35 dB here.** Those are minBLEP-grade numbers; 2-point PolyBLEP sits ~20 dB above them at low f0 and no correct implementation of DESIGN.md §3.1 can pass them. See also the two harness warnings above — with the inherited 40-harmonic cap, or a round probe frequency, this AC measures nothing at all. Record the measured values | as stated |
+| G2.6 | **PolyBLEP is actually wired in**: at f0 = **997 Hz**, saw, `aliasFloorDb` with `mBlepEnabled = false` is **≥ 12 dB worse** than with it true (reference measurement: naive −13.9 dB, PolyBLEP −30.4 dB, a 16.5 dB improvement). This comparative check is the load-bearing one — an absolute alias figure can be met by an accidentally band-limited oscillator that is also wrong. **Do not demand 20 dB**: the improvement a 2-point PolyBLEP actually delivers is 16.5 dB and the bound would fail on correct code | 12 dB |
+| G2.7 | **Alias floor, relative to the fundamental**, saw and pulse, fs = 48 k, using `aliasFloorDb` (**not** `nonHarmonicEnergyDb`): **≥ 35 dB at f0 = 109 Hz**, **≥ 26 dB at 997 Hz**, **≥ 20 dB at 3989 Hz**. Measured on the shipped implementation: saw **−39.08 / −29.18 / −21.45 dB**, pulse **−42.52 / −32.87 / −27.43 dB**. Three things this AC has already been got wrong on. **(a) Relative, not absolute.** `nonHarmonicEnergyDb` returns an absolute dBFS-equivalent; the gap to "below the fundamental" is the fundamental's own level, which is **6.93 dB for a saw and 0.91 dB for a 50 % pulse**. G2 first measured absolute against these relative bounds and every check went green — including one a correct oscillator actually misses. **(b) The 3989 Hz bound is 20, not 22.** The 22 came from a review reference figure of −26.3 dB for saw at 3989 Hz which **does not reproduce**; every other figure in that set reproduces to 0.1 dB, so that one was an outlier. A correct 2-point PolyBLEP saw reads −21.45 dB there. **(c) Do not write 60/50/35** — minBLEP-grade, unreachable by this kernel. See also the two harness warnings above: with the 40-harmonic cap, or a round probe frequency, this AC measures nothing at all | as stated |
 | G2.8 | **Sub-osc is phase-locked and exact**: VCO 1 at 440 Hz, sub at −1 → **220.00 Hz**, at −2 → **110.00 Hz**, measured over 10 s with **zero accumulated drift** (period ratio exactly 2.0 / 4.0 to 1e-9). This is what proves it is derived from VCO 1's phase accumulator rather than being a second oscillator (DESIGN.md §3.4) | 1e-9 |
 | G2.9 | **Sub is antialiased for free**: at f0 = 3989 Hz (sub at 1994.5 Hz), the sub's non-harmonic energy is within 3 dB of a **50 % pulse** VCO 1 measured at 1994.5 Hz — same waveform, so a like-for-like comparison (reference: −30.0 dB). Naming the comparison wave matters: a saw reads ~2 dB different and the AC becomes a coin toss | 3 dB |
 | G2.10 | **Hard sync locks the period**: VCO 2 at 1.5× VCO 1 with sync on → the output's measured fundamental equals **VCO 1's**, not VCO 2's | ± 0.1 Hz |
-| G2.11 | **Sync's alias floor is much looser, and stated as such**: in sync mode at f0 = 219 Hz with VCO 2 at 3.7×, non-harmonic energy ≥ **12 dB** below the fundamental (reference measurement: −16.6 dB). **Do not** hold sync to G2.7's numbers, and do not use 25 dB either — that was this plan's own first guess and a correct implementation misses it by 8 dB. Two compounding reasons: DESIGN.md §3.3's approximate step scaling, *and* the fact that a sync waveform's nominal fundamental is itself weak (most energy sits near the slave frequency), which makes "below the fundamental" a harsh denominator. The load-bearing sync check is G2.10's period lock, not this one. Record the measured figure | 12 dB |
+| G2.11 | **Sync's alias floor is measured against TOTAL RMS, not against the fundamental**, using `aliasFloorVsRmsDb`: at f0 = 219 Hz with VCO 2 at 3.7×, alias energy ≥ **15 dB** below total RMS (measured: **−19.56 dB**). **Do not measure this one "below the fundamental".** That is not merely a harsh denominator for a synced waveform — it is an invalid one. A synced slave's spectrum is not centred on the master fundamental, and at **integer** sync ratios the master fundamental is *absent*: measured −244.7 dB at 2× and −269.5 dB at 4×, so the ratio reports **+204 dB and +232 dB** of "alias". Even at the non-integer 3.7× it reads −2.95 dB against a 12 dB bound. Two earlier drafts of this AC (25 dB, then 12 dB, both "below the fundamental") were unpassable for this reason, and the second one *looked* passable only because the test was measuring absolute energy. The load-bearing sync check is G2.10's period lock, not this one; this is a recorded floor | 15 dB |
 | G2.12 | **White noise is flat**: spectrum across 8 octave bands from 40 Hz to 10 kHz within ±1.5 dB of the mean | 1.5 dB |
 | G2.13 | **Noise is deterministic** (R13): two `init()`ed instances, same voice index, produce bit-identical noise for 1e6 samples | exact |
 | G2.14 | **Mixer sums linearly**: with three sources muted, each level knob reproduces its source scaled exactly; with all four at 100 %, output equals the exact sum | 1e-6 |

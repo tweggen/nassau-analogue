@@ -199,6 +199,67 @@ inline double nonHarmonicEnergyDb(const std::vector<float>& v, double f0, double
   return 10.0 * std::log10(residual);
 }
 
+// ---- aliasFloorDb -----------------------------------------------------------
+// Non-harmonic (alias) energy RELATIVE TO THE FUNDAMENTAL, in dB. Negative
+// numbers; more negative is better.
+//
+// USE THIS, NOT nonHarmonicEnergyDb, FOR ANY ALIAS ACCEPTANCE CRITERION.
+// GATES.md's alias ACs are all worded "non-harmonic energy below the
+// FUNDAMENTAL by >= X dB", and nonHarmonicEnergyDb returns an ABSOLUTE
+// dBFS-equivalent. The gap between them is the fundamental's own level, which
+// is waveform-dependent and large:
+//
+//     +/-1 saw    fundamental amplitude 2/pi   -> -6.93 dB   power
+//     50% pulse   fundamental amplitude 4/pi   -> -0.91 dB   power
+//
+// So an absolute measurement flatters a saw by 6.9 dB and a square by only
+// 0.9 dB. G2 originally compared absolute readings against relative bounds and
+// every AC "passed" -- including one that a correct oscillator actually misses.
+// Measuring the wrong quantity is not caught by the test going green.
+inline double aliasFloorDb(const std::vector<float>& v, double f0, double fs) {
+  int from = 0;
+  int to = static_cast<int>(v.size());
+  trimToWholePeriods(from, to, f0, fs);
+  if (to <= from || f0 <= 0.0) return 0.0;
+  const double absDb = nonHarmonicEnergyDb(v, f0, fs);
+  const double mag = goertzelMag(v, from, to, f0, fs);
+  if (mag <= 0.0) return 0.0;
+  const double fundDb = 10.0 * std::log10(mag * mag / 2.0);  // sinusoid amp -> mean-square
+  return absDb - fundDb;
+}
+
+// ---- aliasFloorVsRmsDb ------------------------------------------------------
+// Non-harmonic (alias) energy relative to the signal's TOTAL RMS, in dB.
+//
+// USE THIS, NOT aliasFloorDb, FOR HARD-SYNC WAVEFORMS.
+// A synced slave's spectrum is not centred on the master fundamental, and at
+// INTEGER sync ratios the master fundamental is not merely weak -- it is
+// absent. Measured on this implementation at f1 = 219 Hz:
+//
+//     ratio 1.0   fundamental  -6.93 dB     vs-fund -36.21   vs-RMS -38.32
+//     ratio 2.0   fundamental -244.72 dB    vs-fund +204.45  vs-RMS -35.39
+//     ratio 3.7   fundamental -21.77 dB     vs-fund  -2.95   vs-RMS -19.56
+//     ratio 4.0   fundamental -269.52 dB    vs-fund +231.99  vs-RMS -32.54
+//
+// Dividing by a -245 dB "fundamental" yields +204 dB of "alias", which is not a
+// harsh measurement, it is a meaningless one. Total RMS is well behaved at
+// every ratio and is what the sync AC actually intends.
+inline double aliasFloorVsRmsDb(const std::vector<float>& v, double f0, double fs) {
+  int from = 0;
+  int to = static_cast<int>(v.size());
+  trimToWholePeriods(from, to, f0, fs);
+  if (to <= from || f0 <= 0.0) return 0.0;
+  const double absDb = nonHarmonicEnergyDb(v, f0, fs);
+  double tot = 0.0;
+  for (int i = from; i < to; ++i) {
+    const double x = static_cast<double>(v[static_cast<size_t>(i)]);
+    tot += x * x;
+  }
+  tot /= static_cast<double>(to - from);
+  if (tot <= 0.0) return 0.0;
+  return absDb - 10.0 * std::log10(tot);
+}
+
 // ---- envelopeDb -------------------------------------------------------------
 // RMS envelope of v in 1 ms frames, in dBFS. out[k] is the level of frame k
 // (samples [k*frame, (k+1)*frame)); the last (partial) frame is included.

@@ -22,3 +22,14 @@ target_include_directories(dsp_tests PRIVATE
 target_compile_options(dsp_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME DspTests COMMAND dsp_tests)
+
+# ---- G2: oscillators, sub, noise, mixer (Source/DSP/synth_osc.h) ----------
+# Header-only (no nassau_synth_core link needed) -- osc_tests.cpp exercises
+# synth_osc.h's structs directly, same shape as dsp_tests.cpp above (and
+# nassau-zermatt's Tests/cabinet_tests.cpp driving Cabinet directly).
+add_executable(osc_tests osc_tests.cpp)
+target_include_directories(osc_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(osc_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME OscTests COMMAND osc_tests)

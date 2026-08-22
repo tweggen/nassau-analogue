@@ -282,6 +282,17 @@ phaseInc = f / fs                                            // clamped to 0.49
 `8'` is the reference range: **note 69, all offsets zero, 8' ⇒ 440.000 Hz.**
 `16' / 8' / 4' / 2'` ⇒ 220 / 440 / 880 / 1760 Hz. `[ref]`
 
+**Triangle interacts badly with hard sync, and the integrator must be
+re-anchored.** A hard-synced slave's truncated square has a non-50/50 duty every
+cycle, and the leaky integrator's DC gain (~1000, from the deliberately low
+7.6 Hz corner) amplifies that persistent bias into a runaway offset — measured
+at 65–70× nominal amplitude and still climbing, for the entirely legitimate
+setting `kOsc2Wave = Tri` with `kOsc2Sync = on`. §3.1 and §3.3 are each correct
+in isolation and the gap is in their interaction. **At every sync reset, the
+integrator is re-anchored to the analytically correct triangle value** for the
+slave's phase at that instant. Found by G2's own extreme-grid search (G2.15),
+which is exactly the kind of corner a parameter grid exists to find. `[dsp]`
+
 **Phase at note-on: both oscillators reset to 0.** Free-running phase would make
 the instrument non-deterministic (R13, and the golden battery depends on it) and
 would make unison mode's summed level depend on arrival phase. The cost is a
