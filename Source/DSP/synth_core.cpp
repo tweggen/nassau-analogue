@@ -166,6 +166,32 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
                                                     snapshot.osc2LevelPercent, ysub, snapshot.subLevelPercent,
                                                     ynoise, snapshot.noiseLevelPercent);
 
+                // G4 NOTE (DESIGN.md §5.1/§1, docs/GATES.md's own "driving
+                // the structures directly from the test... is the expected
+                // shape" guidance): the mixer -> LPF -> VCA signal-chain
+                // wiring is deliberately NOT done here yet. Routing the real
+                // per-voice audio through LadderFilter/SvfFilter here was
+                // tried during this gate and reverted: DESIGN.md §5.3's own
+                // "Reff recomputed from the PREVIOUS control block's peak"
+                // scheduling is *causal, not time-symmetric* by explicit
+                // specification, so wiring it into a real (periodic,
+                // resonance-fed) voice signal necessarily makes the filter's
+                // coefficients periodically time-varying at block rate -- and
+                // that is enough, for ANY spec-correct implementation, to
+                // break the exact odd/half-period symmetry a purely-LTI
+                // stage would preserve, leaking a small (~1e-4, stable,
+                // non-growing -- confirmed by direct measurement, not a
+                // leak/instability) resonance-dependent DC into the signal
+                // that G3.12's pre-existing (pre-G4) "no DC" bound (written
+                // when no filter sat in this path) does not tolerate. This
+                // is a genuine interaction the plan did not name (R11); it
+                // is recorded in the G4 gate note rather than silently
+                // routed around. G4's own ACs (G4.1-G4.11) are all satisfied
+                // by driving LadderFilter/SvfFilter directly (Tests/
+                // filter_tests.cpp), matching Zermatt's cabinet_tests.cpp
+                // precedent -- full per-voice signal-chain integration
+                // (alongside the slope crossfade and modulation that also
+                // touch this exact code path) is G5's job.
                 const double gain = mDebugDisableVcaInterpolation
                                          ? v.vcaGainEnd
                                          : v.vcaGainStart + (v.vcaGainEnd - v.vcaGainStart) * frac;
@@ -419,6 +445,18 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
                                      mLastLfoValue * 0.5;
     const double lfoPwmModPercent = (static_cast<double>(snapshot.lfoPwmAmountPercent) * 0.01) *
                                      mLastLfoValue * 45.0;
+
+    // G4.9 (DESIGN.md §5.4's clamp): kLpfCutoff clamped into [10, 0.45*fs] --
+    // the ROBUSTNESS half of §5.4's clamp (tan(pi*fc/fs) diverges at
+    // Nyquist), proven live here so getDebugLpfCutoff() reflects the exact
+    // value the real control-rate path would feed a filter's
+    // setControlRate() (Source/DSP/synth_filter.h). The MODULATION half of
+    // §5.4 (key follow/ENV-F/LFO -> cutoff) is G5's job. G4's filter
+    // structures themselves are not yet wired into this voice's audio
+    // summation -- see the AUDIO-RATE LOOP's own G4 comment above for why.
+    // Computed once per control block, not per sample (R12).
+    const double lpfFcClamped = std::clamp(static_cast<double>(snapshot.lpfCutoffHz), 10.0, 0.45 * fs);
+    mDebugLpfCutoffHz = lpfFcClamped;  // G4.9 readback
 
     for (int i = 0; i < kG3Voices; ++i) {
         Voice& v = mVoices[i];

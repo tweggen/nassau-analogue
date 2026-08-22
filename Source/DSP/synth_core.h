@@ -13,6 +13,16 @@
 #include "synth_dsp.h"
 #include "synth_osc.h"
 
+// G4 (docs/GATES.md): SynthCore's public API gains a debug readback for the
+// clamped LPF cutoff (getDebugLpfCutoff(), G4.9) but does NOT include
+// synth_filter.h or hold a LadderFilter/SvfFilter per voice -- the two
+// structures themselves are exercised directly by Tests/filter_tests.cpp
+// (matching nassau-zermatt/Tests/cabinet_tests.cpp's precedent for driving a
+// DSP structure straight from its test rather than through the full voice
+// path). See synth_core.cpp's AUDIO-RATE LOOP comment for why wiring them
+// into this voice's real signal path is deferred to G5 (the slope crossfade
+// and modulation gate, which touches this exact code path anyway).
+
 /**
  * NoteEvent — the framework-free MIDI-event wire format SynthCore::process()
  * consumes (DESIGN.md §10.1). This is the ENTIRE surface the IPlug2 wrapper's
@@ -412,6 +422,17 @@ public:
         return mVoices[voiceIndex].envA.y;
     }
 
+    // ===== Test-only debug accessors (G4, docs/GATES.md) =====
+
+    /// G4.9: the ACTUAL cutoff (Hz) fed to both filter structures'
+    /// setControlRate() as of the most recent control-rate update -- i.e.
+    /// `kLpfCutoff` after DESIGN.md §5.4's `[10, 0.45*fs]` clamp (G4's slice
+    /// of that clamp: no modulation term exists yet, that is G5's). Updated
+    /// once per control block regardless of whether any voice is active
+    /// (DESIGN.md §2: cutoff is not per-voice at G4 -- see
+    /// controlRateUpdate()'s own comment).
+    double getDebugLpfCutoff() const { return mDebugLpfCutoffHz; }
+
 private:
     // ===== Per-host-block parameter snapshot (DESIGN.md §2.2) =====
     // Built exactly once per process() call: every atomic is loaded exactly
@@ -518,7 +539,11 @@ private:
         Osc osc1, osc2;
         SubOsc sub;
         NoiseSource noise;
-        AdsrEnv envF, envA;    ///< ENV-F (filter, not yet routed anywhere -- G4/G5) / ENV-A (VCA)
+        AdsrEnv envF, envA;    ///< ENV-F (filter, not yet routed anywhere -- G5) / ENV-A (VCA).
+                               ///< The LPF itself (G4: LadderFilter/SvfFilter,
+                               ///< Source/DSP/synth_filter.h) is not yet a per-voice member --
+                               ///< see synth_core.h's top-of-file G4 note and the AUDIO-RATE
+                               ///< LOOP's own comment in synth_core.cpp.
         bool active = false;   ///< sounding (Attack/Decay/Sustain/Release), not Idle
         int note = -1;
         double vcaGainStart = 0.0;   ///< interpolation endpoints for THIS control block
@@ -543,6 +568,7 @@ private:
     Lfo mLfo;                    ///< DESIGN.md §7 [PERF-4]: ONE global LFO, stepped once per
                                   ///< control block, read by every voice -- never per-voice.
     double mLastLfoValue = 0.0;  ///< test-only readback of the most recent mLfo.step() result (G3.10)
+    double mDebugLpfCutoffHz = 0.0;  ///< G4.9: last clamped LPF cutoff fed to setControlRate()
 
     static constexpr uint32_t kLfoShSeed = 0x5EED1234u;  // [voicing] fixed S&H seed, R8/R13
 

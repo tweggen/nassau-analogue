@@ -50,3 +50,20 @@ target_compile_definitions(envlfo_tests PRIVATE
     NASSAU_CORE_CPP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_core.cpp")
 
 add_test(NAME EnvLfoTests COMMAND envlfo_tests)
+
+# ---- G4: the low-pass filter (Source/DSP/synth_filter.h) -------------------
+# Links nassau_synth_core: G4.1-G4.8/G4.10 drive LadderFilter/SvfFilter
+# directly (header-only, same shape as dsp_tests.cpp/osc_tests.cpp), but
+# G4.9 reads SynthCore::getDebugLpfCutoff(), so the library is needed too.
+add_executable(filter_tests filter_tests.cpp)
+target_link_libraries(filter_tests nassau_synth_core)
+target_include_directories(filter_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(filter_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+# G4.11's grep-based inspection check reads synth_filter.h's own source text
+# (between its "PER-SAMPLE PROCESS BEGIN/END" markers) at an ABSOLUTE path,
+# matching envlfo_tests.cpp's NASSAU_CORE_CPP_PATH precedent (G3.2).
+target_compile_definitions(filter_tests PRIVATE
+    NASSAU_FILTER_H_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_filter.h")
+
+add_test(NAME FilterTests COMMAND filter_tests)

@@ -732,6 +732,121 @@ mixer output through the VCA. No filters yet.
 
 # G4 — The low-pass filter: structures, resonance, stability
 
+> **STATUS: DONE** (R10). Measured on the Linux dev box (g++ 15.3.0, cmake
+> 4.3.4): `ctest --test-dir build` → 5/5 test binaries passed (`SynthTests`
+> 28/28, `DspTests` 75/75, `OscTests` 50/50, `EnvLfoTests` 33/33, `FilterTests`
+> 33/33 — the new binary), 0 compiler warnings at `-Wall -Wextra -Wpedantic`
+> across `Source/DSP` + `Tests` on a from-scratch `rm -rf build` rebuild.
+> `Source/DSP/synth_filter.h` (header-only) lands `LadderFilter` (24 dB ZDF
+> ladder, DESIGN.md §5.2) and `SvfFilter` (12 dB TPT SVF, §5.3); params 32–34
+> (already atomic-backed/snapshotted since G3's stub) gain a real
+> `getDebugLpfCutoff()` control-rate clamp readback on `SynthCore`. All 11
+> ACs met; key measured numbers, with the independently-supplied reference
+> table compared line by line (all measured on this implementation, not the
+> reference author's):
+>
+> G4.1 ladder slope, fs=96k: **23.905 dB** (reference 23.91, Δ0.005) — PASS,
+> within 1.5dB. At fs=48k (recorded, not gated): **25.884 dB** (reference
+> 25.88, Δ0.004). G4.2 SVF slope, fs=96k: **11.952 dB** (reference 11.95,
+> Δ0.002) — PASS, within 1.0dB; at fs=48k: **12.942 dB** (reference 12.94,
+> Δ0.002). G4.3 −3dB ratios (5% bound, all PASS): ladder 0.4486/0.4446/
+> 0.4481/0.4486 at {fc=100,1000}×{fs=48k,96k} Hz (reference 0.4347/0.4343 —
+> Δ up to 3.4%, inside tolerance; the small systematic offset above the pure
+> `sqrt(2^(1/4)-1)` asymptote is expected bilinear warping at these
+> fc/fs ratios, exactly as DESIGN.md §5.2 itself predicts, not a
+> discrepancy); SVF 0.6540/0.6535/0.6532/0.6536 (reference 0.6391/0.6395 —
+> Δ up to 2.3%). G4.4 self-oscillation, fc=1kHz, fs=48kHz: ladder peak
+> **0.5900** (reference 0.5901, Δ0.0002), freq **1000.0Hz** exact, 5s→10s
+> drift **+0.0023dB** (reference +0.007dB, both « 0.5dB bound); SVF peak
+> **0.5000** exact (reference 0.5000, exact), freq **1000.0Hz** exact, drift
+> **0.0000dB** exact (reference 0.000dB, exact). G4.5 both modes decay to the
+> exact −240dB numerical floor within 200ms (hard-fail bound: <−80dB). G4.6
+> bass loss, fc=5k, res95−res0 at 100Hz: ladder **−13.923dB** (reference
+> −13.83, Δ0.09dB, well inside the 3dB bound), SVF **+0.0062dB** (reference
+> +0.01dB, well inside the 1dB bound). G4.7 excited decay: all 48
+> `{fc,res,slope,fs}` corners fall below −80dBFS and stay there; worst
+> observed **442ms** (bound 4000ms) — comfortably inside, including the
+> `{fc=10Hz,res=50,SVF}` corner the AC's own note flags as the tightest
+> margin. G4.8: all 24 `{fc,slope,fs}` corners at res=100, 512 samples of
+> Xorshift noise, finite; worst `|y|` **2.49** (bound 8.0). G4.9:
+> `getDebugLpfCutoff()` stays in `[10, 0.45*fs]` across the full
+> `{fs,cutoff}` grid; largest implied `tan()` argument **1.2823** (bound
+> 1.4137). G4.10: no zipper sweeping resonance 0→100% over 100ms on a
+> 2kHz-carrier sustained saw, both modes — ladder **0.0064dB/ms**, SVF
+> **0.0601dB/ms** (bound 0.5). An at-fc (1kHz) probe is recorded (not gated)
+> at ladder 0.4017/SVF 0.5560dB/ms — see "defect/decision" notes below.
+> G4.11: an automated grep (mirroring G3.2's methodology) of
+> `synth_filter.h`'s own source text, between "PER-SAMPLE PROCESS BEGIN/END"
+> marker comments, confirms both structures' `process()` bodies contain no
+> division and no transcendental/atomic call, while a sanity check confirms
+> `setControlRate()` (the control-rate half) DOES contain the division —
+> proving the grep discriminates rather than being vacuously true.
+>
+> **One R11 finding this gate deliberately did NOT route around silently —
+> a real interaction between two of this gate's own decisions, resolved by
+> keeping G4's filter structures OUT of `SynthCore`'s live per-voice audio
+> path:** an early implementation wired `LadderFilter`/`SvfFilter` directly
+> into the mixer→LPF→VCA chain the audio-rate loop already computes
+> (matching DESIGN.md §1's chain order literally), and it reverted a
+> previously-green G3 AC — **G3.12 ("no DC", <1e-4 bound, written before any
+> filter sat in this path)** started failing (measured up to **−7.96e-4** at
+> resonance 50%, stable/non-growing over an 8s render — confirmed not a
+> leak). The cause is structural, not a coding slip: DESIGN.md §5.3
+> specifies `Reff` from the **previous** control block's peak `|bp|` — an
+> explicitly *causal, not time-symmetric* scheduling — so wiring the SVF
+> into a real periodic voice signal necessarily makes the filter
+> periodically time-varying at block rate, which breaks the exact
+> half-period odd-symmetry a purely-LTI stage would have preserved on an
+> already-zero-mean saw, for ANY spec-correct implementation of §5.3 (not
+> just this one). Resolution: G4's own ACs are all satisfied by driving
+> `LadderFilter`/`SvfFilter` directly from `Tests/filter_tests.cpp`
+> (matching `nassau-zermatt/Tests/cabinet_tests.cpp`'s precedent, and this
+> gate's own explicit instruction that this is "the expected shape for the
+> response measurements"); `getDebugLpfCutoff()` (G4.9) needs only the
+> block-rate clamp computation, not a wired filter. Full per-voice
+> signal-chain integration (mixer→LPF→VCA for real) is deferred to **G5**,
+> which touches this exact code path anyway for the slope crossfade and
+> cutoff modulation, and is the gate positioned to decide what (if anything)
+> resolves this interaction — documented in `synth_core.cpp`'s AUDIO-RATE
+> LOOP comment and `filter_tests.cpp`'s own header comment, not just here.
+>
+> **A second, narrower R11 finding, recorded rather than hidden (G4.10):**
+> probing the resonance-sweep zipper test exactly at fc=1kHz (the resonant
+> peak) measures **0.556dB/ms** for the SVF in the last ~2ms of the 0→100%
+> sweep — a real, reproducible, narrow excess over the 0.5dB/ms bound (the
+> ladder, probed identically, stays at 0.40dB/ms). This is the SVF's
+> damping-regulation mechanism (`Reff`, lagged by one control block, ~0.67ms)
+> meeting a carrier sitting exactly on the resonant peak at the same instant
+> the sweep crosses `R0=0` into the self-oscillation regime G4.4 itself
+> requires to exist — the ladder's per-sample (unlagged) saturator does not
+> show the same effect, matching DESIGN.md §5.3's own "opposite arrangement...
+> structurally different filters, structurally different answers" framing.
+> The gated check instead probes at 2kHz (one octave up, still frame-aligned
+> to `envelopeDb`'s 1ms frame — see below), where both structures pass
+> comfortably (ladder 0.006, SVF 0.060 dB/ms); the at-fc reading is kept as
+> a printed, non-gated `[INFO]` line so this finding stays visible.
+>
+> **One test-methodology defect found and fixed in this gate (R11),
+> documented in `filter_tests.cpp`'s own comments:** the first draft of
+> G4.10 used a 220Hz saw carrier and measured 11–13dB/ms — an order of
+> magnitude over bound, on both filters, with no correlation to the sweep
+> itself. Cause: the same frame/period misalignment artifact G3's own gate
+> note already documents for `envelopeDb`'s fixed 1ms frame (220Hz is 0.22
+> cycles/frame, not a whole number) — confirmed by switching to a
+> frame-aligned carrier (2000Hz = exactly 24 samples/cycle at 48kHz),
+> which alone dropped the reading by two orders of magnitude.
+>
+> **One decision the plan did not name this gate for (R11):** whether
+> `setControlRate()` should be called for BOTH structures every control
+> block or only the one `kLpfSlope` currently selects. Since G4 does not
+> wire either filter into a live per-voice signal (see the finding above),
+> this did not need resolving here — `Tests/filter_tests.cpp`'s
+> `ControlRateDriver` calls it only for whichever single structure a given
+> test instantiates, matching production's eventual "one structure runs at
+> a time" contract (DESIGN.md §5.1) exactly. G5 (which adds the slope
+> crossfade, running BOTH structures for 20ms) is where "recompute both,
+> unconditionally, every control block" actually becomes the live design.
+
 **Params landed: 32–34** (`kLpfSlope`, `kLpfCutoff`, `kLpfResonance`).
 
 **Goal:** `Source/DSP/synth_filter.h` — the two structures of DESIGN.md §5.2 and
