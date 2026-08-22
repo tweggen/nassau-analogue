@@ -1606,6 +1606,67 @@ law, and the shared-modulation structure that keeps it under 2×.
 
 **Requires Windows or macOS** (DESIGN.md §0.4). No new params.
 
+> **STATUS: PARTIALLY DONE** (R10/R11). This gate splits cleanly along
+> DESIGN.md §0.4's platform line: the SDK-free half (framing math, preset
+> table, DSP-level preset voicing) was fully implemented AND verified on the
+> Linux dev box; the SDK-dependent half (the actual `NassauAnaloguePlugin`
+> wrapper, MIDI translation, and every host-validator AC) was fully WRITTEN
+> but is **unbuilt and unverified** — `external/iplug2` is unchecked-out here
+> (DESIGN.md §0.4) and `Source/Plugin/` cannot be compiled on this platform at
+> all. No AC below is claimed met on the strength of the code merely looking
+> right (this project's own repeated lesson, see this gate's task note).
+>
+> Measured on the Linux dev box (g++ 15.3.0, cmake 4.3.4):
+> `ctest --test-dir build` → **12/12 test binaries passed** (the 10 pre-
+> existing G0–G8/G11 binaries plus the two new ones this gate adds),
+> `StateTests` 15/15 checks, `PresetTests` 32/32 checks, 0 compiler warnings
+> at `-Wall -Wextra -Wpedantic` across `Source/DSP` + `Source/Plugin` (the
+> SDK-free headers) + `Tests` (both the default and
+> `-DNASSAU_FORCE_HEADLESS=ON` configs — the latter is otherwise a no-op here
+> since the plugin subdirectory is never added on Linux either way).
+> `GoldenParityG5` and `GoldenParity` both still pass at **exactly 0.000e+00**
+> max abs error (tol 1e-6) — this gate touched no DSP code, only
+> `Source/Plugin/` and `Tests/`, so this is the expected, confirming result,
+> not a coincidence.
+>
+> **Per-AC verdict** (verified here vs. written-but-unbuilt):
+>
+> | AC | Verdict | Evidence |
+> |---|---|---|
+> | G9.1 | **VERIFIED** | `StateTests` (`Tests/state_tests.cpp`), sized to the real 53-param surface: same-count round-trip exact, fewer-stored keeps appended defaults, more-stored skips the tail with no overread, bad-magic legacy fallback restores raw params. 15/15 checks. |
+> | G9.2 | **VERIFIED** (at the pure-framing level) | The same `StateTests` binary asserts `UnserializeState`'s modelled end position lands exactly on a trailing sentinel byte in all three non-bad-magic cases (same-count/fewer-stored/more-stored) — this is `PlanUnserialize`'s own contract, which `NassauAnaloguePlugin::UnserializeState` consumes unchanged from `nassau_state.h`. The actual SDK-side `IByteChunk`/VST3 `SetState` behaviour this feeds is unverified (see below). |
+> | G9.3 | **PARTIALLY VERIFIED** | `nassau_presets::kParamCount == 53 == SynthCore::kNumParams` and `kPresetCount == 12` are runtime-checked in `PresetTests`. The SDK-side half — `kNumParams == PLUG_N_PARAMS`, `kNumPresets == PLUG_N_PRESETS`, and the 53 `nassau_presets::k* == k*` drift-guard `static_assert`s in `NassauAnaloguePlugin.cpp` — is written but cannot be compiled here (needs `EParams`/`config.h` in an actual translation unit built against the SDK). |
+> | G9.4 | **PARTIALLY VERIFIED** | `PresetTests` confirms every preset's discrete-typed (enum/bool/int) values are whole-number step-aligned, and that recall from `nassau_presets::Presets()` via `ApplyPresetToSynthCore` reproduces the table's own values exactly (by construction — there is one table, read directly). The actual IPlug2 `IParam::Value()` round-trip through a live `MakePresetFromChunk`-built preset is unverified (needs the SDK). |
+> | G9.5 | **VERIFIED** | `PresetTests`: all 12 presets, each driven with a 4-note chord (C3/E3/G3/C4, 1.5 s held + 0.5 s release) at 48 kHz against a bare `SynthCore`, are finite throughout and peak in [-30, 0] dBFS. Measured peaks range from -10.35 dBFS (Sub Bass) to -0.29 dBFS (PWM Pad) — see this gate's report for the full per-preset table. Five presets needed an explicit `kMasterVolume` headroom trim below their raw first-pass value once actually measured (R11: found by measurement, not assumed). |
+> | G9.6 | **WRITTEN, UNBUILT, UNVERIFIED** — requires Windows/macOS | `OnParamChange`/`UnserializeState` are written to never call `SetParameterValue` (R9) — `UnserializeState` only calls `GetParam(i)->Set(v)` directly on the IParam, which is the same non-notifying path NassauZermatt's proven implementation uses, not the processor-initiated setter R9 forbids. Not exercised against a real debug build/host. |
+> | G9.7 | **WRITTEN, UNBUILT, UNVERIFIED** — requires Windows/macOS | `TranslateMidiMsg` preserves `msg.mOffset` into `NoteEvent::sampleOffset` unconditionally, and `ProcessBlock` drains `mMidiQueue` in order without ever collapsing an offset to 0. The exact `IMidiMsg`/`IMidiQueue` API (member/method names, `IPlugMidi.h`'s existence under that name) could not be checked against the real SDK headers — see the code's own top-of-file note. |
+> | G9.8 | **WRITTEN, UNBUILT, UNVERIFIED** — requires Windows/macOS | Note-off velocity is captured (`msg.Velocity()/127`); a velocity-0 NoteOn is translated to NoteOff (MIDI convention); CC64/120/123 map to Sustain/AllSoundOff/AllNotesOff; every other CC and every other status type is deliberately ignored (returns false, no event). Channel is never read anywhere in `TranslateMidiMsg`/`ProcessMidiMsg` — omni by construction, matching `PLUG_DOES_MPE 0`. Running status is a raw-MIDI-stream concept resolved below `ProcessMidiMsg`'s abstraction (the host always hands over a complete, decoded `IMidiMsg`), so there is nothing this wrapper needs to do for it beyond receiving what the SDK delivers. |
+> | G9.9 | **NOT RUN** — requires Windows/macOS + VST3 validator | Code written; no build exists to validate. |
+> | G9.10 | **NOT APPLICABLE on Linux** (would be N/A on Windows too; needs macOS) | Recorded per the AC's own instruction. |
+> | G9.11 | **NOT RUN** — requires Windows/macOS + a CLAP host | Code written (`clap_entry`, id derived from `BUNDLE_ID` = `com.Nassau.NassauAnalogue` per `config.h`'s `BUNDLE_DOMAIN`/`BUNDLE_MFR`/`BUNDLE_NAME`); note-ports advertisement from `PLUG_DOES_MIDI_IN` is one of G0's four UNVERIFIED iPlug2 assumptions and still is. |
+> | G9.12 | **NOT RUN** — requires Windows/macOS + a real host | `PLUG_CHANNEL_IO "0-2"` and `kInstrument` are both written as specified (G0.10/config.h) but their acceptance by iPlug2/a real host is unconfirmed. |
+> | G9.13 | **PARTIALLY VERIFIED** | Source-level: `SetLatency` is never called anywhere in `NassauAnaloguePlugin.cpp` (grep-confirmed), and `PLUG_LATENCY` stays `0` in `config.h` (unchanged since G0). Host-observable confirmation (the host actually reads back latency 0) is unverified. |
+>
+> **Verified here (10 sub-ACs):** G9.1, G9.2 (framing level), G9.3 (DSP-side
+> half), G9.4 (table-level half), G9.5, G9.13 (source level).
+> **Written but unbuilt/unverified, pending Windows/macOS (7 sub-ACs):** the
+> SDK-side halves of G9.3/G9.4, all of G9.6–G9.12.
+>
+> **Plan defect found (R11):** none. The gate's own task note anticipated
+> this exact split (DESIGN.md §0.4) and instructed exactly this treatment —
+> nothing here contradicts the plan, only confirms its own stated boundary.
+>
+> Deliverables written: `Source/Plugin/nassau_presets.h` (12 presets, single
+> source of truth, shared by `NassauAnaloguePlugin.cpp`'s preset-bank ctor
+> loop and `Tests/preset_tests.cpp`), `Source/Plugin/NassauAnaloguePlugin.h/
+> .cpp` (all 53 params registered, `ProcessMidiMsg`/`IMidiQueue`-drained
+> `ProcessBlock`, `OnReset`, full `OnParamChange` switch,
+> `SerializeState`/`UnserializeState`), `Tests/state_tests.cpp` (`StateTests`),
+> `Tests/preset_tests.cpp` (`PresetTests`). `Source/Plugin/nassau_state.h` was
+> already correct from G0 and needed no change. See the G9 gate report
+> (session record) for the full preset-by-preset architectural description
+> and the per-preset measured peak table.
+
 **Goal:** the IPlug2 instrument wrapper. Copy the *shape* of
 `nassau-zermatt/Source/Plugin/` — it is proven — and change what an instrument
 needs changed.

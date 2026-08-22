@@ -139,6 +139,34 @@ target_compile_options(stereo_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME StereoTests COMMAND stereo_tests)
 
+# ---- G9.1/G9.2: versioned state framing (Source/Plugin/nassau_state.h) ----
+# Header-only, dependency-free (no SDK, no nassau_synth_core link needed) --
+# state_tests.cpp exercises nassau_state.h's PlanUnserialize/MagicMatches
+# directly against a hand-rolled IByteChunk model, same shape as
+# nassau-zermatt/Tests/state_tests.cpp (docs/GATES.md G9's own "copy the
+# shape" instruction). Only include path needed is Source/Plugin.
+add_executable(state_tests state_tests.cpp)
+target_include_directories(state_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/Plugin)
+target_compile_options(state_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME StateTests COMMAND state_tests)
+
+# ---- G9.3/G9.4/G9.5: factory preset bank (Source/Plugin/nassau_presets.h) -
+# Links nassau_synth_core: preset_tests.cpp applies nassau_presets.h's 12
+# preset arrays directly to a bare SynthCore (ApplyPresetToSynthCore), no SDK
+# needed -- the same boundary state_tests.cpp above established. Needs both
+# Source/DSP (synth_core.h) and Source/Plugin (nassau_presets.h) on the
+# include path.
+add_executable(preset_tests preset_tests.cpp)
+target_link_libraries(preset_tests nassau_synth_core)
+target_include_directories(preset_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/Plugin)
+target_compile_options(preset_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+
+add_test(NAME PresetTests COMMAND preset_tests)
+
 # ---- G11.4/G11.5/G11.6: throughput benchmark (Tests/synth_bench.cpp) ------
 # Deliberately NOT wired to add_test(): a wall-clock number is load-sensitive
 # and makes a bad pass/fail signal (docs/GATES.md G11's own file-header

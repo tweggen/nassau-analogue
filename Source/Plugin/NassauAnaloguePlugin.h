@@ -1,6 +1,16 @@
 #pragma once
 #include "config.h"
 #include "IPlug_include_in_plug_hdr.h"
+// IMidiMsg/IMidiQueue (iPlug2's MIDI wire types, used by ProcessMidiMsg/
+// ProcessBlock below). UNVERIFIED (DESIGN.md §0.4): the SDK's iplug2
+// submodule is unchecked-out on this Linux dev box, so this header's exact
+// name could not be confirmed -- "IPlugMidi.h" is the file that defines both
+// IMidiMsg and IMidiQueue in the publicly documented iPlug2 tree. If
+// IPlug_include_in_plug_hdr.h already pulls this in transitively (likely,
+// since iplug::Plugin's own API surface depends on IMidiMsg), this include is
+// harmless and redundant; if the filename differs, this is the one line a
+// Windows/macOS build needs to correct first -- see this gate's report.
+#include "IPlugMidi.h"
 #include "synth_core.h"
 
 #if IPLUG_EDITOR
@@ -8,21 +18,15 @@
 #endif
 
 // FINAL parameter surface (DESIGN.md §11, 53 params, append-only, R4), in its
-// FINAL frozen index order. Unlike nassau-zermatt's own G0 (which grew
-// PLUG_N_PARAMS gate by gate), this instrument's config.h already fixes
-// PLUG_N_PARAMS at 53 from G0 (docs/GATES.md's own G0 "Instrument-specific
-// config.h values" snippet) — matching SynthCore's own "declare the complete
-// final API early" shape (synth_core.h's class comment). So EParams below
-// already names all 53 indices; only kMasterVolume/kOutputClip are actually
-// REGISTERED with a GetParam(i)->InitXxx() call in the constructor at G0 (see
-// the .cpp) — every other index exists as a frozen position (its enum value
-// will never move, R4) but is not yet wired to a live IParam. Each gate below
-// adds its own InitXxx() call(s) when it lands, never reordering this enum.
+// FINAL frozen index order. G9 (docs/GATES.md) wires every one of these to a
+// live IParam in the constructor (see the .cpp) -- G0 only ever wired
+// kMasterVolume/kOutputClip, but this enum's SHAPE has been complete and
+// frozen since G0 (see that gate's own note in the .cpp/.h history).
 //
 // APPEND-ONLY PARAM DISCIPLINE (state compatibility): params are serialized
 // positionally by enum index (see nassau_state.h). To keep saved states
 // forward/backward compatible, params must NEVER be reordered or inserted in
-// the middle — this enum is already complete, so "append-only" from here on
+// the middle -- this enum is already complete, so "append-only" from here on
 // means "never change a value below", not "add more entries".
 enum EParams {
     // ---- G0: indices 0-1 --------------------------------------------------
@@ -100,15 +104,10 @@ enum EParams {
 static_assert(kNumParams == PLUG_N_PARAMS, "Parameter count mismatch");
 
 // Factory preset count. Kept in lockstep with PLUG_N_PRESETS (config.h) by
-// the static_assert below. G0: config.h already fixes PLUG_N_PRESETS at the
-// FINAL count (12), matching the params-surface treatment above, but the
-// bank itself (Source/Plugin/nassau_presets.h) and the constructor's
-// preset-creation loop are a G9 deliverable (docs/GATES.md) — there is
-// nothing meaningful to preset-recall-test before the full param surface (and
-// therefore every preset's parameter values) exists. G9 adds both
-// nassau_presets.h and the runtime seatbelt assert (NPresets() ==
-// kNumPresets) that nassau-zermatt's own constructor uses, once the loop
-// that actually creates the 12 presets is in place.
+// the static_assert below and re-checked at runtime against NPresets() in
+// the ctor. The full 12-preset bank is defined once in
+// Source/Plugin/nassau_presets.h (single source of truth, also used by
+// Tests/preset_tests.cpp, docs/GATES.md G9).
 static constexpr int kNumPresets = 12;
 static_assert(kNumPresets == PLUG_N_PRESETS, "Preset count mismatch");
 
@@ -120,38 +119,52 @@ public:
     void OnReset() override;
     void OnParamChange(int paramIdx) override;
 
-    // Versioned, forward-compatible state (lands fully at G9, docs/GATES.md).
-    // See nassau_state.h for the chunk layout and the tolerant read rules.
+    // MIDI in (DESIGN.md §10.1/§10.2, docs/GATES.md G9.7-G9.8): every
+    // NoteOn/NoteOff/PolyAftertouch(ignored)/ControlChange/PitchWheel message
+    // the host delivers is queued here, offset-preserving, and drained into a
+    // NoteEvent array at the top of ProcessBlock. Channel is deliberately
+    // IGNORED (omni, G9.8) -- DESIGN.md's NoteEvent has no channel field and
+    // this instrument does not do MPE (PLUG_DOES_MPE 0, config.h).
+    void ProcessMidiMsg(const iplug::IMidiMsg& msg) override;
+
+    // Versioned, forward-compatible state (nassau_state.h: chunk layout and
+    // the tolerant read rules). Design copied verbatim from NassauZermatt's
+    // own proven SerializeState/UnserializeState (docs/GATES.md G0's config.h
+    // note: "PLUG_DOES_STATE_CHUNKS 0, yet SerializeState IS overridden --
+    // copy zermatt's stance verbatim, it is proven").
     bool SerializeState(iplug::IByteChunk& chunk) const override;
     int  UnserializeState(const iplug::IByteChunk& chunk, int startPos) override;
 
 private:
     static iplug::Config MakePluginConfig();
 
-    // Number of EParams indices actually registered with a live IParam (via
-    // GetParam(i)->InitXxx() in the constructor) so far. G0: just the two
-    // below. OnReset() re-pushes exactly this many indices through
-    // OnParamChange() -- NOT all of kNumParams, since indices past this are
-    // frozen POSITIONS (R4) but have no live IParam yet (see the EParams
-    // comment above). Bump this alongside each gate's own InitXxx() calls.
-    static constexpr int kNumWiredParams = 2; // kMasterVolume, kOutputClip
-
     SynthCore mCore;
     static constexpr int kMaxBlockSize = 8192;
 
     // SynthCore is natively STEREO (DESIGN.md §11 "Channel configuration",
-    // PLUG_CHANNEL_IO "0-2") — unlike NassauZermatt there is no mono core and
+    // PLUG_CHANNEL_IO "0-2") -- unlike NassauZermatt there is no mono core and
     // no mono-sum/broadcast wrapper here: ProcessBlock writes directly to the
     // two output channels. Fixed-size (R3: no allocation in the audio path).
     float mOutL[kMaxBlockSize];
     float mOutR[kMaxBlockSize];
 
-    // MIDI handling (ProcessMidiMsg -> an IMidiQueue drained into a fixed-size
-    // NoteEvent array each block, DESIGN.md §10.1/§10.2) is a G9 deliverable
-    // (docs/GATES.md: "the IMidiQueue drain semantics G9.7 depends on" is one
-    // of the four iPlug2 assumptions G9 must verify first, DESIGN.md §0.4 —
-    // iplug2's submodule is unchecked-out on this box and could not be read
-    // while G0 was written). At G0, SynthCore::process() ignores events
-    // entirely regardless (synth_core.h's class comment), so ProcessBlock
-    // below simply calls it with events == nullptr.
+    // ---- MIDI (DESIGN.md §10.1/§10.2, docs/GATES.md G9.7) -----------------
+    // iPlug2's IMidiQueue buffers incoming IMidiMsg's (each carrying its own
+    // sample-accurate mOffset within the CURRENT block) between
+    // ProcessMidiMsg() calls (which the host/framework invokes for every
+    // event, sample-accurately, before ProcessBlock()) and the actual drain
+    // in ProcessBlock() below. This preserves G9.7's "sampleOffset ==
+    // s" guarantee: the queue is keyed on mOffset, never collapses it to 0.
+    iplug::IMidiQueue mMidiQueue;
+
+    // Fixed-size scratch array (R3: no allocation in process()) that
+    // ProcessBlock() fills by draining mMidiQueue, then hands to
+    // SynthCore::process() as the framework-free NoteEvent list (DESIGN.md
+    // §10.1). Sized generously: a MIDI 1.0 stream at typical host block sizes
+    // essentially never delivers more events than this in one block (dense
+    // controller sweeps aside, which this instrument does not listen to --
+    // only note on/off, sustain, all-notes/sound-off and pitch bend cross
+    // into NoteEvent at all, see TranslateMidiMsg in the .cpp).
+    static constexpr int kMaxEventsPerBlock = 256;
+    NoteEvent mEventBuf[kMaxEventsPerBlock];
 };
