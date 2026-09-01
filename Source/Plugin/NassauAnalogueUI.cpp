@@ -75,26 +75,39 @@ struct Binder {
     }
 
     // Evenly-spaced knobs across `row`.
+    //
+    // GetHPadded, NOT GetPadded: the gutter between neighbouring cells is
+    // wanted, but the 4px that GetPadded also takes off the TOP and BOTTOM is
+    // not. IVectorBase::MakeRects hands the label its measured text height
+    // off the top and the value its measured text height off the bottom, and
+    // whatever survives is the knob -- so every vertical pixel spent on
+    // padding comes straight out of the knob's diameter. The row heights
+    // below are budgeted exactly (label + knob + value); padding them again
+    // here is what starved the widget in the first place.
     void KnobRow(const IRECT& row, const IVStyle& style,
                  std::initializer_list<std::pair<int, const char*>> knobs)
     {
         const int n = static_cast<int>(knobs.size());
         int i = 0;
         for (const auto& kv : knobs) {
-            Knob(row.GetGridCell(i, 1, n).GetPadded(-4.f), kv.first, kv.second, style);
+            Knob(row.GetGridCell(i, 1, n).GetHPadded(-4.f), kv.first, kv.second, style);
             ++i;
         }
     }
 
     // Evenly-spaced toggles across `row` (VCO2's Sync/KeyTrack, and single-
-    // toggle rows like Stereo/Output).
+    // toggle rows like Stereo/Output). Horizontal-only padding, for the same
+    // reason as KnobRow: an IVToggleControl draws its "Off"/"On" INSIDE the
+    // button (IVSwitchControl's valueInButton is hard-coded true for it), so
+    // any height taken off the row is height taken off the box that text has
+    // to fit in.
     void ToggleRow(const IRECT& row, const IVStyle& style,
                    std::initializer_list<std::pair<int, const char*>> toggles)
     {
         const int n = static_cast<int>(toggles.size());
         int i = 0;
         for (const auto& kv : toggles) {
-            Toggle(row.GetGridCell(i, 1, n).GetPadded(-4.f), kv.first, kv.second, style);
+            Toggle(row.GetGridCell(i, 1, n).GetHPadded(-4.f), kv.first, kv.second, style);
             ++i;
         }
     }
@@ -153,9 +166,13 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     const IColor kAccent(255, 212, 150, 64); // amber
 
     // ---- Layout metrics -------------------------------------------------
-    // EVERY dimension in the editor derives from this block, so the whole
-    // panel can be resized by changing these numbers plus PLUG_WIDTH/
-    // PLUG_HEIGHT in config.h.
+    // EVERY dimension in the editor derives from this block, and the block is
+    // constexpr precisely so the two static_asserts at the bottom of it can
+    // check the derived editor size against PLUG_WIDTH/PLUG_HEIGHT in
+    // config.h. Those asserts are the whole point: the previous version of
+    // this file carried the same arithmetic as a COMMENT, the comment drifted
+    // from the code, and the result was an editor whose content did not fit
+    // its own window. A comment cannot fail a build; a static_assert can.
     //
     // Panels are organised into three content rows, in exactly the group
     // order docs/GATES.md G10.2 lists, read left-to-right then top-to-
@@ -175,67 +192,138 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     // everywhere; rows with fewer weight units simply get a little more
     // breathing room per knob, which is a fine trade, not a defect.
     //
-    //   kKnobColW * 14 + kColGap * 4  =  64*14 + 8*4      =  896 + 32 = 928
-    //   PLUG_WIDTH = contentW + 2*kMargin                 =  928 + 16 = 944
+    // ---- how the VERTICAL budget is derived (the thing that was wrong) ----
     //
-    // Height is the sum of the three content rows' own heights (each row's
-    // height is set by its OWN tallest panel -- e.g. row 1 is set by VCO 2:
-    // title + 2 switch rows + 1 knob row + 1 toggle row), plus the header
-    // and keyboard strip:
-    //   row1 (VCO2 tallest): 16 + (20+4)*2 + 56 + 4 + 20  = 144
-    //   row2 (LPF tallest):  16 + 20+4 + 56+4 + 56         = 156
-    //   row3 (Voice tallest):16 + (20+4)*2 + 56            = 120
-    //   header 32, keyboard 90, 4x kRowGap(8) between the five bands
-    //   32 + 8+180 + 8+176 + 8+146 + 8+90 = 656
-    //   PLUG_HEIGHT = 656 + 2*kMargin(8) = 672
+    // IVectorBase::MakeRects (IControl.h) carves every IVControl's bounds up
+    // like this, and the row heights below are budgeted to match it exactly:
     //
-    // Grew from 590 after the first Windows screenshot: every font is +1pt and
-    // kSwitchH went 20 -> 30 so the tab captions stop being clipped.
+    //   * the LABEL takes MeasureText(labelText).H() off the TOP;
+    //   * the VALUE takes MeasureText(valueText).H() off the BOTTOM -- but
+    //     ONLY when the value text's EVAlign is Bottom. At EVAlign::Middle it
+    //     takes nothing and is drawn straight ON TOP of the widget instead;
+    //   * whatever is left is the widget, and for the button-ish controls
+    //     (IVSwitchControl and therefore IVTabSwitchControl/IVToggleControl,
+    //     which pass hasHandle=true) GetAdjustedHandleBounds then removes
+    //     another frameThickness + shadowOffset = kHandleInset off the height.
     //
-    // (53 params plus a keyboard needs considerably more room than Zermatt's
-    // 552x390 six-panel/25-param layout -- this is roughly 2.4x the area.)
-    const float kMargin     = 8.f;
-    const float kHeaderH    = 32.f;
-    const float kPanelTitle = 18.f;   // panel caption strip (+2 for the +1pt font)
-    const float kRowH       = 60.f;   // one knob row (knob + label + value; +4 for the +1pt font)
-    // 20 was too short to contain its own text: IVTabSwitchControl draws the
-    // LABEL above the widget and the tab captions inside it, so a 20px box with
-    // a 10pt label left the captions clipped -- visible in the first Windows
-    // screenshot on every wave/range/slope switch. 30 gives the label its own
-    // line and the tabs a legible box at the larger font. [voicing]
-    const float kSwitchH    = 30.f;   // one tab-switch / toggle row
-    const float kGap        = 4.f;    // vertical gap inside a panel
-    const float kColGap     = 8.f;    // horizontal gap between panels
-    const float kRowGap     = 8.f;    // vertical gap between bands
-    // kKnobColW (64px, the nominal per-knob-column width) is not read back
-    // here -- it only fed the PLUG_WIDTH arithmetic above at design time,
-    // the same way it is not an input to Zermatt's own placeRow() weighting
-    // either. Actual per-column widths come from normalising each row's
-    // panel weights to contentW below, exactly as NassauZermattUI.cpp does.
-    const float kKeyboardH  = 90.f;   // bottom keyboard strip
+    // Two consequences drove this rewrite:
+    //
+    // 1. iPlug2's own DEFAULT_VALUE_TEXT is {DEFAULT_TEXT_SIZE, Bottom}, but
+    //    the IText(size, color, fontID) constructor defaults valign to
+    //    MIDDLE. Every IText here is built with that constructor, so every
+    //    knob silently got a Middle-aligned value -- i.e. the value string
+    //    painted across the middle of the knob face, over the pointer. It
+    //    survived review on Windows because Segoe UI is narrow enough at 10pt
+    //    that "-5.2 cents" stayed inside the knob and read as deliberate; in
+    //    macOS Helvetica the same string is ~10% wider, spills past the knob
+    //    on both sides, and reads as broken. Fixed by spelling the alignment
+    //    out (kKnobValueText below) rather than relying on a default.
+    //
+    // 2. The switch/toggle rows were 20px, then 30px, and both were too short
+    //    to contain their own text: at 30px an IVToggleControl kept 30 - 4
+    //    (this file's old GetPadded(-4)) - 10 (label) - 4 (handle inset) = 12
+    //    for a widget that has to hold an 11pt "Off"/"On" -- so the value was
+    //    drawn clipped in half. The heights below are computed from the font
+    //    sizes instead of guessed, and the row helpers pad horizontally only.
+    //
+    // MeasureText's returned HEIGHT is the em box, not the glyph extent, so
+    // it comes back as exactly the point size -- MEASURED on macOS/Skia, for
+    // every size used here (10, 11, 12, 17), which is what lets the vertical
+    // budget below be constexpr at all. The Windows build goes through the
+    // same Skia backend, so the same should hold there; if a future Windows
+    // screenshot ever shows vertical clipping, that assumption is the first
+    // thing to re-measure. Text WIDTH is emphatically NOT portable (Helvetica
+    // runs ~10% wider than Segoe UI at the same size), which is exactly why
+    // the fix for (1) is a layout change and not a "drop the font a point on
+    // macOS" fudge.
+    constexpr float kMargin     = 8.f;
+    constexpr float kHeaderH    = 32.f;
+    constexpr float kGap        = 4.f;    // vertical gap inside a panel
+    constexpr float kColGap     = 8.f;    // horizontal gap between panels
+    constexpr float kRowGap     = 8.f;    // vertical gap between bands
+    constexpr float kKnobColW   = 64.f;   // nominal per-knob-column width; feeds the width assert
+    constexpr float kKeyboardH  = 80.f;   // bottom keyboard strip
+
+    // Text point sizes. Named, because the row heights below are computed
+    // from them -- change a size and the layout follows, instead of the two
+    // silently drifting apart.
+    constexpr float kTitleTextSz = 12.f;  // panel caption
+    constexpr float kKnobLabelSz = 11.f;
+    constexpr float kKnobValueSz = 10.f;
+    constexpr float kSwLabelSz   = 10.f;  // tab switch + toggle label
+    constexpr float kSwValueSz   = 10.f;  // tab captions
+    constexpr float kTogValueSz  = 11.f;  // toggle "Off"/"On"
+
+    // Height MakeRects hands to GetAdjustedHandleBounds and never gives back:
+    // frameThickness (1, halved off each edge) + shadowOffset (3, off the
+    // bottom only) with iPlug2's DEFAULT_STYLE. Applies to the button-shaped
+    // controls only -- IVKnobControl does not pass hasHandle.
+    constexpr float kHandleInset = 4.f;
+
+    // The clear height each widget must keep AFTER label/value/inset, chosen
+    // so the text inside it is never clipped and the knob stays a knob.
+    constexpr float kTabH   = 20.f;   // tab-caption box in a tab switch
+    constexpr float kTogH   = 22.f;   // button box in a toggle
+    constexpr float kKnobD  = 45.f;   // knob diameter
+
+    constexpr float kPanelTitle = kTitleTextSz + 6.f;                        // 18
+    constexpr float kSwitchH    = kSwLabelSz + kHandleInset + kTabH;         // 34
+    constexpr float kToggleH    = kSwLabelSz + kHandleInset + kTogH;         // 36
+    constexpr float kRowH       = kKnobLabelSz + kKnobD + kKnobValueSz;      // 66
+
+    // Row heights: each set by its own tallest panel's internal stack --
+    // row 1 by VCO 2 (title + 2 switches + knob row + toggle row), row 2 by
+    // LPF (title + switch + 2 knob rows), row 3 by Voice (title + 2 switches
+    // + knob row).
+    constexpr float row1H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH + kGap + kToggleH;
+    constexpr float row2H = kPanelTitle + (kSwitchH + kGap) + kRowH + kGap + kRowH;
+    constexpr float row3H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH;
+
+    // ...and the editor size those add up to. If either assert fires, change
+    // PLUG_WIDTH/PLUG_HEIGHT in config.h to the number the compiler names --
+    // do not "fix" it by shaving a row, which is how the content came to
+    // overflow its window in the first place.
+    constexpr float kEditorW = kKnobColW * 14.f + kColGap * 4.f + 2.f * kMargin;
+    constexpr float kEditorH = kHeaderH
+                             + kRowGap + row1H
+                             + kRowGap + row2H
+                             + kRowGap + row3H
+                             + kRowGap + kKeyboardH
+                             + 2.f * kMargin;
+    static_assert(kEditorW == static_cast<float>(PLUG_WIDTH),
+                  "PLUG_WIDTH does not match the width this layout needs");
+    static_assert(kEditorH == static_cast<float>(PLUG_HEIGHT),
+                  "PLUG_HEIGHT does not match the height this layout needs");
 
     const IText header(17, kText, "default", EAlign::Near);
     const IText brand(12, kAccent, "default", EAlign::Far);
-    const IText colHdr(12, kAccent, "default", EAlign::Center);
+    const IText colHdr(kTitleTextSz, kAccent, "default", EAlign::Center);
+
+    // EVAlign::Bottom, spelled out: see note (1) in the metrics block above.
+    // This is what puts the value UNDER the knob instead of across its face.
+    const IText kKnobValueText(kKnobValueSz, kText, "default", EAlign::Center, EVAlign::Bottom);
 
     const IVStyle knobStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
-        .WithLabelText(IText(11, kText, "default"))
-        .WithValueText(IText(10, kText, "default"))
+        .WithLabelText(IText(kKnobLabelSz, kText, "default"))
+        .WithValueText(kKnobValueText)
         .WithDrawFrame(false)
         .WithShowValue(true);
 
+    // The switch/toggle values are drawn INSIDE the widget -- IVSwitchControl
+    // hard-codes valueInButton, and overrides the valign to Middle itself --
+    // so their valign here is irrelevant and only the box height matters.
     const IVStyle switchStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
         .WithColor(kBG, kPanel)
-        .WithLabelText(IText(10, kText, "default"))
-        .WithValueText(IText(10, kText, "default"))
+        .WithLabelText(IText(kSwLabelSz, kText, "default"))
+        .WithValueText(IText(kSwValueSz, kText, "default"))
         .WithDrawFrame(true);
 
     const IVStyle toggleStyle = DEFAULT_STYLE
         .WithColor(kFG, kAccent)
-        .WithValueText(IText(11, kText, "default"))
-        .WithLabelText(IText(10, kText, "default"));
+        .WithValueText(IText(kTogValueSz, kText, "default"))
+        .WithLabelText(IText(kSwLabelSz, kText, "default"));
 
     ui.AttachPanelBackground(kBg);
 
@@ -269,12 +357,6 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     const PanelSpec kRow1[] = { { "VCO 1", 2.f }, { "VCO 2", 3.f }, { "SUB+NOISE", 2.f }, { "MIXER+DRIVE", 3.f } };
     const PanelSpec kRow2[] = { { "HPF", 2.f }, { "LPF", 3.f }, { "ENV-F", 4.f }, { "ENV-A", 4.f } };
     const PanelSpec kRow3[] = { { "LFO", 4.f }, { "POLY-MOD", 2.f }, { "VOICE", 4.f }, { "STEREO", 2.f }, { "OUTPUT", 2.f } };
-
-    // Row heights: each set by its own tallest panel's internal stack (see
-    // the metrics comment above for the arithmetic).
-    const float row1H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH + kGap + kSwitchH; // VCO 2
-    const float row2H = kPanelTitle + kSwitchH + kGap + kRowH + kGap + kRowH;             // LPF
-    const float row3H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH;                    // Voice
 
     IRECT cols[13];
     {
@@ -335,7 +417,7 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
         bind.KnobRow(IRECT(c.L, y, c.R, y + kRowH), knobStyle,
                      { { kOsc2Semi, "Semi" }, { kOsc2Fine, "Fine" }, { kOsc2PW, "PW" } });
         y += kRowH + kGap;
-        bind.ToggleRow(IRECT(c.L, y, c.R, y + kSwitchH), toggleStyle,
+        bind.ToggleRow(IRECT(c.L, y, c.R, y + kToggleH), toggleStyle,
                        { { kOsc2Sync, "Sync" }, { kOsc2KeyTrack, "KeyTrk" } });
     }
 
@@ -433,8 +515,8 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     {
         const IRECT& c = cols[11];
         float y = c.T + kPanelTitle;
-        bind.ToggleRow(IRECT(c.L, y, c.R, y + kSwitchH), toggleStyle, { { kStereoMode, "Stereo" } });
-        y += kSwitchH + kGap;
+        bind.ToggleRow(IRECT(c.L, y, c.R, y + kToggleH), toggleStyle, { { kStereoMode, "Stereo" } });
+        y += kToggleH + kGap;
         bind.KnobRow(IRECT(c.L, y, c.R, y + kRowH), knobStyle,
                      { { kStereoDetune, "Detune" }, { kStereoSpread, "Spread" } });
     }
@@ -443,8 +525,8 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     {
         const IRECT& c = cols[12];
         float y = c.T + kPanelTitle;
-        bind.ToggleRow(IRECT(c.L, y, c.R, y + kSwitchH), toggleStyle, { { kOutputClip, "Clip" } });
-        y += kSwitchH + kGap;
+        bind.ToggleRow(IRECT(c.L, y, c.R, y + kToggleH), toggleStyle, { { kOutputClip, "Clip" } });
+        y += kToggleH + kGap;
         bind.KnobRow(IRECT(c.L, y, c.R, y + kRowH), knobStyle, { { kMasterVolume, "Volume" } });
     }
 
