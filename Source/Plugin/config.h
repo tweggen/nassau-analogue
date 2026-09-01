@@ -91,16 +91,40 @@
 // G10: sized for the full 13-panel editor (VCO 1 / VCO 2 / Sub+Noise /
 // Mixer+Drive / HPF / LPF / ENV-F / ENV-A / LFO / Poly-Mod / Voice / Stereo /
 // Output, docs/GATES.md G10.2), covering all 53 params plus the preset
-// selector and an IVKeyboardControl strip along the bottom. See
-// NassauAnalogueUI.cpp's layout-metrics comment for the exact arithmetic
-// this size was derived from (was a 360x180 G0 placeholder covering only
-// kMasterVolume/kOutputClip).
+// selector and an IVKeyboardControl strip along the bottom.
+//
+// These two numbers are NOT free parameters and must not be hand-tuned:
+// NassauAnalogueUI.cpp's layout-metrics block computes the editor size its
+// own constants add up to and static_asserts it against exactly these
+// macros, so the two can no longer drift apart. (They had: the height here
+// said 672 while the layout needed more, and the overflow showed up as
+// clipped and overlapping text -- worse on macOS, whose Helvetica is wider
+// than the Segoe UI the layout had been eyeballed against on Windows.)
+// 672 -> 712 came with that fix: knob values moved out from on top of the
+// knob face to under it, and the switch/toggle rows grew enough to contain
+// their own captions.
 #define PLUG_WIDTH      944
-#define PLUG_HEIGHT     672
+#define PLUG_HEIGHT     712
 #define PLUG_FPS        60
 
 #define PLUG_SHARED_RESOURCES 0
 #define PLUG_HOST_RESIZE 0
+
+// ---- APP (standalone) -------------------------------------------------------
+// The standalone .app host (iPlug2's IPlugAPP + RTAudio/RTMidi via SWELL). It
+// exists so the editor and the synth can be looked at and PLAYED without
+// loading a DAW -- which is also how the UI layout gets verified on each
+// platform's own font metrics, the exact thing that produced the macOS
+// clipping this block was added while fixing.
+//
+// APP_NUM_CHANNELS is the standalone host's I/O width. 2 (not 0) even though
+// PLUG_CHANNEL_IO is "0-2": IPlugAPP always opens a duplex stream, and the
+// input side is simply never read by an instrument.
+#define APP_NUM_CHANNELS       2
+#define APP_N_VECTOR_WAIT      0
+#define APP_MULT               1
+#define APP_COPY_AUV3          0
+#define APP_SIGNAL_VECTOR_SIZE 64
 
 // ---- VST3 -------------------------------------------------------------------
 #define VST3_SUBCATEGORY "Instrument|Synth"

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>NassauAnalogue</string>
+	<key>CFBundleGetInfoString</key>
+	<string>NassauAnalogue v0.1.0 Copyright 2026 Nassau</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.Nassau.app.NassauAnalogue</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NassauAnalogue</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>Nan1</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CSResourcesFileMapped</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.13.0</string>
+	<key>NSMainNibFile</key>
+	<string>NassauAnalogue-macOS-MainMenu</string>
+	<key>NSPrincipalClass</key>
+	<string>SWELLApplication</string>
+	<!-- The standalone opens the default input device via RTAudio; macOS
+	     requires a usage string before it will even prompt. This is an
+	     instrument (0-2), so it never reads the input, but SWELL/RTAudio
+	     still enumerate devices at startup. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NassauAnalogue enumerates audio devices to select an output.</string>
+</dict>
+</plist>
