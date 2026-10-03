@@ -1,0 +1,80 @@
+name: CI
+
+# The jobs call ci/gates.sh and do nothing else of substance (plan 50, D6): a
+# move off GitHub should rewrite this file, not the gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Always runs, needs nothing: no SDK, no submodules, no credentials, no macOS.
+  # This is the job that makes CI worth having on day one.
+  # ---------------------------------------------------------------------------
+  dsp:
+    name: DSP core + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Gate
+        run: ./ci/gates.sh
+        env:
+          CMAKE_GENERATOR: Ninja
+
+  # ---------------------------------------------------------------------------
+  # The plugin bundles, HEADLESS. Headless on purpose: it needs the SDK (a
+  # private repo, hence the deploy key) but NOT the prebuilt Skia release asset,
+  # which is the only part that would require an API token. So this job proves
+  # every format compiles and links against the real SDK using nothing but a
+  # read-only deploy key.
+  #
+  # TO ENABLE: add a repository secret NASSAU_SDK_DEPLOY_KEY containing a
+  # read-only deploy key for github.com/tweggen/nassau-plugin-sdk. Never a
+  # long-lived personal access token (plan 50, M3). Without the secret this job
+  # no-ops with a notice instead of failing, so a fork or a fresh clone is still
+  # green. If nassau-plugin-sdk is ever made public (plan 50, D10) the secret
+  # and the `if:` guards simply become unnecessary.
+  # ---------------------------------------------------------------------------
+  plugin:
+    name: Plugin bundles (macOS, headless)
+    runs-on: macos-14
+    steps:
+      - name: Check for the SDK deploy key
+        id: gate
+        env:
+          KEY: ${{ secrets.NASSAU_SDK_DEPLOY_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NASSAU_SDK_DEPLOY_KEY not set - skipping the plugin build."
+          fi
+
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Check out the Nassau plugin SDK
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: tweggen/nassau-plugin-sdk
+          path: sdk
+          # The SDK's own submodules (iplug2, vst3sdk) are public, so recursing
+          # needs no further credentials.
+          submodules: recursive
+          ssh-key: ${{ secrets.NASSAU_SDK_DEPLOY_KEY }}
+
+      - name: Provision the SDK's downloaded dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        run: cmake -DNASSAU_SDK_DIR="$PWD/sdk" -P sdk/cmake/ProvisionDeps.cmake
+
+      - name: Gate (with SDK)
+        if: steps.gate.outputs.enabled == 'true'
+        run: ./ci/gates.sh --sdk sdk --headless
+        env:
+          CMAKE_GENERATOR: Ninja
