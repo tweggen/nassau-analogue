@@ -117,9 +117,22 @@ every voice-loaded config.
 ## Dependencies
 
 NassauAnalogue consumes the shared **[nassau-plugin-sdk](../nassau-plugin-sdk)**
-via the `NASSAU_SDK_DIR` CMake cache variable, which defaults to the sibling
-checkout `../nassau-plugin-sdk`. The DSP core and tests build even without the
-SDK; only the plugin targets require it.
+through `cmake/NassauSDK.cmake`, a verbatim copy of the SDK's canonical
+locator (`cmake/bootstrap/NassauSDK.cmake` there -- re-copy it rather than
+editing this one). It resolves the SDK in a fixed order:
+
+1. an explicit `-DNASSAU_SDK_DIR=...`;
+2. a sibling checkout `../nassau-plugin-sdk`;
+3. `FetchContent` from the SDK's git remote (slow last resort; disable with
+   `-DNASSAU_SDK_ALLOW_FETCH=OFF`).
+
+Besides the vendored iplug2 + vst3sdk and `nassau_add_plugin()`, the SDK now
+also supplies the shared project prologue -- toolchain flags, OBJC/OBJCXX
+enablement, the MSVC `/MT` runtime selection -- that this repo used to carry as
+its own copy of nassau-zermatt's.
+
+The DSP core and tests build even without the SDK; only the plugin targets
+require it (gate G0.2).
 
 ## Platform support
 
