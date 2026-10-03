@@ -150,8 +150,7 @@ END
 
 3 TEXTINCLUDE
 BEGIN
-    "#include ""..\\config.h""\r\n"
-    "ROBOTO_FN TTF ROBOTO_FN\0"
+    "\0"
 END
 
 #endif    // APSTUDIO_INVOKED
@@ -162,9 +161,10 @@ END
 // Icon
 //
 
-// Icon with lowest ID value placed first to ensure application icon
-// remains consistent on all systems.
-IDI_ICON1               ICON                    "NassauAnalogue.ico"
+// No application icon ships yet, so the exe gets the default Windows icon.
+// IPlugAPP never loads IDI_ICON1 itself; to add one, drop a
+// NassauAnalogue.ico next to this file and restore:
+//   IDI_ICON1 ICON "NassauAnalogue.ico"
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -231,8 +231,8 @@ END
 //
 // Generated from the TEXTINCLUDE 3 resource.
 //
-#include "..\config.h"
-ROBOTO_FN TTF ROBOTO_FN
+// No embedded fonts: NassauAnalogueUI loads its font by system family name,
+// and config.h defines no ROBOTO_FN.
 /////////////////////////////////////////////////////////////////////////////
 #endif    // not APSTUDIO_INVOKED
 
