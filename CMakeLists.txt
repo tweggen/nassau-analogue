@@ -4,48 +4,26 @@ project(NassauAnalogue VERSION 0.1.0 LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# OBJC/OBJCXX exist only on Apple toolchains and are needed solely by iPlug2's
-# macOS plugin bundles — the DSP core and tests are plain C++. Enabling them in
-# project() unconditionally breaks configure on Windows/Linux, so enable them
-# here instead, from this top-level scope (iPlug2 requires that). Mirrors
-# nassau-zermatt/CMakeLists.txt verbatim (DESIGN.md §0.4, docs/GATES.md G0).
-if(APPLE)
-    enable_language(OBJC)
-    enable_language(OBJCXX)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
-endif()
+# Locate the shared Nassau plugin SDK and apply its project prologue: the
+# OBJC/OBJCXX enablement, the macOS deployment target, NASSAU_WARNING_FLAGS /
+# NASSAU_RELEASE_OPT_FLAGS, and the MSVC /MT runtime selection that keeps the
+# DSP core from linking /MD against a /MT plugin (LNK2038).
+#
+# This replaces ~45 lines that used to live here and, verbatim, in
+# nassau-zermatt and nassau-eq -- the duplication the comment at the top of
+# this file used to admit to. The reasoning now lives once, in the SDK's
+# cmake/NassauPluginProject.cmake. Two constraints that file documents and this
+# call site has to honour: it must come BEFORE the first add_subdirectory()
+# (CMAKE_MSVC_RUNTIME_LIBRARY seeds each target's property at creation time,
+# and Source/DSP is added below), and it must be included from THIS top-level
+# scope (enable_language(OBJC) has to happen here for iPlug2).
+#
+# Resolution order: an explicit -DNASSAU_SDK_DIR=..., then a sibling
+# ../nassau-plugin-sdk checkout, then FetchContent. Finding no SDK is not an
+# error -- NASSAU_PLUGIN_TARGETS_POSSIBLE goes false and the DSP core and tests
+# build anyway (DESIGN.md §0.4, docs/GATES.md G0).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NassauSDK.cmake)
 
-# Portable warning/optimization flags: the GCC/Clang spellings used throughout
-# this tree are not understood by MSVC. Subdirectories consume these variables
-# instead of hard-coding compiler-specific flags.
-if(MSVC)
-    set(NASSAU_WARNING_FLAGS /W4)
-    # MSVC Release already implies /O2 /Ob2 (CMAKE_CXX_FLAGS_RELEASE) -- this
-    # is the portable equivalent of GCC/Clang's -O3 (R7: no -march=native, no
-    # -ffast-math; /Oi below is neither, it just lets the compiler inline CRT
-    # calls like fabs/sqrt instead of emitting a real call).
-    set(NASSAU_RELEASE_OPT_FLAGS /Oi)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-
-    # Statically link the MSVC runtime (/MT), matching what iPlug2.cmake selects
-    # for the plugin targets. This MUST be set before the first add_subdirectory:
-    # the variable seeds each target's MSVC_RUNTIME_LIBRARY property at creation
-    # time, and Source/DSP is added before the SDK include that pulls in
-    # iPlug2.cmake -- so leaving it unset gives the DSP core /MD against the
-    # plugin's /MT and the link fails with LNK2038.
-    #
-    # /MT is also simply correct for a distributed plugin: the .vst3/.clap then
-    # carries no dependency on a VC++ redistributable being present on the host.
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-else()
-    set(NASSAU_WARNING_FLAGS -Wall -Wextra -Wpedantic)
-    set(NASSAU_RELEASE_OPT_FLAGS -O3)
-endif()
-
-# Where to find the shared Nassau plugin SDK. Default: a sibling checkout
-# `../nassau-plugin-sdk`. Override with -DNASSAU_SDK_DIR=... .
-set(NASSAU_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../nassau-plugin-sdk"
-    CACHE PATH "Nassau plugin SDK root")
 
 # Opt-in single-precision DSP path (DESIGN.md §12.2), OFF by default: the
 # double-precision path stays the shipped default and must remain
@@ -89,27 +67,17 @@ if(NASSAU_NO_SIMD)
     add_compile_definitions(NASSAU_NO_SIMD)
 endif()
 
+
 # DSP core (always builds — no framework dependencies, R2/R14).
 add_subdirectory(Source/DSP)
 
-# Plugin bundles (VST3 + AU + CLAP) — only when the SDK module and the vendored
-# iPlug2 tree are present, so the DSP core + tests still build on a machine
-# without the SDK (G0.2). The SDK's NassauPlugin.cmake pulls in iPlug2's own
-# CMake system (find_package(iPlug2)) and must be included from this top-level
-# scope so iPlug2 can enable the OBJC/OBJCXX languages.
-#
-# The SDK supports macOS (VST3 + AU + CLAP) and Windows (VST3 + CLAP); on any
-# other platform (this dev box: Linux) we skip the plugin targets rather than
-# fail configure, so the DSP core and the full test suite still build and run
-# (DESIGN.md §0.4).
-if(NOT APPLE AND NOT WIN32)
-    message(STATUS "Plugin targets are macOS/Windows-only — building DSP core + tests only")
-elseif(EXISTS "${NASSAU_SDK_DIR}/cmake/NassauPlugin.cmake"
-       AND EXISTS "${NASSAU_SDK_DIR}/external/iplug2/iPlug2.cmake")
+# Plugin bundles: VST3 + AU + CLAP on macOS, VST3 + CLAP on Windows, none
+# elsewhere (this dev box: Linux). NassauPlugin.cmake pulls in iPlug2's own
+# CMake system (find_package(iPlug2)) at include time, which is the other
+# reason this stays at top-level scope.
+if(NASSAU_PLUGIN_TARGETS_POSSIBLE)
     include(${NASSAU_SDK_DIR}/cmake/NassauPlugin.cmake)
     add_subdirectory(Source/Plugin)
-else()
-    message(STATUS "Nassau SDK not found at ${NASSAU_SDK_DIR} — skipping plugin targets")
 endif()
 
 # Tests (hand-rolled harness, always builds).
