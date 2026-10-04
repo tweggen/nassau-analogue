@@ -26,6 +26,43 @@ jobs:
           CMAKE_GENERATOR: Ninja
 
   # ---------------------------------------------------------------------------
+  # Does the SDK deploy key exist? One cheap job whose ONLY purpose is to turn
+  # that question into a job OUTPUT.
+  #
+  # The indirection is forced and worth explaining, because the obvious
+  # simplification does not work. `secrets` is NOT one of the contexts
+  # available in a job-level `if:` — the allowed set is `github`, `needs`,
+  # `vars` and `inputs` — so `if: secrets.NASSAU_SDK_DEPLOY_KEY != ''` on the
+  # plugin job is not expressible. `needs` IS allowed, so a prior job can carry
+  # the answer across.
+  #
+  # Gating the plugin job's STEPS instead (what this workflow did until
+  # QBX-131) leaves the job itself running to completion and exiting 0, which
+  # GitHub records as SUCCESS. The result was a green "Plugin bundles" check,
+  # in 2 s, having compiled nothing — for every PR in every plugin repo, since
+  # the secret has never been set anywhere. A check that cannot do its work
+  # must not look like one that did.
+  # ---------------------------------------------------------------------------
+  sdk-key:
+    name: SDK deploy key present?
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Check for the SDK deploy key
+        id: gate
+        env:
+          KEY: ${{ secrets.NASSAU_SDK_DEPLOY_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::NASSAU_SDK_DEPLOY_KEY is set - the plugin build will run."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NASSAU_SDK_DEPLOY_KEY is not set - the plugin build will be SKIPPED (not passed)."
+          fi
+
+  # ---------------------------------------------------------------------------
   # The plugin bundles, HEADLESS. Headless on purpose: it needs the SDK (a
   # private repo, hence the deploy key) but NOT the prebuilt Skia release asset,
   # which is the only part that would require an API token. So this job proves
@@ -35,31 +72,31 @@ jobs:
   # TO ENABLE: add a repository secret NASSAU_SDK_DEPLOY_KEY containing a
   # read-only deploy key for github.com/tweggen/nassau-plugin-sdk. Never a
   # long-lived personal access token (plan 50, M3). Without the secret this job
-  # no-ops with a notice instead of failing, so a fork or a fresh clone is still
-  # green. If nassau-plugin-sdk is ever made public (plan 50, D10) the secret
-  # and the `if:` guards simply become unnecessary.
+  # is SKIPPED, so a fork or a fresh clone is still green WITHOUT claiming the
+  # plugins were built. If nassau-plugin-sdk is ever made public (plan 50, D10)
+  # the sdk-key job and this `if:` simply become unnecessary.
+  #
+  # WHICH HOST VERIFIES WHAT (QBX-131 AC4), measured, not assumed:
+  #   * ubuntu (the `dsp` job)  — the DSP core and the full test suite. It does
+  #     NOT compile the plugin or UI sources: with the SDK checked out locally
+  #     and `./ci/gates.sh --sdk <dir>` run on Linux, no object file for the UI
+  #     translation unit is produced under build-ci-plugin. The plugin targets
+  #     are not buildable there.
+  #   * macOS (this job)        — every shipping format, compiled and linked
+  #     against the real SDK. This is the ONLY host that compiles the plugin
+  #     and UI sources at all, which is why its being silently skipped mattered.
+  #   * Windows                 — nothing. No runner, so the Windows plugin
+  #     targets are verified by hand or not at all.
   # ---------------------------------------------------------------------------
   plugin:
     name: Plugin bundles (macOS, headless)
+    needs: sdk-key
+    if: needs.sdk-key.outputs.enabled == 'true'
     runs-on: macos-14
     steps:
-      - name: Check for the SDK deploy key
-        id: gate
-        env:
-          KEY: ${{ secrets.NASSAU_SDK_DEPLOY_KEY }}
-        run: |
-          if [ -n "$KEY" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::NASSAU_SDK_DEPLOY_KEY not set - skipping the plugin build."
-          fi
-
-      - if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Check out the Nassau plugin SDK
-        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
           repository: tweggen/nassau-plugin-sdk
@@ -70,11 +107,9 @@ jobs:
           ssh-key: ${{ secrets.NASSAU_SDK_DEPLOY_KEY }}
 
       - name: Provision the SDK's downloaded dependencies
-        if: steps.gate.outputs.enabled == 'true'
         run: cmake -DNASSAU_SDK_DIR="$PWD/sdk" -P sdk/cmake/ProvisionDeps.cmake
 
       - name: Gate (with SDK)
-        if: steps.gate.outputs.enabled == 'true'
         run: ./ci/gates.sh --sdk sdk --headless
         env:
           CMAKE_GENERATOR: Ninja
