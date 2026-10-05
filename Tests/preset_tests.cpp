@@ -11,7 +11,8 @@
 // scope for a DSP-only test binary on this Linux dev box (DESIGN.md §0.4).
 //
 // Covers:
-//   G9.3 (partial) -- nassau_presets::kParamCount == 53, kPresetCount == 12
+//   G9.3 (partial) -- nassau_presets::kParamCount == SynthCore::kNumParams,
+//                     kPresetCount == 12
 //                      (the SDK-side kNumParams/kNumPresets equality is a
 //                      static_assert in NassauAnaloguePlugin.h/.cpp instead).
 //   G9.4           -- every preset recalls to its EXACT stored values
@@ -99,7 +100,8 @@ int main() {
   std::cout << "=== NassauAnalogue Preset Tests (G9) ===\n\n";
 
   std::cout << "Group: preset table shape (G9.3)\n";
-  check("nassau_presets::kParamCount == 53", nassau_presets::kParamCount == 53);
+  check("nassau_presets::kParamCount == SynthCore::kNumParams (54 since G12 appended kChorus)",
+        nassau_presets::kParamCount == SynthCore::kNumParams);
   check("nassau_presets::kParamCount == SynthCore::kNumParams",
         nassau_presets::kParamCount == SynthCore::kNumParams);
   check("nassau_presets::kPresetCount == 12", nassau_presets::kPresetCount == 12);

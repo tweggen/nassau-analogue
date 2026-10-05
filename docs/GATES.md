@@ -712,7 +712,7 @@ mixer output through the VCA. No filters yet.
 
 | ID | Criterion | Tolerance |
 |---|---|---|
-| G3.1 | `ParamSnapshot` is built **exactly once per host block**: instrument the atomic loads in a debug build; for a 10-block run with 53 params the count is exactly `53 * 10` | exact |
+| G3.1 | `ParamSnapshot` is built **exactly once per host block**: instrument the atomic loads in a debug build; for a 10-block run the count is exactly `kNumParams * 10` (53 when this AC was written; 54 since G12 appended `kChorus` — the test asserts against `SynthCore::kNumParams`, not a literal, so what it pins is the once-per-block property rather than a number that was only ever incidental) | exact |
 | G3.2 | The audio-rate loop performs **zero** atomic loads (R3) and calls **zero** transcendentals (R12) | instrumented count == 0 |
 | G3.3 | **Block-size invariance**: output for a given event sequence is **identical** whether the host delivers it in blocks of 1, 7, 32, 33, 512 or 8192 samples. This is passable **only** with the persistent control-grid remainder of DESIGN.md §2 — if the control grid restarts at each host-block boundary, a 1-sample delivery updates modulation every sample and a 33-sample delivery gives an uneven grid, and this AC fails by orders of magnitude. Implement the remainder first; do not treat the failure as a tolerance problem | 1e-7 |
 | G3.4 | **ENV-A drives the VCA**: a note with A/D/S/R = 50/200/50%/300 ms produces an output envelope whose measured attack, decay and release match the requested times | 15 % |
@@ -1713,7 +1713,7 @@ needs changed.
 
 | ID | Criterion |
 |---|---|
-| G10.1 | Every one of the 53 params has a control bound **by enum index** |
+| G10.1 | Every param has a control bound **by enum index** (53 at G10; 54 since G12 appended `kChorus`, bound in the Chorus+Output panel) |
 | G10.2 | Layout groups in signal-chain order: *VCO 1 · VCO 2 · Sub+Noise · Mixer+Drive · HPF · LPF · ENV-F · ENV-A · LFO · Poly-Mod · Voice · Stereo · Output*, plus the preset selector (`IVBakedPresetManagerControl`) |
 | G10.3 | An `IVKeyboardControl` is present and plays notes — an instrument editor without a keyboard is untestable by ear without external MIDI |
 | G10.4 | Builds **and links** with `-DNASSAU_FORCE_HEADLESS=ON` (whole `.cpp` inside `#if IPLUG_EDITOR`) |
@@ -1937,12 +1937,80 @@ gate note; README status block updated.
 
 ---
 
+---
+
+## Gate G12 — Juno-style output-stage chorus
+
+> **STATUS: DONE.** Full `ctest` green (13 suites, `ChorusTests` new at 45/45).
+> Both golden batteries verify at exactly `0.000e+00` against fixtures
+> captured before this gate — with `kChorus` at its Off default the stage is a
+> bit-exact passthrough, so nothing about the pre-G12 instrument moved.
+>
+> **Measured (M4 Mac, 48 kHz, best of 7):** the chorus costs **+4.6 ns/sample
+> at 8 voices mono** against a build that does not contain it at all
+> (327.4 → 332.0), i.e. **+1.4 %**; the budget scenario stays at **62.8×
+> realtime** against G11.5's ≥ 10× floor. Of that, +2.4 ns is the
+> unconditional delay-line write the Off path still pays, which is the price
+> of a mid-note switch-on starting from real signal history.
+>
+> **R11 findings, both found by measurement rather than reasoning:**
+> (a) gliding the chorus's depth on a live mode change but not its **rate**
+> leaves the new rate sweeping the old depth — 117 cents of pitch swoop on
+> II → I+II, against I+II's own 16.8 cents. Gliding both bounds it at 37.
+> (b) G12.8's first draft compared the toggle window's worst sample step
+> against a **chorus-off** render and read 1.59. That was not a click: at full
+> wet the output is `dry + 0.7·wet` and the summed slope can legitimately reach
+> ~1.7× the dry's own. Measured against the worse of the two *steady states* —
+> the correct reference — it reads 0.95.
+
+**Goal:** one switch, four positions, the Juno chorus behind it, and nothing
+about the existing instrument changed.
+
+### Deliverables
+
+* `Source/DSP/synth_chorus.h` — `JunoChorus`, an R2-legal header-only sibling
+  of `synth_dsp.h`/`synth_osc.h`/`synth_filter.h`: two delay lines, antiphase
+  triangle LFO, BBD low-pass, wet fade, mode glide. Per-mode tables
+  (`kRateHz`/`kCenterMs`/`kDepthMs`) are the single source of truth.
+* `kChorus` **appended** at index 53 (DESIGN.md §11) — core setter, plugin
+  `EParams` entry, `InitEnum`, preset index, `PLUG_N_PARAMS 54`.
+* One `IVTabSwitchControl` in the editor's Chorus+Output panel.
+* `Tests/chorus_tests.cpp` + ctest `ChorusTests`.
+* Two new `Tests/synth_bench.cpp` rows whose **delta** is the stage's cost.
+* DESIGN.md §13.
+
+### Acceptance criteria
+
+| ID | Criterion | Tolerance |
+|---|---|---|
+| G12.1 | **`kChorus = Off` is a bit-exact passthrough, and stays one after being switched off.** Compared against a render that never had the chorus on, from 1 s after a switch-off. This is the AC the "adding a chorus changed nothing" claim rests on, and it fails if the wet fade merely approaches zero, or if the passthrough is written as `x + 0.0*wet` | max abs diff **== 0.0** |
+| G12.1b | Both golden batteries still verify against their pre-G12 fixtures | **0.000e+00** |
+| G12.2 | **G8.1 survives**: mono mode + chorus Off gives `outL == outR` bit-exactly, and L/R correlation is exactly 1. With the chorus on, correlation drops below 0.9 — decorrelating a mono voice stack is the whole point | == 0.0 / == 1.0 / < 0.9 |
+| G12.3 | Each mode's LFO runs at `JunoChorus::kRateHz[m]`, measured as total advanced phase over 8 s | 0.5 % |
+| G12.4 | Each mode's delay envelope spans exactly `kCenterMs ∓ kDepthMs` | 0.02 ms |
+| G12.5 | The two lines stay in **antiphase**: `delay[0] + delay[1] == 2·centre` at every control step, for every mode | 1e-9 ms |
+| G12.6 | Each mode's pitch deviation, measured off the delay slope (median, turnarounds excluded), equals `1200·log2(1 + 4·depth·rate)`; and the three are strictly ordered I < II < I+II | 0.15 cents |
+| G12.7 | All four modes finite and bounded under an 8-note chord at full velocity | \|y\| < 8 |
+| G12.8 | **Switching on or off mid-note does not click**: worst sample step in the 100 ms straddling the toggle, against the worse of the two steady states' own worst steps. Measured on a low-passed triangle — on a saw the oscillator's wrap dwarfs anything a 20 ms fade could do, and the AC would be measuring the wrong thing | ratio < 1.05 |
+| G12.9 | The wet fade is `kFadeMs` long and lands on **exactly** 1.0 and **exactly** 0.0 (the condition G12.1's passthrough re-arms on), measured one sample per `process()` call | ±2 samples, exact endpoints |
+| G12.10 | **A live mode change glides rather than steps.** Worst single-control-step delay movement across II → I+II, the largest geometry change the four positions can produce. Unglided the depth alone steps the delay ~1.55 ms | < 0.05 ms |
+| G12.11 | **Block-size invariance holds with the chorus on** (G3.3 re-run at block sizes 1/7/32/33/512/8192). This is why the chorus LFO advances on the control-rate grid and the delay is interpolated with the same `frac` the VCA gain uses | max abs diff == 0.0 |
+| G12.12 | `reset()` clears the chorus completely: a reset core renders bit-identically to its own first render, with the chorus on throughout | max abs diff == 0.0 |
+| G12.13 | **Zero heap allocation** across 2 s of `process()` spanning every mode and three mid-render mode changes. The chorus owns the largest buffer in the tree; G0.11 predates it | 0 |
+| G12.14 | **R12 for the chorus's own per-sample path**: grep `synth_chorus.h` between its `PER-SAMPLE PROCESS BEGIN/END` markers for `tan(`/`exp(`/`exp2(`/`pow(`/`log(`/`sin(`/`cos(`/`.load(`. G3.2(b) scans `synth_core.cpp`'s loop region and cannot see across a file boundary | grep, zero hits |
+| G12.15 | The **cost** is reported as a delta against a build without the stage, not asserted to be small | numbers in the note |
+
+**Exit:** full `ctest` green; both golden batteries at `0.000e+00`; the cost
+delta in the gate note; DESIGN.md §13 and README updated.
+
+---
+
 ## Gate dependency graph
 
 ```
-G0 ─ G1 ─ G2 ─ G3 ─ G4 ─ G5 ─ G6 ─ G7 ─ G8 ─ G9 ─ G10 ─ G11
+G0 ─ G1 ─ G2 ─ G3 ─ G4 ─ G5 ─ G6 ─ G7 ─ G8 ─ G9 ─ G10 ─ G11 ─ G12
                      └── LPF ──┘    │         └ needs a Windows/macOS host
-                                    └ full param surface complete at G8
+                                    └ params 0-52 complete at G8; G12 appends 53
 ```
 
 **G0–G8 and G11's core work are executable on Linux with no SDK.**
@@ -1950,5 +2018,10 @@ G0 ─ G1 ─ G2 ─ G3 ─ G4 ─ G5 ─ G6 ─ G7 ─ G8 ─ G9 ─ G10 ─ G1
 provisioned — see DESIGN.md §0.4 for the two commands.
 
 Param ranges per gate, checked against DESIGN.md §11: G0 → 0–1, G2 → 2–18,
-G3 → 19–31, G4 → 32–34, G5 → 35–37, G6 → 38–43, G7 → 44–49, G8 → 50–52.
-Total 53. G1, G9, G10 and G11 land no params.
+G3 → 19–31, G4 → 32–34, G5 → 35–37, G6 → 38–43, G7 → 44–49, G8 → 50–52,
+G12 → 53. Total 54. G1, G9, G10 and G11 land no params.
+
+G12 is the first gate after the original twelve, and it is the worked example
+of what R4 actually permits: a new param may be **appended**, never inserted,
+and the gate that appends one owes an AC proving the instrument that existed
+before it is bit-identical with the new param at its default (G12.1/G12.1b).

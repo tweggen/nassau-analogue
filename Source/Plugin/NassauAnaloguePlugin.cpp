@@ -13,7 +13,7 @@ using namespace iplug;
 // enum is frozen -- this just guards against ever getting the two out of
 // sync again). Mirrors NassauZermattPlugin.cpp's own static_assert block
 // verbatim (docs/GATES.md G9's "copy the shape" instruction), extended to
-// all 53 indices.
+// every index.
 static_assert(nassau_presets::kMasterVolume == kMasterVolume, "preset index drift: kMasterVolume");
 static_assert(nassau_presets::kOutputClip == kOutputClip, "preset index drift: kOutputClip");
 static_assert(nassau_presets::kOsc1Wave == kOsc1Wave, "preset index drift: kOsc1Wave");
@@ -67,6 +67,7 @@ static_assert(nassau_presets::kVelToFilter == kVelToFilter, "preset index drift:
 static_assert(nassau_presets::kStereoMode == kStereoMode, "preset index drift: kStereoMode");
 static_assert(nassau_presets::kStereoDetune == kStereoDetune, "preset index drift: kStereoDetune");
 static_assert(nassau_presets::kStereoSpread == kStereoSpread, "preset index drift: kStereoSpread");
+static_assert(nassau_presets::kChorus == kChorus, "preset index drift: kChorus");
 static_assert(nassau_presets::kParamCount == kNumParams, "preset index drift: kNumParams");
 static_assert(nassau_presets::kPresetCount == kNumPresets, "preset index drift: kNumPresets");
 
@@ -198,7 +199,7 @@ NassauAnaloguePlugin::NassauAnaloguePlugin(const InstanceInfo& info)
     // define a `Plugin` template, so the unqualified name would be ambiguous.
     : iplug::Plugin(info, MakePluginConfig())
 {
-    // ---- Full 53-param surface (DESIGN.md §11) -----------------------------
+    // ---- Full param surface (DESIGN.md §11) --------------------------------
     // Ranges/defaults transcribed verbatim from DESIGN.md §11's table.
     // Grouped exactly along the same gate boundaries as the EParams enum
     // comment in NassauAnaloguePlugin.h for cross-reference, though every
@@ -273,12 +274,20 @@ NassauAnaloguePlugin::NassauAnaloguePlugin(const InstanceInfo& info)
     GetParam(kStereoDetune)->InitDouble("Stereo Detune", 6., 0., 25., 0.1, "cents");
     GetParam(kStereoSpread)->InitDouble("Stereo Spread", 70., 0., 100., 0.1, "%");
 
+    // G12 (Juno-style output-stage chorus, DESIGN.md §13). ONE enum param,
+    // not a bank of knobs: the hardware this models has two buttons, and the
+    // four positions below are every combination they can produce -- which
+    // is the whole reason this lands as a single control. The labels here
+    // are what the editor draws (NassauAnalogueUI.cpp binds it with an EMPTY
+    // options list precisely so the UI text cannot drift from this line).
+    GetParam(kChorus)->InitEnum("Chorus", 0, {"Off", "I", "II", "I+II"});
+
     // ---- Factory preset bank (kNumPresets == PLUG_N_PRESETS) -----------------
     // The full 12-preset bank, defined ONCE in Source/Plugin/nassau_presets.h
     // (also consumed directly by Tests/preset_tests.cpp, which has no SDK
     // link -- G9.5). Each preset's stored array is exactly the RAW
     // positional-double layout MakePresetFromNamedParams itself builds
-    // internally (53 doubles, one per param, in enum order), so
+    // internally (kNumParams doubles, one per param, in enum order), so
     // MakePresetFromChunk reproduces it exactly -- this sidesteps
     // MakePresetFromNamedParams' own int-vs-double vararg pitfall entirely
     // (every value here is already the correct double for its param's stored
@@ -318,7 +327,7 @@ void NassauAnaloguePlugin::OnReset()
         mCore.init(static_cast<float>(sr));
         // Re-push every param so the freshly-initialised core matches host
         // state (mirrors NassauZermattPlugin::OnReset()'s own loop, now over
-        // the FULL 53-param surface -- every index is wired, unlike G0).
+        // the FULL param surface -- every index is wired, unlike G0).
         for (int i = 0; i < kNumParams; ++i)
             OnParamChange(i);
         // PLUG_LATENCY stays 0, permanently (DESIGN.md §2.1/§12, G9.13): no
@@ -393,6 +402,8 @@ void NassauAnaloguePlugin::OnParamChange(int p)
         case kStereoMode:    mCore.setStereoMode(f != 0.f); break;
         case kStereoDetune:  mCore.setStereoDetuneCents(f); break;
         case kStereoSpread:  mCore.setStereoSpreadPercent(f); break;
+
+        case kChorus:        mCore.setChorusMode(static_cast<SynthCore::Chorus>(static_cast<int>(f))); break;
 
         default: break;
     }

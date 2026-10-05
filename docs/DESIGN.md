@@ -128,8 +128,8 @@ which are computed once per voice and used by both chains (PERF-5).
     11. PAN        c == 0 → left by Spread, c == 1 → right by Spread
                                   │
                                   ▼
-          voice accumulator (L, R) ──> Master volume ──> Output clip ──>
-          Output DC block (§11, when clip is on) ────────────────> out
+          voice accumulator (L, R) ──> CHORUS (§13) ──> Master volume ──>
+          Output clip ──> Output DC block (§11, when clip is on) ──> out
 ```
 
 ### Ordering constraints (non-negotiable)
@@ -144,6 +144,13 @@ which are computed once per voice and used by both chains (PERF-5).
    resonant tail is enveloped rather than the other way round.
 4. **The output clip is post-summation and post-master**, so it limits the
    stack, not the individual voice.
+5. **The chorus is post-summation and *pre*-master** (§13). Juno order — on the
+   real instrument the chorus sits after the VCAs and ahead of the volume
+   slider. It is also the only placement that makes acoustic sense here: one
+   chorus on the summed stack produces *a* stereo image, whereas one per voice
+   would produce sixteen uncorrelated ones. Keeping it ahead of master volume
+   leaves the user a trim for the ~1.7 dB it adds, and leaves the clip as the
+   last thing between it and the ceiling.
 
 ---
 
@@ -853,10 +860,16 @@ voice.
 
 ---
 
-## 11. Parameter surface (53 params, append-only)
+## 11. Parameter surface (54 params, append-only)
 
-Indices are **final and frozen** (R4). Each gate lands exactly the next
-contiguous run. `kNumParams == 53 == PLUG_N_PARAMS`.
+Indices are **frozen** (R4). Each gate lands exactly the next contiguous run.
+`kNumParams == 54 == PLUG_N_PARAMS`.
+
+Append-only does not mean "never grows" — it means an existing index never
+changes meaning. Indices 0–52 were complete at G8 and have not moved since;
+G12 appended index 53. That is what keeps a patch saved by a 53-param build
+loadable by this one (`nassau_state.h`'s `PlanUnserialize` reads what the
+chunk has and leaves the rest at its default).
 
 | # | Param | Range | Default | Gate |
 |---|---|---|---|---|
@@ -913,6 +926,7 @@ contiguous run. `kNumParams == 53 == PLUG_N_PARAMS`.
 | 50 | `kStereoMode` | bool | off | G8 |
 | 51 | `kStereoDetune` | 0 .. 25 cents | 6 | G8 |
 | 52 | `kStereoSpread` | 0 .. 100 % | 70 | G8 |
+| 53 | `kChorus` | Off / I / II / I+II | Off | G12 |
 
 ### Channel configuration
 
@@ -1356,3 +1370,112 @@ only**: half-rate doubles and 4-wide NEON are exactly the conditions it was
 written for. It is a measured **7.3 % regression on x86-64** — never enable it
 there.
 
+
+---
+
+## 13. Chorus (`synth_chorus.h`)
+
+A Juno-6/60/106 BBD chorus in the output stage, behind **one** parameter. The
+hardware has two buttons; the four states they can produce **are** the four
+positions of `kChorus` (param 53). There is nothing continuous to dial, so
+there is no knob.
+
+```
+mixSum L, R ──> [delay line A] ──> BBD LP ──> +  ──> L
+            └─> [delay line B] ──> BBD LP ──> −  ──> R
+                        ▲
+                triangle LFO, the two lines swept in ANTIPHASE
+```
+
+### The three live modes
+
+Rates are the figures that circulate for the Juno-106's chorus LFO. The
+**delay** figures are `[voicing]`, not measurements — no Juno was measured for
+this. They were chosen from the quantity a listener actually hears, the peak
+pitch deviation, which for a triangle of peak `depth` at rate `f` is a
+*constant* `4·depth·f` (not a peak value — a triangle sweeps the delay at a
+constant rate, which is exactly why this instrument's chorus is built on one):
+
+| Mode | Rate | Centre | Depth | `4·depth·f` | = cents | Character |
+|---|---|---|---|---|---|---|
+| I | 0.513 Hz | 3.2 ms | ±1.30 ms | 0.00267 | 4.6 | slow, gentle |
+| II | 0.863 Hz | 3.2 ms | ±1.80 ms | 0.00621 | 10.7 | faster, richer |
+| I+II | 9.750 Hz | 3.2 ms | ±0.25 ms | 0.00975 | 16.8 | fast vibrato |
+
+The **ordering** is the audible part, and it is the characteristic thing about
+this chorus: II is about twice I, and I+II is not "more chorus" but a
+different effect — which is what both buttons down does on the hardware.
+G12.3/G12.4/G12.6 measure all three back out of the running implementation.
+
+### Why one channel is subtracted
+
+`L = dry + wet`, `R = dry − wet` is where the Juno's width comes from. The
+consequence is deliberate: summed to mono a listener gets `2·dry + (wetA −
+wetB)`, so the chorus **does not vanish** — a single shared delay line would
+make it cancel exactly. Two lines swept in antiphase is the choice that keeps
+mono listenable; the inversion is the choice that keeps stereo sounding like a
+Juno.
+
+### Everything else about it
+
+* **Linear interpolation** on the fractional delay, followed by two cascaded
+  one-poles at 8 kHz on the wet (the BBD's own bandwidth). The filter is not
+  an apology for the interpolator, but it does make it the right choice rather
+  than a compromise: the interpolator's error lives at high frequencies and
+  this stage attenuates that band one step later.
+* **Wet gain 0.7** against a dry of exactly 1.0. Not an equal mix: that peaks
+  at +6 dB when the two arrive in phase, and a chorus button should not double
+  the instrument's level. At 0.7 the worst case is +4.6 dB and the typical
+  (decorrelated) case is +1.7 dB.
+* **20 ms linear wet fade** on switch-on/off — the same window, and the same
+  reasoning, as the LPF slope crossfade (§5.1). It lands on **exactly** 1.0
+  and **exactly** 0.0, which is not cosmetic: an exact 0.0 is the condition the
+  bit-exact passthrough resumes on.
+* **50 ms glide of both depth and rate** on a switch between two *live* modes.
+  Depth alone is not enough, and this was found by measurement (G12.10): with
+  only the depth gliding, II → I+II leaves 1.8 ms of depth being swept at
+  9.75 Hz for as long as the depth takes to settle — 117 cents of pitch swoop
+  against the 16.8 cents I+II is supposed to produce. Gliding both bounds the
+  worst case at the product's interior maximum, 37 cents.
+* **Switching out of Off snaps instead of gliding**, because the wet is at
+  zero and there is nothing audible to glide.
+
+### The bit-exactness contract
+
+With `kChorus = Off` the stage is a **bit-exact passthrough** — the outputs are
+*assigned* from the inputs, never computed as `x + 0.0·wet` (which is only
+bit-exact for `x ≠ −0.0`). Both golden batteries were captured before this gate
+and still verify at exactly `0.000e+00`, and G8.1's mono `L == R` bit-identity
+is untouched.
+
+The delay lines are still **written** while off. Two stores and a masked
+increment buys two things: switching the chorus on mid-note starts from the
+signal that was actually playing rather than from silence or stale audio, and
+nothing ever has to clear 32 KB from the audio thread. Measured cost of those
+writes on an M4 Mac: **+0.6 ns/sample idle, +2.4 ns/sample at 8 voices**
+(327.4 → 329.7), i.e. 0.7 % of the budget scenario.
+
+### Cost
+
+Measured at 48 kHz, best of 7, M4 Mac (`Tests/synth_bench.cpp`, which carries
+its own `idle + chorus II` and `8 voices + cho II` rows for exactly this):
+
+| | no chorus in the build | chorus Off | chorus II |
+|---|---|---|---|
+| idle | 9.87 ns/sample | 10.48 | 14.02 |
+| 8 voices mono | 327.36 | 329.74 | 331.96 |
+
+**+1.4 % on the G11.5 budget scenario**, which stays at 62.8× realtime against
+its ≥ 10× floor. One chorus on the summed stack is why: the cost does not scale
+with polyphony.
+
+### R12 and R3
+
+Everything per-sample is compare/add/multiply plus two masked array reads —
+no transcendental, no atomic load. The LFO increment (a divide) and the glide
+coefficient (an `exp`) are derived once per **host block** in
+`finishSnapshot()`, alongside `glideStepCoeff`/`stereoBlendCoeff`; the BBD
+coefficients and the fade step are derived once in `init()`. Storage is a
+fixed `double[2][2048]` constructed with the instrument — 2048 samples holds
+10.6 ms at 192 kHz against a 5.0 ms worst case, and nothing in the audio path
+allocates (G12.13 measures this).

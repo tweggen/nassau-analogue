@@ -1,8 +1,10 @@
-// G10: full IGraphics editor for NassauAnalogue. Binds all 53 params
+// G10: full IGraphics editor for NassauAnalogue. Binds EVERY param
 // (EParams, NassauAnaloguePlugin.h) by enum index, grouped in signal-chain
 // order exactly as docs/GATES.md G10.2 lists it:
 //   VCO 1 · VCO 2 · Sub+Noise · Mixer+Drive · HPF · LPF · ENV-F · ENV-A ·
-//   LFO · Poly-Mod · Voice · Stereo · Output
+//   LFO · Poly-Mod · Voice · Stereo · Chorus+Output
+// (G12 added kChorus to the last of those panels -- see its own note in the
+// layout-metrics block for the two pixels of editor height that cost)
 // plus the factory preset selector (IVBakedPresetManagerControl) and an
 // IVKeyboardControl so the instrument can be auditioned by ear without
 // external MIDI (G10.3).
@@ -34,7 +36,7 @@ using namespace iplug::igraphics;
 namespace {
 
 // Tracks, per enum-index param, whether some control in this Layout() call
-// has bound it -- G10.1 requires ALL 53 to be bound, and the most reliable
+// has bound it -- G10.1 requires ALL of them to be bound, and the most reliable
 // way to make that true is to make it impossible to walk away from this
 // function with one missed: every bind goes through Binder, which flips a
 // bit, and Layout() asserts the whole array is set (and, in a debug build,
@@ -273,11 +275,21 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
 
     // Row heights: each set by its own tallest panel's internal stack --
     // row 1 by VCO 2 (title + 2 switches + knob row + toggle row), row 2 by
-    // LPF (title + switch + 2 knob rows), row 3 by Voice (title + 2 switches
-    // + knob row).
+    // LPF (title + switch + 2 knob rows), row 3 by Chorus+Output.
+    //
+    // G12 CHANGED WHICH PANEL SETS ROW 3. It used to be Voice (title + 2
+    // switches + knob row = 160), and Output had 36px of slack under its
+    // toggle + knob stack. A chorus tab switch needs kSwitchH + kGap = 38,
+    // i.e. exactly TWO PIXELS more than that slack -- so rather than shave
+    // something to make it fit (which is how the content came to overflow
+    // its window before this block existed at all), row 3 is now budgeted
+    // from the taller Output stack and PLUG_HEIGHT follows it, 712 -> 714.
+    // Voice's 160 still fits inside the 162 with room to spare.
     constexpr float row1H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH + kGap + kToggleH;
     constexpr float row2H = kPanelTitle + (kSwitchH + kGap) + kRowH + kGap + kRowH;
-    constexpr float row3H = kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH;
+    constexpr float row3H = kPanelTitle + (kSwitchH + kGap) + kToggleH + kGap + kRowH;
+    static_assert(row3H >= kPanelTitle + 2.f * (kSwitchH + kGap) + kRowH,
+                  "row 3 must still contain the Voice panel's own title + 2 switches + knob row");
 
     // ...and the editor size those add up to. If either assert fires, change
     // PLUG_WIDTH/PLUG_HEIGHT in config.h to the number the compiler names --
@@ -356,7 +368,7 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     // metrics comment above).
     const PanelSpec kRow1[] = { { "VCO 1", 2.f }, { "VCO 2", 3.f }, { "SUB+NOISE", 2.f }, { "MIXER+DRIVE", 3.f } };
     const PanelSpec kRow2[] = { { "HPF", 2.f }, { "LPF", 3.f }, { "ENV-F", 4.f }, { "ENV-A", 4.f } };
-    const PanelSpec kRow3[] = { { "LFO", 4.f }, { "POLY-MOD", 2.f }, { "VOICE", 4.f }, { "STEREO", 2.f }, { "OUTPUT", 2.f } };
+    const PanelSpec kRow3[] = { { "LFO", 4.f }, { "POLY-MOD", 2.f }, { "VOICE", 4.f }, { "STEREO", 2.f }, { "CHORUS+OUTPUT", 2.f } };
 
     IRECT cols[13];
     {
@@ -521,19 +533,28 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
                      { { kStereoDetune, "Detune" }, { kStereoSpread, "Spread" } });
     }
 
-    // --- Output (cols[12]) -----------------------------------------------
+    // --- Chorus + Output (cols[12]) ---------------------------------------
+    // The chorus lives HERE, at the top of the output panel, because that is
+    // where it lives in the signal chain (DESIGN.md §1/§13: on the summed
+    // accumulator, ahead of master volume) -- reading the panel top to bottom
+    // reads the output stage in order. A 4-position tab switch, not a knob
+    // and not four toggles: the instrument it models has two buttons whose
+    // four states ARE these four positions, and there is nothing continuous
+    // to dial.
     {
         const IRECT& c = cols[12];
         float y = c.T + kPanelTitle;
+        bind.Switch(IRECT(c.L + 3.f, y, c.R - 3.f, y + kSwitchH), kChorus, "Chorus", switchStyle);
+        y += kSwitchH + kGap;
         bind.ToggleRow(IRECT(c.L, y, c.R, y + kToggleH), toggleStyle, { { kOutputClip, "Clip" } });
         y += kToggleH + kGap;
         bind.KnobRow(IRECT(c.L, y, c.R, y + kRowH), knobStyle, { { kMasterVolume, "Volume" } });
     }
 
-    // Every one of the 53 params must be bound by now (G10.1) -- this is the
+    // Every param must be bound by now (G10.1) -- this is the
     // assertion the count is checked by: Binder::Mark flips one bit per
     // successful bind and refuses a second bind of the same index, so if
-    // this holds, all 53 indices were each bound exactly once.
+    // this holds, all kNumParams indices were each bound exactly once.
     for (int i = 0; i < kNumParams; ++i) {
         assert(bound[static_cast<size_t>(i)] && "a param was left unbound by the G10 layout");
     }

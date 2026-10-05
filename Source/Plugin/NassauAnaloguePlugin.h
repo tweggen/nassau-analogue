@@ -17,17 +17,19 @@
 #include "NassauAnalogueUI.h"   // #if IPLUG_EDITOR guarded; not present headless.
 #endif
 
-// FINAL parameter surface (DESIGN.md §11, 53 params, append-only, R4), in its
-// FINAL frozen index order. G9 (docs/GATES.md) wires every one of these to a
-// live IParam in the constructor (see the .cpp) -- G0 only ever wired
-// kMasterVolume/kOutputClip, but this enum's SHAPE has been complete and
-// frozen since G0 (see that gate's own note in the .cpp/.h history).
+// Parameter surface (DESIGN.md §11, append-only, R4), in its frozen index
+// order. G9 (docs/GATES.md) wires every one of these to a live IParam in
+// the constructor (see the .cpp) -- G0 only ever wired
+// kMasterVolume/kOutputClip, but indices 0-52 have been complete and frozen
+// since G0 (see that gate's own note in the .cpp/.h history); G12 appended
+// index 53.
 //
 // APPEND-ONLY PARAM DISCIPLINE (state compatibility): params are serialized
 // positionally by enum index (see nassau_state.h). To keep saved states
 // forward/backward compatible, params must NEVER be reordered or inserted in
-// the middle -- this enum is already complete, so "append-only" from here on
-// means "never change a value below", not "add more entries".
+// the middle. A NEW param may only ever be added at the END, immediately
+// before kNumParams -- which is exactly how kChorus arrived, and is why a
+// patch saved before it existed still recalls correctly.
 enum EParams {
     // ---- G0: indices 0-1 --------------------------------------------------
     kMasterVolume = 0,  //  0  -60 .. +12 dB,        default -6
@@ -98,8 +100,15 @@ enum EParams {
     kStereoDetune,      // 51  0 .. 25 cents,         default 6
     kStereoSpread,      // 52  0 .. 100 %,            default 70
 
-    kNumParams   // == 53 (DESIGN.md §11). Frozen: R4 append-only, and this is
-                 // the last index in the FINAL surface.
+    // ---- G12 (Juno-style output-stage chorus): index 53 --------------------
+    // APPENDED, which is the one thing R4's append-only rule permits: every
+    // index 0-52 above keeps the meaning it has on disk, so a state chunk or
+    // a factory preset saved by a 53-param build loads into this one
+    // unchanged, with kChorus simply left at its Off default
+    // (nassau_state.h's PlanUnserialize).
+    kChorus,            // 53  Off / I / II / I+II,   default Off
+
+    kNumParams   // == 54 (DESIGN.md §11: 53 through G11, + kChorus at G12).
 };
 static_assert(kNumParams == PLUG_N_PARAMS, "Parameter count mismatch");
 

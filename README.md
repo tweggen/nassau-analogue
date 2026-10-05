@@ -3,9 +3,11 @@
 A **polyphonic 1980-vintage analogue synthesiser** — two PolyBLEP VCOs, a
 sub-oscillator and noise into a mixer, a little soft saturation, a switchable
 12/24 dB high-pass with key follow, a switchable 24/12 dB resonant low-pass with
-its own ADSR, a VCA ADSR, one global LFO, and an optional stereo mode that
+its own ADSR, a VCA ADSR, one global LFO, an optional stereo mode that
 duplicates the whole per-voice signal flow into a second chain with negated fine
-tunings.
+tunings, and a **Juno-style BBD chorus** in the output stage behind a single
+four-position switch — Off / I / II / I+II, the four states the Juno's two
+chorus buttons can produce.
 
 Voicing target: a **Roland Jupiter-6 with a bit of Sequential Prophet-5**.
 
@@ -26,7 +28,10 @@ with no SDK present.
 > proven by `ctest`. **G9 (plugin wrapper) and G10 (UI) remain deferred**,
 > needing a Windows or macOS host with `nassau-plugin-sdk`'s submodules
 > provisioned; neither touches `Source/DSP/`, so the DSP core itself is
-> final. Twelve gates (G0–G11) are specified in
+> final. **G12 (chorus) is done**: appended as param 53, with the pre-G12
+> instrument proven bit-identical at the new param's Off default — both
+> golden batteries still verify at exactly `0.000e+00` against fixtures
+> captured before it. Thirteen gates (G0–G12) are specified in
 > [`docs/GATES.md`](docs/GATES.md), each with objectively measurable
 > acceptance criteria; see that file for the per-gate status.
 >
@@ -44,8 +49,8 @@ with no SDK present.
 
 | | |
 |---|---|
-| [`docs/DESIGN.md`](docs/DESIGN.md) | The specification — signal chain, every block's math, the control-rate architecture, the 53-parameter surface, and the eight places where performance was chosen over authenticity. |
-| [`docs/GATES.md`](docs/GATES.md) | The implementation plan: twelve gates, each with objectively measurable acceptance criteria, plus the R1–R14 rules that bind every gate. |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | The specification — signal chain, every block's math, the control-rate architecture, the 54-parameter surface, and the eight places where performance was chosen over authenticity. |
+| [`docs/GATES.md`](docs/GATES.md) | The implementation plan: thirteen gates, each with objectively measurable acceptance criteria, plus the R1–R14 rules that bind every gate. |
 
 ## The one priority that outranks the others
 
@@ -83,7 +88,16 @@ silently skipped by the silent-voice-skip path ([PERF-7]):
 | 16 voices, unison | 932.00 | 612.91 | 1.52× | 34.0× |
 
 **Budget verdict: 8 voices mono clears the ≥10× floor at 66.6× realtime — a
-6.7× margin.** The budget was already met before any optimization (40.0×
+6.7× margin.**
+
+> **G12 (chorus) costs +1.4 % of that.** Measured separately on an M4 Mac —
+> a different box, so read it as a *delta*, not against the table above:
+> 8 voices mono went 327.4 → 332.0 ns/sample (62.8× realtime) with the
+> chorus on II, of which +2.4 ns is the unconditional delay-line write the
+> Off path still pays so a mid-note switch-on starts from real signal
+> history. One chorus runs on the summed stack, not per voice, so the cost
+> does not scale with polyphony. `Tests/synth_bench.cpp` carries its own
+> `idle + chorus II` and `8 voices + cho II` rows for this. The budget was already met before any optimization (40.0×
 realtime, `docs/GATES.md`'s G11 status note), so §12's escape hatches were
 never *required* — §12.3 (SIMD-over-voices, `Source/DSP/synth_simd.h`) was
 built anyway, by request, on the understanding that it is the most invasive
@@ -142,9 +156,10 @@ require it (gate G0.2).
 | Windows | ✅ | VST3 + CLAP | NanoVG / GL2 |
 | Linux | ✅ | ❌ — skipped at configure time | — |
 
-Gates G0–G8 and G11 are fully executable on Linux against the DSP core and its
-tests alone. **G9 (wrapper/validators) and G10 (UI) require a Windows or macOS
-host.**
+Gates G0–G8, G11 and G12's DSP half are fully executable on Linux against the
+DSP core and its tests alone. **G9 (wrapper/validators) and G10 (UI) require a
+Windows or macOS host** — G12's one editor control lands in G10's layout and
+so inherits that requirement.
 
 ## Build
 

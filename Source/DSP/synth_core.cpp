@@ -69,6 +69,15 @@ void SynthCore::init(float sampleRate) {
         mOutputDcBlock[ch].setFc(5.0, sampleRate);
     }
 
+    // G12 (DESIGN.md §13): the output-stage chorus's own fs-dependent
+    // preparation -- delay-time-to-samples scale, the per-sample step of its
+    // 20 ms wet fade, and the two BBD-bandwidth one-pole coefficients.
+    // BEFORE reset() below, not after: JunoChorus::init() ends by calling
+    // its own reset(), and doing it in this order means the reset() on the
+    // next line is simply redundant for the chorus rather than being undone
+    // by it.
+    mChorus.init(static_cast<double>(sampleRate));
+
     // Sizes/prepares all fixed (non-allocating, R3) buffers for this rate.
     // G7: kMaxVoices+kNumFadeSlots is already a fixed-size array (synth_core.h).
     reset();
@@ -199,6 +208,16 @@ void SynthCore::reset() {
     mEffPanGainR0 = 1.0;
     mEffPanGainL1 = 0.0;
     mEffPanGainR1 = 0.0;
+
+    // G12 (DESIGN.md §13, §11 "Reset semantics"): clears the two delay
+    // lines, the chorus LFO phase, the BBD filters and the wet fade gain --
+    // and, via JunoChorus's own `mEverRun`, makes the NEXT control block
+    // SNAP its geometry and wet gain from whatever kChorus currently says
+    // instead of ramping into it. That is the same contract
+    // mLpfSlopeSettled/mHpfBypassed/mControlRateEverRun above each have:
+    // a reset() must not leave behind state that the next control block
+    // mistakes for a runtime toggle. No parameter is touched.
+    mChorus.reset();
 
     mPendingCount = 0;
 
@@ -384,8 +403,8 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
 
     // fs is read exactly ONCE per host block too (block rate, not audio
     // rate) -- deliberately OUTSIDE buildSnapshot() so it does not count
-    // against G3.1's "53 params" figure (mSampleRate is configuration, not
-    // one of DESIGN.md §11's 53 parameters). finishSnapshot() below computes
+    // against G3.1's param-count figure (mSampleRate is configuration, not
+    // one of DESIGN.md §11's parameters). finishSnapshot() below computes
     // every block-rate DERIVED constant (ADSR coefficients, LFO increment)
     // from it plus the raw snapshot fields — DESIGN.md §2.2.
     const double fs = static_cast<double>(mSampleRate.load(std::memory_order_relaxed));
@@ -705,8 +724,33 @@ void SynthCore::process(const NoteEvent* events, int numEvents,
             // branches below run the IDENTICAL scalar math on IDENTICAL
             // inputs, so outL[n+i]==outR[n+i] bit-exact (G8.1) even though
             // each channel now goes through its OWN mOutputDcBlock[] instance.
-            double outSampleL = mixSumL * snapshot.masterVolumeLinear;
-            double outSampleR = mixSumR * snapshot.masterVolumeLinear;
+            // G12 (DESIGN.md §1/§13): the Juno-style BBD chorus, on the
+            // SUMMED accumulator and BEFORE master volume -- the real
+            // instrument's own order (chorus after the VCAs, ahead of the
+            // volume slider), which also leaves master volume as the last
+            // trim before the clip's ceiling so the chorus's own +1.7 dB
+            // typical gain is something the user can dial back out.
+            //
+            // With kChorus = Off this is a BIT-EXACT passthrough by
+            // assignment (synth_chorus.h): `chorusL`/`chorusR` receive
+            // `mixSumL`/`mixSumR` unchanged, which is what keeps both golden
+            // batteries verifying at exactly 0.000e+00 and keeps G8.1's
+            // mono L==R bit-identity intact across this gate. The delay
+            // lines are still WRITTEN while off, so switching the chorus on
+            // mid-note starts from real signal history -- two stores, no
+            // branch on the hot path, and nothing ever has to clear 32 KB
+            // from the audio thread.
+            //
+            // R12: everything in JunoChorus::process() is compare/add/
+            // multiply plus two masked array reads -- no transcendental, no
+            // atomic load. `frac` is the SAME control-block position the VCA
+            // gain is interpolated with, which is what makes the delay sweep
+            // block-size invariant (G3.3).
+            double chorusL = mixSumL, chorusR = mixSumR;
+            mChorus.process(mixSumL, mixSumR, frac, chorusL, chorusR);
+
+            double outSampleL = chorusL * snapshot.masterVolumeLinear;
+            double outSampleR = chorusR * snapshot.masterVolumeLinear;
             if (snapshot.outputClip) {
                 outSampleL = shapeCubic(outSampleL, 2.0);  // [dsp] DESIGN.md §11, L=2.0 -> +6dBFS ceiling
                 outSampleR = shapeCubic(outSampleR, 2.0);
@@ -757,7 +801,9 @@ SynthCore::ParamSnapshot SynthCore::buildSnapshot() const {
     // G3.1: every .load() below goes through this counting wrapper, so a
     // debug build (or a Release one -- the counter is cheap and unconditional,
     // there is no "debug build" config distinction in this tree) can assert
-    // "exactly 53 * numHostBlocks" (docs/GATES.md G3.1). A generic lambda
+    // "exactly kNumParams * numHostBlocks" (docs/GATES.md G3.1 -- 53 when
+    // that AC was written, 54 since G12 appended kChorus; the test reads
+    // SynthCore::kNumParams rather than the literal). A generic lambda
     // (C++17) so it works uniformly across the float/int/bool-as-float
     // atomics below without a template function per type.
     auto ld = [this](const auto& atomicRef) {
@@ -819,6 +865,7 @@ SynthCore::ParamSnapshot SynthCore::buildSnapshot() const {
     s.stereoMode               = ld(mStereoMode) != 0.0f;
     s.stereoDetuneCents       = ld(mStereoDetuneCents);
     s.stereoSpreadPercent     = ld(mStereoSpreadPercent);
+    s.chorusMode                = ld(mChorusMode);
     return s;
 }
 
@@ -914,6 +961,23 @@ void SynthCore::finishSnapshot(ParamSnapshot& s, double fsControl) {
     // conventions, DESIGN.md §6 -- this is a generic "reach the target
     // asymptotically" ramp, no overshoot semantics at all).
     s.stereoBlendCoeff = AdsrEnv::coeffForMs(kStereoBlendMs, 1.0, fsControl);
+
+    // [dsp] G12/DESIGN.md §13: the chorus LFO's control-step increment and
+    // the one-pole coefficient its centre/depth glide on when the mode
+    // changes between two LIVE positions. Both are single-instrument-wide
+    // derived constants of a single param, and both are things the control
+    // rate must never compute (a divide is merely wasteful there; the
+    // exp() inside coeffForMs is an outright R12 violation) -- so, like
+    // glideStepCoeff and stereoBlendCoeff above, they are computed once per
+    // host block here. The rate comes from JunoChorus's own per-mode table
+    // (synth_chorus.h), which is the single source of truth for it; the
+    // index is clamped there too, so a corrupt stored value cannot read off
+    // the end of the table on either side of this boundary.
+    const int chorusModeIdx = std::clamp(s.chorusMode, 0, JunoChorus::kNumModes - 1);
+    s.chorusLfoIncrement = JunoChorus::kRateHz[chorusModeIdx] / std::max(fsControl, 1e-6);
+    // Same "generic asymptotic approach, divisor 1.0" use of coeffForMs as
+    // stereoBlendCoeff just above -- not an envelope-segment coefficient.
+    s.chorusGlideCoeff = AdsrEnv::coeffForMs(JunoChorus::kGlideMs, 1.0, fsControl);
 }
 
 // ===== G7: event application (DESIGN.md §10.1/§10.3-§10.6) =====
@@ -1367,6 +1431,17 @@ void SynthCore::controlRateUpdate(const ParamSnapshot& snapshot, double fs) {
     mEffPanGainR0 = (1.0 - mStereoBlend) * 1.0 + mStereoBlend * snapshot.panGainR0;
     mEffPanGainL1 = (1.0 - mStereoBlend) * 0.0 + mStereoBlend * snapshot.panGainL1;
     mEffPanGainR1 = (1.0 - mStereoBlend) * 0.0 + mStereoBlend * snapshot.panGainR1;
+
+    // G12 (DESIGN.md §13): the output-stage chorus is ONE instrument-wide
+    // block sitting on the summed accumulator, so -- exactly like the LPF
+    // slope crossfade and the stereo blend above -- its whole control-rate
+    // step happens once here, outside the per-voice loop. It advances its
+    // own triangle LFO one control step and republishes the two per-channel
+    // delay endpoints the audio-rate loop interpolates between; everything
+    // needing a divide or an exp() was already derived at block rate
+    // (finishSnapshot()) and is merely passed in (R12).
+    mChorus.setControlRate(snapshot.chorusMode, snapshot.chorusLfoIncrement,
+                            snapshot.chorusGlideCoeff);
 
     // Chain 1 needs a full control-rate prep (pitch, filter coefficients)
     // whenever it is either the logical target OR the blend has not yet
@@ -1885,6 +1960,10 @@ void SynthCore::setStereoSpreadPercent(float pct) {
 }
 
 // ===== Test-only debug accessors =====
+
+void SynthCore::setChorusMode(Chorus m) {
+    mChorusMode.store(static_cast<int>(m), std::memory_order_relaxed);
+}
 
 void SynthCore::setDebugControlBlock(int samples) {
     mControlBlock = std::max(1, samples);

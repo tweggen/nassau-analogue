@@ -9,7 +9,8 @@ namespace iplug { namespace igraphics { class IGraphics; } }
 class NassauAnaloguePlugin;
 
 namespace NassauAnalogueUI {
-    // G10: the full, signal-chain-grouped 53-param editor (DESIGN.md §1/§11,
+    // G10: the full, signal-chain-grouped editor covering every param
+    // (DESIGN.md §1/§11,
     // docs/GATES.md G10.2) — VCO 1 / VCO 2 / Sub+Noise / Mixer+Drive / HPF /
     // LPF / ENV-F / ENV-A / LFO / Poly-Mod / Voice / Stereo / Output, plus
     // the factory preset selector and an IVKeyboardControl for auditioning
