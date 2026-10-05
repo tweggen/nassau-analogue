@@ -72,12 +72,16 @@
 // SerializeState/UnserializeState are orthogonal).
 #define PLUG_DOES_STATE_CHUNKS 0
 
-// The FULL 53-param surface (DESIGN.md §11), append-only (R4), landed
+// The param surface (DESIGN.md §11), append-only (R4), landed
 // incrementally: kMasterVolume/kOutputClip (G0), Osc1/Osc2/Sub/Noise (G2),
 // ENV-F/ENV-A/LFO (G3), LPF slope+cutoff+resonance (G4), LPF modulation (G5),
-// HPF+Drive+Poly-Mod (G6), voice/glide/bend/velocity (G7), stereo (G8).
-// Frozen here: R4 append-only, and this is the last index in the design.
-#define PLUG_N_PARAMS   53
+// HPF+Drive+Poly-Mod (G6), voice/glide/bend/velocity (G7), stereo (G8),
+// chorus (G12). 53 through G11; 54 since G12 APPENDED kChorus at index 53 --
+// growing this number is legal exactly as long as every existing index keeps
+// its meaning, which is what keeps older saved states loadable
+// (nassau_state.h). NassauAnaloguePlugin.h static_asserts kNumParams against
+// this.
+#define PLUG_N_PARAMS   54
 // Factory preset bank. MUST equal kNumPresets in NassauAnaloguePlugin.h (a
 // static_assert there enforces it) and the number of entries in
 // nassau_presets::Presets() once that lands (G9). G0 has no preset bank yet
@@ -90,7 +94,7 @@
 #define PLUG_HAS_UI     1
 // G10: sized for the full 13-panel editor (VCO 1 / VCO 2 / Sub+Noise /
 // Mixer+Drive / HPF / LPF / ENV-F / ENV-A / LFO / Poly-Mod / Voice / Stereo /
-// Output, docs/GATES.md G10.2), covering all 53 params plus the preset
+// Chorus+Output, docs/GATES.md G10.2), covering every param plus the preset
 // selector and an IVKeyboardControl strip along the bottom.
 //
 // These two numbers are NOT free parameters and must not be hand-tuned:
@@ -103,8 +107,14 @@
 // 672 -> 712 came with that fix: knob values moved out from on top of the
 // knob face to under it, and the switch/toggle rows grew enough to contain
 // their own captions.
+//
+// 712 -> 714 is G12: the Output panel gained the chorus switch, and the
+// panel that had been setting row 3's height (Voice) had exactly 2px less
+// slack than a tab-switch row needs. Two pixels, taken by following the
+// arithmetic rather than by trimming something to fit -- which is what the
+// static_assert exists to force.
 #define PLUG_WIDTH      944
-#define PLUG_HEIGHT     712
+#define PLUG_HEIGHT     714
 #define PLUG_FPS        60
 
 #define PLUG_SHARED_RESOURCES 0

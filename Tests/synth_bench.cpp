@@ -6,7 +6,7 @@
 // pass/fail signal -- Zermatt's own G6.9 note measured 13.6-21.7x under
 // concurrent builds vs 19.5-20.2x idle for the SAME binary).
 //
-// Five configs, all at fs = 48 kHz (DESIGN.md §12's own budget scenario),
+// Seven configs, all at fs = 48 kHz (DESIGN.md §12's own budget scenario),
 // best-of-N trials each, matching G11.4's exact list:
 //   idle        -- SynthCore initialised, NOT ONE NoteEvent ever sent. Every
 //                  one of the 18 physical+fade slots stays Idle, so the
@@ -82,6 +82,11 @@ struct Config {
   SynthCore::VoiceMode voiceMode;
   bool stereoMode;
   int expectedActiveVoices;  // getDebugActiveVoiceCount() sanity check, post warm-up
+  // G12: the output-stage chorus. Present here because the whole point of
+  // the "8 voices mono + chorus II" config below is the DELTA against the
+  // identical config with it Off -- one number that says what the stage
+  // costs, rather than a claim that it is cheap.
+  SynthCore::Chorus chorus = SynthCore::Chorus::Off;
 };
 
 void configureCore(SynthCore& core, const Config& cfg, float fs) {
@@ -128,6 +133,7 @@ void configureCore(SynthCore& core, const Config& cfg, float fs) {
   core.setStereoMode(cfg.stereoMode);
   core.setStereoDetuneCents(cfg.stereoMode ? 10.0f : 6.0f);
   core.setStereoSpreadPercent(cfg.stereoMode ? 80.0f : 70.0f);
+  core.setChorusMode(cfg.chorus);
   core.init(fs);
 }
 
@@ -210,6 +216,14 @@ int main(int argc, char** argv) {
       {"8 voices mono", eightNoteCluster, SynthCore::Polyphony::Eight, SynthCore::VoiceMode::Poly, false, 8},
       {"8 voices stereo", eightNoteCluster, SynthCore::Polyphony::Eight, SynthCore::VoiceMode::Poly, true, 8},
       {"16 voices unison", {60}, SynthCore::Polyphony::Sixteen, SynthCore::VoiceMode::Unison, false, 16},
+      // G12: the two configs whose DIFFERENCE is the chorus's whole cost.
+      // "idle + chorus" isolates it completely (no voice work at all to hide
+      // in), and "8 voices + chorus II" puts it against the budget scenario
+      // G11.5 actually owns.
+      {"idle + chorus II", {}, SynthCore::Polyphony::Eight, SynthCore::VoiceMode::Poly, false, 0,
+       SynthCore::Chorus::Two},
+      {"8 voices + cho II", eightNoteCluster, SynthCore::Polyphony::Eight, SynthCore::VoiceMode::Poly,
+       false, 8, SynthCore::Chorus::Two},
   };
 
   for (const Config& cfg : configs) runOne(cfg, totalSamples, trials, block);

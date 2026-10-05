@@ -32,10 +32,11 @@
 // overridden already at G0 (PLUG_DOES_STATE_CHUNKS stays 0 regardless — see
 // config.h's own note: iPlug2's "state chunks" flag and a plugin choosing to
 // implement versioned state via these two overrides are orthogonal, exactly
-// NassauZermatt's stance, copied verbatim). Only 2 of the FINAL 53 params are
+// NassauZermatt's stance, copied verbatim). Only 2 of the params are
 // actually registered with a live IParam at G0 (see NassauAnaloguePlugin.h),
 // but the framing below only ever operates on `NParams()` (== PLUG_N_PARAMS
-// == 53, fixed from G0 — see config.h's own note on why that differs from
+// -- 53 from G0 through G11, 54 since G12 appended kChorus; see config.h's
+// own note on why that differs from
 // NassauZermatt's incremental growth) and `GetParam(i)->Set(v)`, neither of
 // which cares whether index i has been InitXxx()'d yet. PlanUnserialize is
 // pure and dependency-free, so nothing here needs to change as later gates

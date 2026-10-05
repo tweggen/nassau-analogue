@@ -210,9 +210,17 @@ int main() {
   // =========================================================================
   // G3.1: ParamSnapshot built exactly once per host block.
   // QUANTITY MEASURED: the instrumented count of atomic .load() calls made
-  // by buildSnapshot() (via a counting wrapper around every one of its 53
-  // loads, Source/DSP/synth_core.cpp) across a run of known host-block
-  // count -- exactly what the AC text asks for ("53 params" x "10 blocks").
+  // by buildSnapshot() (via a counting wrapper around every one of its
+  // per-param loads, Source/DSP/synth_core.cpp) across a run of known
+  // host-block count -- exactly what the AC text asks for ("53 params" x
+  // "10 blocks").
+  //
+  // The AC was written when the surface was 53 params; G12 appended
+  // kChorus, making it 54. Every count below is expressed as
+  // SynthCore::kNumParams rather than a literal, so what is actually
+  // asserted -- "exactly one snapshot per HOST block, every param loaded
+  // exactly once in it" -- is unchanged by that, and stays right the next
+  // time the surface grows.
   // =========================================================================
   std::cout << "Group: ParamSnapshot built exactly once per host block (G3.1)\n";
   {
@@ -222,18 +230,19 @@ int main() {
     std::vector<float> l(512), r(512);
     for (int b = 0; b < 10; ++b) core.process(nullptr, 0, l.data(), r.data(), 512);
     const long long count = core.getDebugAtomicLoadCount();
-    checkNum("G3.1: 10 host blocks x 53 params -> exactly 530 instrumented atomic loads",
-             count == 53 * 10, static_cast<double>(count));
+    checkNum("G3.1: 10 host blocks x kNumParams -> exactly 10*kNumParams instrumented atomic loads",
+             count == static_cast<long long>(SynthCore::kNumParams) * 10, static_cast<double>(count));
 
     // A SINGLE call spanning many control blocks (8192/32 = 256 of them)
-    // must still load exactly 53 -- not 53*256 -- proving the snapshot is
-    // built once per HOST block, not once per control block.
+    // must still load exactly kNumParams -- not kNumParams*256 -- proving
+    // the snapshot is built once per HOST block, not once per control block.
     core.resetDebugAtomicLoadCount();
     std::vector<float> l2(8192), r2(8192);
     core.process(nullptr, 0, l2.data(), r2.data(), 8192);
     const long long count2 = core.getDebugAtomicLoadCount();
-    checkNum("G3.1: one host block spanning 256 control blocks still loads exactly 53, not 53x256",
-             count2 == 53, static_cast<double>(count2));
+    checkNum("G3.1: one host block spanning 256 control blocks still loads exactly kNumParams, "
+             "not kNumParams x 256",
+             count2 == SynthCore::kNumParams, static_cast<double>(count2));
   }
 
   // =========================================================================
@@ -241,7 +250,8 @@ int main() {
   // QUANTITY MEASURED (a): same instrumented atomic-load counter as G3.1,
   // now on a call that does NOT complete a control block (17 < 32 samples,
   // default mControlBlock) -- if the audio-rate loop touched an atomic, this
-  // count would be nonzero beyond 53, or would vary with sample count.
+  // count would be nonzero beyond kNumParams, or would vary with sample
+  // count.
   // QUANTITY MEASURED (b): the ACTUAL SOURCE TEXT of Source/DSP/
   // synth_core.cpp between its own "AUDIO-RATE LOOP BEGIN/END" markers,
   // grepped for tan(/exp(/exp2(/pow(/log(/sin(/cos(/.load( -- the same
@@ -255,10 +265,11 @@ int main() {
     core.resetDebugAtomicLoadCount();
     std::vector<float> l(17), r(17);  // < 1 control block: no control-rate update point is ever reached
     core.process(nullptr, 0, l.data(), r.data(), 17);
-    checkNum("G3.2(a): a partial (<1 control block) host block loads exactly 53 atomics -- none "
-             "from the audio-rate loop, which ran for all 17 samples without ever reaching a "
+    checkNum("G3.2(a): a partial (<1 control block) host block loads exactly kNumParams atomics -- "
+             "none from the audio-rate loop, which ran for all 17 samples without ever reaching a "
              "control-rate update point",
-             core.getDebugAtomicLoadCount() == 53, static_cast<double>(core.getDebugAtomicLoadCount()));
+             core.getDebugAtomicLoadCount() == SynthCore::kNumParams,
+             static_cast<double>(core.getDebugAtomicLoadCount()));
 
 #ifdef NASSAU_CORE_CPP_PATH
     std::ifstream f(NASSAU_CORE_CPP_PATH);

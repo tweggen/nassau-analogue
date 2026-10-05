@@ -10,7 +10,7 @@
 // "copy the shape" instruction for this gate). Only includes synth_core.h
 // (Source/DSP, itself SDK-free, R2).
 //
-// SINGLE SOURCE OF TRUTH: each preset is stored as a FULL 53-value array (one
+// SINGLE SOURCE OF TRUTH: each preset is stored as a FULL kParamCount-value array (one
 // double per param, in enum order -- the exact positional layout a factory
 // preset chunk has on disk, see nassau_state.h's "bad magic -> legacy
 // fallback" path, which is what MakePresetFromChunk-built chunks actually
@@ -34,6 +34,11 @@
 // param values DESIGN.md §11 ranges apply to (percent/Hz/ms/cents/semitones/
 // enum-index/bool-as-0-or-1), never a scaled or clamped derivative -- G9.4
 // checks exact recall against these same numbers.
+//
+// G12 appended ONE param (kChorus, index 53). Every preset below therefore
+// gained a value for it -- implicitly Off via Defaults(), explicitly where a
+// preset genuinely wants the chorus (see the four that name it). Nothing
+// above index 52 moved, which is the whole point of R4's append-only rule.
 
 #include "synth_core.h"
 
@@ -100,8 +105,9 @@ constexpr int kVelToFilter = 49;
 constexpr int kStereoMode = 50;
 constexpr int kStereoDetune = 51;
 constexpr int kStereoSpread = 52;
+constexpr int kChorus = 53;
 
-constexpr int kParamCount = 53;
+constexpr int kParamCount = 54;
 constexpr int kPresetCount = 12;
 
 using ParamArray = std::array<double, static_cast<size_t>(kParamCount)>;
@@ -114,7 +120,7 @@ using ParamArray = std::array<double, static_cast<size_t>(kParamCount)>;
 // opposite order from kLpfSlope -- kept as documented, matching
 // synth_core.h's own HpfSlope enum comment). Polyphony enum:
 // 4=0/6=1/8=2/12=3/16=4. VoiceMode enum: Poly=0/Unison=1/Mono=2. Bools stored
-// as 0.0/1.0.
+// as 0.0/1.0. Chorus enum: Off=0/I=1/II=2/I+II=3.
 inline ParamArray Defaults() {
   ParamArray v{};
   v[static_cast<size_t>(kMasterVolume)] = -6.0;
@@ -170,6 +176,7 @@ inline ParamArray Defaults() {
   v[static_cast<size_t>(kStereoMode)] = 0.0;  // off
   v[static_cast<size_t>(kStereoDetune)] = 6.0;
   v[static_cast<size_t>(kStereoSpread)] = 70.0;
+  v[static_cast<size_t>(kChorus)] = 0.0;  // Off
   return v;
 }
 
@@ -237,11 +244,12 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kStereoSpread, 60.0}})},
 
       // 2 - Prophet Strings: lush detuned ensemble pad. 12 dB SVF for a
-      // softer top, slow envelopes, LFO->PWM for a chorus-like shimmer
-      // instead of an audio-rate chorus effect (none exists, DESIGN.md §13),
-      // wide stereo.
+      // softer top, slow envelopes, LFO->PWM shimmer, wide stereo -- and,
+      // since G12, the output-stage chorus on II (DESIGN.md §13), which is
+      // the deeper of the two slow positions and what an ensemble pad of
+      // this vintage would actually have been played through.
       {"Prophet Strings",
-       WithOverrides({{kMasterVolume, -14.0},  // headroom: wide detuned stereo ensemble
+       WithOverrides({{kMasterVolume, -17.0},  // [voicing] G12 headroom trim -- was -14; the chorus on II pushed the measured peak to +1.77 dBFS  // headroom: wide detuned stereo ensemble
                        {kOsc1Level, 95.0},
                        {kOsc2Fine, 4.5},
                        {kOsc2Level, 90.0},
@@ -264,7 +272,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLfoPwmAmount, 30.0},
                        {kStereoMode, 1.0},
                        {kStereoDetune, 12.0},
-                       {kStereoSpread, 90.0}})},
+                       {kStereoSpread, 90.0},
+                       {kChorus, 2.0}})},  // II
 
       // 3 - Sub Bass: Mono legato bass built around the sub-oscillator
       // (SubLevel 70 -- the whole point of the patch), 16' fundamental, a
@@ -298,9 +307,11 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // 4 - PWM Pad: both oscillators pulse waves, PW swept slowly by the
       // LFO (LfoPwmAmount 60%) rather than held static -- the PWM sound
       // DESIGN.md §4.1 calls out as one of this instrument's core timbres.
-      // 12 dB SVF, wide stereo.
+      // 12 dB SVF, wide stereo, chorus on I (the gentler position -- the PWM
+      // is already doing most of the movement here, and II on top of it
+      // muddles rather than widens).
       {"PWM Pad",
-       WithOverrides({{kMasterVolume, -17.0},  // [voicing] G9 headroom trim -- was -15; only 0.52 dB of headroom  // headroom: wide detuned stereo pulse pad
+       WithOverrides({{kMasterVolume, -19.5},  // [voicing] G12 headroom trim -- was -17 (itself a G9 trim from -15); the chorus on I pushed the measured peak to +1.05 dBFS  // headroom: wide detuned stereo pulse pad
                        {kOsc1Wave, 1.0},  // Pulse
                        {kOsc1PW, 50.0},
                        {kOsc2Wave, 1.0},  // Pulse
@@ -324,7 +335,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLpfEnvAmount, 20.0},
                        {kStereoMode, 1.0},
                        {kStereoDetune, 10.0},
-                       {kStereoSpread, 75.0}})},
+                       {kStereoSpread, 75.0},
+                       {kChorus, 1.0}})},  // I
 
       // 5 - Sync Lead: VCO2 hard-synced to VCO1, swept by the Prophet-
       // flavoured Poly-Mod (ENV-F -> VCO2 pitch, 60% -- a large bipolar
@@ -417,7 +429,10 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // 45%) plus a touch of ENV-F -> PW, producing an inharmonic
       // pitch/timbre "ping" no audio-rate FM is needed for (DESIGN.md §8,
       // [PERF-6]). Triangle VCO1 for a soft body under the shimmer, 12 dB
-      // SVF with a resonant peak.
+      // SVF with a resonant peak. Chorus on I+II (DESIGN.md §13): both
+      // buttons down is not "more chorus" but a fast ~9.75 Hz wobble, and a
+      // struck-bell/electric-piano patch is the one place in this bank that
+      // wants exactly that.
       {"Bell Keys",
        WithOverrides({{kMasterVolume, -16.0},  // headroom: resonant Poly-Mod bell ping, 4-note chord
                        {kOsc1Wave, 2.0},  // Tri
@@ -439,7 +454,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kPmEnvFToPw, 15.0},
                        {kStereoMode, 1.0},
                        {kStereoDetune, 4.0},
-                       {kStereoSpread, 50.0}})},
+                       {kStereoSpread, 50.0},
+                       {kChorus, 3.0}})},  // I+II
 
       // 9 - Resonant Pluck: a snappy filter envelope (instant attack, fast
       // decay to zero sustain) slamming a NEARLY self-oscillating 24 dB
@@ -499,7 +515,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
       // 11 - Stereo Wash: slow ambient pad showcasing the full stereo dual
       // chain at maximum detune/spread, LFO->LPF cutoff movement
       // (LpfLfoAmount) alongside the envelope, and a hint of pink noise for
-      // air. The single widest, slowest preset in the bank.
+      // air, and the chorus on I over the top of all of it. The single
+      // widest, slowest preset in the bank.
       {"Stereo Wash",
        WithOverrides({{kMasterVolume, -16.0},  // headroom: widest/slowest pad, 4-note chord
                        {kOsc2Fine, 5.5},
@@ -525,7 +542,8 @@ inline const std::array<PresetSpec, static_cast<size_t>(kPresetCount)>& Presets(
                        {kLpfLfoAmount, 40.0},
                        {kStereoMode, 1.0},
                        {kStereoDetune, 25.0},
-                       {kStereoSpread, 100.0}})},
+                       {kStereoSpread, 100.0},
+                       {kChorus, 1.0}})},  // I
   }};
   return kTable;
 }
@@ -597,6 +615,7 @@ inline void ApplyPresetToSynthCore(const ParamArray& v, SynthCore& core) {
   core.setStereoMode(v[static_cast<size_t>(kStereoMode)] != 0.0);
   core.setStereoDetuneCents(static_cast<float>(v[static_cast<size_t>(kStereoDetune)]));
   core.setStereoSpreadPercent(static_cast<float>(v[static_cast<size_t>(kStereoSpread)]));
+  core.setChorusMode(static_cast<SynthCore::Chorus>(static_cast<int>(v[static_cast<size_t>(kChorus)])));
 }
 
 }  // namespace nassau_presets

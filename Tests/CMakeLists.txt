@@ -167,6 +167,23 @@ target_compile_options(preset_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME PresetTests COMMAND preset_tests)
 
+# ---- G12: the Juno-style output-stage chorus -------------------------------
+# Links nassau_synth_core: most G12 ACs drive the REAL SynthCore output stage
+# (the whole gate is about WIRING one shared chorus into the summed
+# accumulator ahead of master volume, which a header-only test cannot see),
+# while G12.14 inspects Source/DSP/synth_chorus.h's own per-sample source
+# text -- so, like envlfo_tests.cpp's G3.2(b) and filter_tests.cpp's G4.11,
+# it needs that file's ABSOLUTE path at compile time.
+add_executable(chorus_tests chorus_tests.cpp)
+target_link_libraries(chorus_tests nassau_synth_core)
+target_include_directories(chorus_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
+target_compile_options(chorus_tests PRIVATE ${NASSAU_WARNING_FLAGS})
+target_compile_definitions(chorus_tests PRIVATE
+    NASSAU_CHORUS_H_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_chorus.h")
+
+add_test(NAME ChorusTests COMMAND chorus_tests)
+
 # ---- G11.4/G11.5/G11.6: throughput benchmark (Tests/synth_bench.cpp) ------
 # Deliberately NOT wired to add_test(): a wall-clock number is load-sensitive
 # and makes a bad pass/fail signal (docs/GATES.md G11's own file-header

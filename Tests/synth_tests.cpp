@@ -9,7 +9,7 @@
 // (no voice/oscillator/filter/envelope existed yet), so most groups below
 // still assert silence/finiteness/no-crash rather than a signal shape; the
 // meaningful new-at-G0 behaviour under test is the control-rate grid's
-// persistence (DESIGN.md §2) and the 53-param setter surface (DESIGN.md §11)
+// persistence (DESIGN.md §2) and the full setter surface (DESIGN.md §11)
 // compiling, running and being thread-safe (R3, G0.9). G3 (docs/GATES.md)
 // wires in a real, enveloped voice, so the ONE check that specifically
 // asserted silence for a NoteOn/NoteOff-bearing event stream (G0.8's block-
@@ -132,7 +132,8 @@ int main() {
         core.init(999999.0f); // bogus (too high) -> ignored
         check("init() ignores an absurdly high sample rate", core.getSampleRate() == 192000.0f);
 
-        // Exercise the full FINAL setter surface (DESIGN.md §11, 53 params)
+        // Exercise the full FINAL setter surface (DESIGN.md §11; 53 params
+        // through G11, 54 since G12 appended kChorus)
         // once each; the point at G0 is that this compiles and doesn't crash,
         // not that it audibly changes anything (process() has no DSP math
         // yet — see synth_core.h's class comment).
@@ -189,8 +190,15 @@ int main() {
         core.setStereoMode(true);
         core.setStereoDetuneCents(12.0f);
         core.setStereoSpreadPercent(50.0f);
-        check("every setter in the FINAL 53-param surface compiles and runs", true);
-        static_assert(SynthCore::kNumParams == 53, "DESIGN.md §11 froze this at 53 (R4)");
+        core.setChorusMode(SynthCore::Chorus::OneTwo);
+        check("every setter in the FINAL param surface compiles and runs", true);
+        // R4 is APPEND-ONLY, not "never grows": G12 appended kChorus at
+        // index 53. What this pins is that the count matches what the
+        // serializer, the preset table and the plugin's EParams enum all
+        // separately believe -- each of those has its own assert against
+        // this same number.
+        static_assert(SynthCore::kNumParams == 54,
+                      "DESIGN.md §11: 53 params through G11, +kChorus at 53 as of G12 (R4)");
     }
 
     // ---------------------------------------------------------------- Silence --
@@ -501,7 +509,7 @@ int main() {
         // iterations/s (521 ns/sample), stereo worst case 1014 iterations/s
         // (983 ns/sample) -- a 1.89x ratio, matching DESIGN.md §9's own
         // "near 1.85x" expectation almost exactly, and nowhere near a stall.
-        // Adding the ACTUAL contending setter thread (hammering 53 atomics in
+        // Adding the ACTUAL contending setter thread (hammering every param atomic in
         // a tight loop, no sleep) drops this further, to ~880 iterations/s
         // measured on this box -- BELOW this AC's original `> 1000` bound,
         // which was calibrated before G8 existed and never reasoned about a
@@ -578,6 +586,7 @@ int main() {
                 core.setStereoMode((rng.next() & 1u) != 0);
                 core.setStereoDetuneCents((v + 1.0f) * 12.5f);
                 core.setStereoSpreadPercent((v + 1.0f) * 50.0f);
+                core.setChorusMode(static_cast<SynthCore::Chorus>(rng.next() % 4u));
                 setterIterations.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -600,7 +609,7 @@ int main() {
         stop.store(true, std::memory_order_relaxed);
         setterThread.join();
 
-        check("1 s of process() blocks concurrent with continuous setter calls across all 53 "
+        check("1 s of process() blocks concurrent with continuous setter calls across all "
               "params completes with no crash",
               true);
         check("process() thread made many iterations over the 1 s window", processIterations > 100);

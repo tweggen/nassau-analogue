@@ -15,6 +15,7 @@
 #include "synth_filter.h"
 #include "synth_alloc.h"
 #include "synth_simd.h"
+#include "synth_chorus.h"
 
 // G5 (docs/GATES.md): the LPF is now GENUINELY WIRED into the per-voice
 // audio path (mixer -> DC block -> LPF -> VCA, DESIGN.md §1) -- G4 built and
@@ -83,7 +84,7 @@ struct NoteEvent {
  * SynthCore — NassauAnalogue polyphonic analogue-synthesiser DSP core.
  *
  * Since G0 this header declares the COMPLETE FINAL public API (a setter for
- * every one of the 53 params in DESIGN.md §11), even though only a prefix of
+ * every one of the params in DESIGN.md §11), even though only a prefix of
  * those params is WIRED into a shipped plugin param at any given gate (params
  * 0-1 as of G0 — see NassauAnaloguePlugin.h). Every setter stores into its
  * atomic (R3); each gate fills in the corresponding math behind this stable
@@ -171,10 +172,20 @@ public:
     /// kVoiceMode (param 45). Default Poly.
     enum class VoiceMode : int { Poly = 0, Unison = 1, Mono = 2 };
 
-    /// Total parameter count (DESIGN.md §11: "53 params, append-only", R4
-    /// frozen). Kept here, not just in Source/Plugin/, so a DSP-only test
-    /// binary (no SDK, R2) has something to check its setter count against.
-    static constexpr int kNumParams = 53;
+    /// kChorus (param 53). Default Off. ALIASED, not re-declared: the four
+    /// positions live in Source/DSP/synth_chorus.h next to the mode tables
+    /// they index (JunoChorus::kRateHz/kCenterMs/kDepthMs), and a second
+    /// copy of the enum here would be one more thing that can silently
+    /// drift out of order. Off=0 / One=1 / Two=2 / OneTwo=3.
+    using Chorus = JunoChorus::Mode;
+
+    /// Total parameter count (DESIGN.md §11, R4 append-only). Kept here, not
+    /// just in Source/Plugin/, so a DSP-only test binary (no SDK, R2) has
+    /// something to check its setter count against. 53 through G11; 54 as of
+    /// G12, which APPENDED kChorus at index 53 -- the one legal way to grow
+    /// this surface (nassau_state.h's PlanUnserialize reads a 53-param save
+    /// into a 54-param build unchanged, leaving kChorus at its Off default).
+    static constexpr int kNumParams = 54;
 
     // ===== Lifecycle =====
     SynthCore();
@@ -351,6 +362,8 @@ public:
     void setStereoDetuneCents(float cents);
     /// 52 kStereoSpread   0 .. 100 %, default 70. G8.
     void setStereoSpreadPercent(float pct);
+    /// 53 kChorus         Off/I/II/I+II, default Off. G12 (DESIGN.md §13).
+    void setChorusMode(Chorus m);
 
     // ===== Utility =====
 
@@ -393,7 +406,7 @@ public:
     /// G3.1: exactly one ParamSnapshot built per host block, every one of its
     /// 53 atomics loaded exactly once. Incremented once per atomic .load()
     /// INSIDE buildSnapshot() only (not mSampleRate, not mControlPhase --
-    /// those are not part of the "53 params" DESIGN.md §11 table this AC
+    /// those are not part of the DESIGN.md §11 param table this AC
     /// counts, see buildSnapshot()'s own comment). Test-only: reset before
     /// measuring, read after.
     long long getDebugAtomicLoadCount() const { return mDebugAtomicLoadCount; }
@@ -413,6 +426,24 @@ public:
     /// interpolation, nothing else. Test-only, not safe concurrently with
     /// process().
     void setDebugDisableVcaInterpolation(bool enabled) { mDebugDisableVcaInterpolation = enabled; }
+
+    // ===== Test-only debug accessors (G12, docs/GATES.md) =====
+
+    /// G12: the delay the chorus published for `channel` (0 = L, 1 = R) at
+    /// the most recent control step, in ms -- i.e. the endpoint the
+    /// audio-rate loop is interpolating towards. Reading the delay back
+    /// directly is what lets Tests/chorus_tests.cpp measure each mode's rate
+    /// and depth against JunoChorus's own tables instead of inferring them
+    /// from rendered audio.
+    double getDebugChorusDelayMs(int channel) const { return mChorus.delayMs(channel); }
+    /// G12: chorus LFO phase in [0,1), post-step.
+    double getDebugChorusLfoPhase() const { return mChorus.lfoPhase(); }
+    /// G12: the wet-path fade gain, 0 (fully off) .. 1 (fully on), which
+    /// lands on EXACTLY 0.0/1.0 rather than approaching them (synth_chorus.h).
+    double getDebugChorusWetGain() const { return mChorus.wetGain(); }
+    /// G12: false exactly when process() is taking the bit-exact passthrough
+    /// path (chorus off AND fully faded out).
+    bool getDebugChorusAudible() const { return mChorus.audible(); }
 
     /// G3.10/G3.7: the LFO's raw output (post depth-gate, [-1,1]) as of the
     /// most recent control-rate step -- the SAME single value every active
@@ -585,7 +616,7 @@ private:
     // constants (ADSR coefficients, LFO increment, drive knee, mixer gains,
     // resonance k, base cutoffs, ...) DESIGN.md §2.2 describes, but the RAW
     // per-param fields below are already final in shape and correspond
-    // 1:1 with the 53 setters above.
+    // 1:1 with the setters above.
     struct ParamSnapshot {
         float masterVolumeDb;
         bool  outputClip;
@@ -636,7 +667,7 @@ private:
         // (drivePre, driveKnee, masterVolumeLinear) live further down with
         // the rest of ParamSnapshot's "derived, BLOCK-RATE constants" (see
         // that section's own comment) rather than here, to keep this run of
-        // fields a 1:1 mirror of the 53 setters, matching G0's original
+        // fields a 1:1 mirror of the setters, matching G0's original
         // layout note.
         int   polyphony;
         int   voiceMode;
@@ -647,6 +678,7 @@ private:
         bool  stereoMode;
         float stereoDetuneCents;
         float stereoSpreadPercent;
+        int   chorusMode;
 
         // ---- G3: derived, BLOCK-RATE constants (DESIGN.md §2.2) ----
         // NOT loaded from atomics -- filled in by finishSnapshot() AFTER
@@ -720,6 +752,15 @@ private:
         /// across the whole render -- computed once per host block anyway,
         /// matching every other derived constant's own convention here.
         double stereoBlendCoeff = 0.0;
+
+        // ---- G12: derived, BLOCK-RATE constants (DESIGN.md §2.2/§13) ----
+        // kChorus is a single instrument-wide param, and BOTH quantities the
+        // chorus needs derived from it are things R12 forbids at control
+        // rate, let alone audio rate: a division by fsControl, and an exp().
+        // Computed once per host block by finishSnapshot(), exactly like
+        // glideStepCoeff/stereoBlendCoeff above.
+        double chorusLfoIncrement = 0.0;  ///< cycles/control-step = kRateHz[mode]/fsControl
+        double chorusGlideCoeff = 0.0;    ///< one-pole coeff for JunoChorus::kGlideMs at fsControl
     };
 
     /// Loads every one of the 53 atomics exactly once (relaxed ordering — a
@@ -1070,6 +1111,19 @@ private:
     /// and every pre-G8 golden/unit AC (which only ever compared a single
     /// shared value duplicated to both channels) unperturbed.
     OnePoleHP mOutputDcBlock[2];
+
+    /// G12 (DESIGN.md §13): the Juno-style BBD chorus of the output stage.
+    /// ONE instance for the whole instrument, not one per voice -- it sits
+    /// on the summed accumulator, between the voice sum and master volume,
+    /// which is the Juno's own order (chorus after the VCAs, before the
+    /// volume slider) and the only placement at which the two delay lines'
+    /// antiphase sweep produces a stereo image rather than 16 uncorrelated
+    /// ones. All of its state, including the two 2048-sample delay lines,
+    /// is fixed-size and constructed here (R3: nothing in the audio path
+    /// ever allocates). With kChorus = Off its per-sample work is two array
+    /// stores and a bit-exact passthrough -- see synth_chorus.h.
+    JunoChorus mChorus;
+
     double mDebugLpfCutoffHz = 0.0;  ///< G4.9: last clamped (UNMODULATED) LPF cutoff -- see
                                       ///< getDebugLpfCutoff()'s own comment for why this stays
                                       ///< unmodulated even after G5.
@@ -1451,4 +1505,5 @@ private:
     std::atomic<float> mStereoMode{0.0f};                                       // [voicing] off
     std::atomic<float> mStereoDetuneCents{6.0f};                                // [voicing]
     std::atomic<float> mStereoSpreadPercent{70.0f};                             // [voicing]
+    std::atomic<int>   mChorusMode{static_cast<int>(Chorus::Off)};              // [voicing] off
 };
