@@ -163,6 +163,26 @@ so inherits that requirement.
 
 ## Build
 
+### The scripts (the short way)
+
+```sh
+./ci/build.sh            # configure + build into build/ — installs nothing
+./ci/build.sh --test     # ...and run ctest afterwards
+./ci/install.sh          # install the result into this user's plug-in folders
+./ci/uninstall.sh        # take it back out
+./ci/clean.sh            # drop build/, keep the checkout
+```
+
+Every repo in the Nassau suite answers to those four verbs, and the files are
+byte-identical across the four plugin repos — fix one, copy it across.
+
+`ci/build.sh` configures with `-DIPLUG_DEPLOY_PLUGINS=OFF`, so **a build never
+writes outside `build/`**. Installing is `ci/install.sh`, which prints where
+every bundle went; `ci/install.sh --link` symlinks instead of copying, for a
+rebuild-and-reload loop, and `--system` writes the shared directories the release
+`.pkg` uses instead of this user's. The raw CMake invocations below are what the
+scripts run, and stay correct if you would rather drive CMake yourself.
+
 One-time, after cloning, to provision the VST3/CLAP SDKs that iPlug2 needs but
 doesn't vendor (skip if you only want the DSP core + tests):
 
