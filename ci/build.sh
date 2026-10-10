@@ -107,11 +107,22 @@ cmake -S "$REPO_DIR" -B "$BUILD_DIR" \
     "${EXTRA_CMAKE_ARGS[@]+${EXTRA_CMAKE_ARGS[@]}}"
 
 say "Build"
-cmake --build "$BUILD_DIR" -j
+# --config and -C as well as CMAKE_BUILD_TYPE, because the two kinds of
+# generator read different ones and this script deliberately passes no -G so
+# CMAKE_GENERATOR can choose:
+#
+#   single-config (Ninja, Makefiles)  CMAKE_BUILD_TYPE decides; --config/-C ignored
+#   multi-config  (Visual Studio)     CMAKE_BUILD_TYPE IGNORED; --config/-C decide
+#
+# Without them a Visual Studio generator silently built DEBUG while the banner
+# said Release, and ctest found no tests at all. CMake does say so, in a warning
+# that reads like noise: "Manually-specified variables were not used by the
+# project: CMAKE_BUILD_TYPE".
+cmake --build "$BUILD_DIR" --config "$BUILD_TYPE" -j
 
 if [ -n "$RUN_TESTS" ]; then
     say "Test"
-    ctest --test-dir "$BUILD_DIR" --output-on-failure
+    ctest --test-dir "$BUILD_DIR" -C "$BUILD_TYPE" --output-on-failure
 fi
 
 # --- report the OUTCOME, not the options --------------------------------------
