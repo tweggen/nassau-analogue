@@ -164,6 +164,23 @@ format_of_ext() {
     esac
 }
 
+# The loadable binary inside a built plugin, or nothing when there is none.
+# A plain file (a CLAP or a legacy VST3 off macOS) is its own binary; a bundle
+# keeps it under Contents/<arch>/ -- MacOS on macOS, x86_64-win / arm64ec-win
+# on Windows, x86_64-linux on Linux. The same rule the hosts apply, so what this
+# accepts is what a host can load. ci/build.sh carries the identical function.
+bundle_binary() {
+    local p="$1" f
+    if [ -f "$p" ]; then
+        [ -s "$p" ] && echo "$p"
+        return 0
+    fi
+    for f in "$p"/Contents/MacOS/* "$p"/Contents/*-win/* "$p"/Contents/*-linux/*; do
+        if [ -f "$f" ] && [ -s "$f" ]; then echo "$f"; return 0; fi
+    done
+    return 0
+}
+
 # =============================================================================
 # uninstall
 # =============================================================================
@@ -255,6 +272,30 @@ if [ "$METHOD" = "link" ] && [ "$PLATFORM" = "windows" ]; then
     # elevation, and the failure is a permission error that names neither.
     warn "--link needs Developer Mode or elevation on Windows; copying instead."
     METHOD="copy"
+fi
+
+# --- refuse skeletons ---------------------------------------------------------
+# iPlug2 creates a bundle's directory tree BEFORE it compiles the binary that
+# goes in it, so a failed compile still leaves e.g. NassauAnalogue.vst3/Contents/
+# x86_64-win/ in build/out -- empty. Copied, that is a plugin every host skips
+# or rejects, while the copy you are looking for is "obviously installed"
+# (QBX-140: every Windows install for a week). So every candidate is checked
+# BEFORE anything is touched, and one skeleton refuses the whole install: half
+# an install is the same ambiguity this script exists to remove.
+EMPTY=()
+for src in "$OUT_DIR"/*; do
+    case "$src" in *.vst3|*.component|*.clap|*.app) ;; *) continue ;; esac
+    [ -e "$src" ] || continue
+    [ -n "$(bundle_binary "$src")" ] || EMPTY+=("$(basename "$src")")
+done
+if [ "${#EMPTY[@]}" -gt 0 ]; then
+    echo "" >&2
+    for e in "${EMPTY[@]}"; do
+        echo "  FAIL: $e has no binary in it -- a bundle skeleton, not a plugin." >&2
+    done
+    echo "  The last build did not finish. Rerun ./ci/build.sh and read its errors;" >&2
+    echo "  nothing was installed." >&2
+    exit 1
 fi
 
 INSTALLED=0

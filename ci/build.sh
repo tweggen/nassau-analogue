@@ -67,6 +67,23 @@ done
 say()  { printf '\n=== %s ===\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 
+# The loadable binary inside a built plugin, or nothing when there is none.
+# A plain file (a CLAP or a legacy VST3 off macOS) is its own binary; a bundle
+# keeps it under Contents/<arch>/ -- MacOS on macOS, x86_64-win / arm64ec-win
+# on Windows, x86_64-linux on Linux. ci/install.sh carries the identical
+# function and refuses what this one reports as a skeleton.
+bundle_binary() {
+    local p="$1" f
+    if [ -f "$p" ]; then
+        [ -s "$p" ] && echo "$p"
+        return 0
+    fi
+    for f in "$p"/Contents/MacOS/* "$p"/Contents/*-win/* "$p"/Contents/*-linux/*; do
+        if [ -f "$f" ] && [ -s "$f" ]; then echo "$f"; return 0; fi
+    done
+    return 0
+}
+
 CMAKE_EXTRA=()
 
 if [ -n "$SDK_DIR" ]; then
@@ -141,16 +158,34 @@ case "$RESOLVED_SDK" in
     *)               note "SDK:     $RESOLVED_SDK" ;;
 esac
 
+# A bundle DIRECTORY is not a bundle: iPlug2 makes the tree before it compiles
+# the binary, so a target that failed to build -- this run or an earlier one
+# whose tree is still here -- leaves an empty skeleton that the line above used
+# to report as "bundle:" (QBX-140). Each one is checked for its binary.
 FOUND=0
+SKELETONS=0
 if [ -d "$BUILD_DIR/out" ]; then
     for b in "$BUILD_DIR"/out/*; do
         case "$b" in
             *.vst3|*.component|*.clap|*.app|*.exe)
                 [ -e "$b" ] || continue
-                note "bundle:  $(basename "$b")"
-                FOUND=$((FOUND+1)) ;;
+                if [ -n "$(bundle_binary "$b")" ]; then
+                    note "bundle:  $(basename "$b")"
+                    FOUND=$((FOUND+1))
+                else
+                    note "EMPTY:   $(basename "$b") -- a skeleton with no binary in it"
+                    SKELETONS=$((SKELETONS+1))
+                fi ;;
         esac
     done
+fi
+
+if [ "$SKELETONS" -gt 0 ]; then
+    echo "" >&2
+    echo "  FAIL: $SKELETONS bundle(s) in $BUILD_DIR/out have no binary: a plugin" >&2
+    echo "        target did not build. Its error is in the build log above (or, if" >&2
+    echo "        this build was up to date, in an earlier one: try --clean)." >&2
+    exit 1
 fi
 
 if [ "$FOUND" -eq 0 ]; then
