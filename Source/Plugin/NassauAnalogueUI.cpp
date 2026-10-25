@@ -47,7 +47,7 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
         IColor(255, 226, 218, 205),  // text: warm off-white
         IColor(255, 150, 140, 126),  // textDim
         IColor(255, 212, 150, 64),   // accent: amber
-        IColor(255, 70, 58, 46),     // knobFace: dark warm brown
+        IColor(255, 64, 54, 42),     // knobFace: dark warm brown, zermatt's (4.63:1 as ink on the amber; 70,58,46 gave 4.32, under AA)
     };
 
     // ---- Size: derived, and checked against config.h ----------------------
