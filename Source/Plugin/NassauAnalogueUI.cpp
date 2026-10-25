@@ -105,6 +105,10 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     static_assert(kEditorH == static_cast<float>(PLUG_HEIGHT),
                   "PLUG_HEIGHT does not match the height this layout needs");
 
+    // Every switch and toggle goes through nui::Switch / nui::ToggleRow, i.e.
+    // nui::TabSwitch / nui::Toggle, never the bare iPlug2 classes: those draw
+    // the selected segment's and the "on" text in the ink that reads on the
+    // amber (here the dark knobFace; the off-white text read at ~1.9:1).
     const IVStyle knob = nui::KnobStyle(pal);
     const IVStyle sw = nui::SwitchStyle(pal);
     const IVStyle tog = nui::ToggleStyle(pal);
@@ -291,6 +295,13 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     // stock keyboard is a generic white/black that sits badly against this
     // palette. Pressed keys use the accent, the colour of every knob's value
     // arc, so a held note reads as "lit" in the same visual language.
+    //
+    // KNOWN, Debug only: in a _DEBUG build IVKeyboardControl::Draw paints a
+    // "key: .., vel: .." overlay with IText(20, COLOR_RED), i.e. in iPlug2's
+    // DEFAULT_FONT "Roboto-Regular", which nothing loads. NanoVG's
+    // PrepareAndMeasureText then asserts ("No font found"), the assert's modal
+    // dialog blocks the first paint, and the Debug editor stays white and does
+    // not close. Release builds are unaffected; this predates the shared style.
     const float kbY = y3 + row3H + nui::kRowGap;  // just below row 3
     const IRECT kbRect(x0, kbY, x1, kbY + kKeyboardH);
     constexpr int kKeyboardMinNote = 36;  // C2
