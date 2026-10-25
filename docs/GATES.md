@@ -1711,13 +1711,22 @@ needs changed.
 
 **Requires Windows or macOS.** Non-blocking for DSP work; do it whenever G9 lands.
 
+> **Since the shared editor style:** the editor is built from nassau-plugin-sdk's
+> `include/nassau/ui_style.h` and follows that repo's `docs/UI_STYLE.md` — the
+> metrics, text sizes, control styles, font loading, header, panels, row helpers
+> and the binding check are the SDK's; the palette (warm amber on dark brown, plus
+> a dark `knobFace`), the panels, the keyboard strip and the window size are this
+> plugin's. The size is still derived and `static_assert`ed in
+> `NassauAnalogueUI.cpp`, and is unchanged at **944 × 714**. Most of UI_STYLE.md
+> §2–§3 was first worked out here (G10, G12).
+
 | ID | Criterion |
 |---|---|
-| G10.1 | Every param has a control bound **by enum index** (53 at G10; 54 since G12 appended `kChorus`, bound in the Chorus+Output panel) |
+| G10.1 | Every param has **exactly one** control bound **by enum index** (53 at G10; 54 since G12 appended `kChorus`, bound in the Chorus+Output panel). Checked at the end of `Layout` in debug builds by `nassau::ui::CheckBindings`, which prints `NassauAnalogue editor: 54 params, … 0 without exactly one control` to stderr and asserts |
 | G10.2 | Layout groups in signal-chain order: *VCO 1 · VCO 2 · Sub+Noise · Mixer+Drive · HPF · LPF · ENV-F · ENV-A · LFO · Poly-Mod · Voice · Stereo · Output*, plus the preset selector (`IVBakedPresetManagerControl`) |
 | G10.3 | An `IVKeyboardControl` is present and plays notes — an instrument editor without a keyboard is untestable by ear without external MIDI |
 | G10.4 | Builds **and links** with `-DNASSAU_FORCE_HEADLESS=ON` (whole `.cpp` inside `#if IPLUG_EDITOR`) |
-| G10.5 | **Font is loaded by family name on EVERY editor open, from a per-platform candidate list, with no `static bool` guard.** Both halves of this are Zermatt G8 bugs that shipped: `"Helvetica"` does not exist on Windows, and IGraphics' font storage is destroyed with the editor, so a process-lifetime static makes the *second* open render nothing. See `nassau-zermatt/Source/Plugin/NassauZermattUI.cpp`'s comment block |
+| G10.5 | **Font is loaded by family name on EVERY editor open, from a per-platform candidate list, with no `static bool` guard.** Both halves of this are Zermatt G8 bugs that shipped: `"Helvetica"` does not exist on Windows, and IGraphics' font storage is destroyed with the editor, so a process-lifetime static makes the *second* open render nothing. Now `nassau::ui::LoadFont`, called at the top of every `Layout`; the history is in nassau-plugin-sdk's `docs/UI_STYLE.md` §4 |
 | G10.6 | Builds on Windows (NanoVG/GL2) and, if a Mac is available, macOS (Skia/Metal) |
 | G10.7 | All formats still build; `ctest` still green |
 

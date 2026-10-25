@@ -17,6 +17,7 @@ namespace NassauAnalogueUI {
     // notes without external MIDI (G10.3). Every control binds to its
     // parameter by enum index, so IPlug2 handles all UI <-> param sync — this
     // function never writes SynthCore or plugin state directly (R9). See
-    // NassauAnalogueUI.cpp for the layout metrics and window-size derivation.
+    // NassauAnalogueUI.cpp for the window-size derivation; the shared metrics
+    // and styles are nassau-plugin-sdk's (include/nassau/ui_style.h).
     void Layout(iplug::igraphics::IGraphics& ui, NassauAnaloguePlugin& plugin);
 }
