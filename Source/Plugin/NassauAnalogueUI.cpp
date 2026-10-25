@@ -296,12 +296,10 @@ void NassauAnalogueUI::Layout(IGraphics& ui, NassauAnaloguePlugin& /*plugin*/)
     // palette. Pressed keys use the accent, the colour of every knob's value
     // arc, so a held note reads as "lit" in the same visual language.
     //
-    // KNOWN, Debug only: in a _DEBUG build IVKeyboardControl::Draw paints a
-    // "key: .., vel: .." overlay with IText(20, COLOR_RED), i.e. in iPlug2's
-    // DEFAULT_FONT "Roboto-Regular", which nothing loads. NanoVG's
-    // PrepareAndMeasureText then asserts ("No font found"), the assert's modal
-    // dialog blocks the first paint, and the Debug editor stays white and does
-    // not close. Release builds are unaffected; this predates the shared style.
+    // In a _DEBUG build IVKeyboardControl::Draw paints a red "key: .., vel: .."
+    // overlay in iPlug2's DEFAULT_FONT ("Roboto-Regular"). nui::LoadFont
+    // registers that name too; before it did, NanoVG asserted "No font found",
+    // and the assert's hidden dialog left the Debug editor blank and unclosable.
     const float kbY = y3 + row3H + nui::kRowGap;  // just below row 3
     const IRECT kbRect(x0, kbY, x1, kbY + kKeyboardH);
     constexpr int kKeyboardMinNote = 36;  // C2
