@@ -1716,13 +1716,15 @@ needs changed.
 > metrics, text sizes, control styles, font loading, header, panels, row helpers
 > and the binding check are the SDK's; the palette (warm amber on dark brown, plus
 > a dark `knobFace`), the panels, the keyboard strip and the window size are this
-> plugin's. The size is still derived and `static_assert`ed in
+> plugin's. Every switch and toggle is a `nui::TabSwitch` / `nui::Toggle` (via
+> `nui::Switch` / `nui::ToggleRow`), which draw the selected / "on" text in the
+> ink that reads on the amber. The size is still derived and `static_assert`ed in
 > `NassauAnalogueUI.cpp`, and is unchanged at **944 × 714**. Most of UI_STYLE.md
 > §2–§3 was first worked out here (G10, G12).
 
 | ID | Criterion |
 |---|---|
-| G10.1 | Every param has **exactly one** control bound **by enum index** (53 at G10; 54 since G12 appended `kChorus`, bound in the Chorus+Output panel). Checked at the end of `Layout` in debug builds by `nassau::ui::CheckBindings`, which prints `NassauAnalogue editor: 54 params, … 0 without exactly one control` to stderr and asserts |
+| G10.1 | Every param has **exactly one** control bound **by enum index** (53 at G10; 54 since G12 appended `kChorus`, bound in the Chorus+Output panel). Checked at the end of `Layout` in debug builds by `nassau::ui::CheckBindings`, which prints `NassauAnalogue editor: 54 params, … 0 without exactly one control, 0 out of range` to stderr and asserts (out of range: a control bound past the last param) |
 | G10.2 | Layout groups in signal-chain order: *VCO 1 · VCO 2 · Sub+Noise · Mixer+Drive · HPF · LPF · ENV-F · ENV-A · LFO · Poly-Mod · Voice · Stereo · Output*, plus the preset selector (`IVBakedPresetManagerControl`) |
 | G10.3 | An `IVKeyboardControl` is present and plays notes — an instrument editor without a keyboard is untestable by ear without external MIDI |
 | G10.4 | Builds **and links** with `-DNASSAU_FORCE_HEADLESS=ON` (whole `.cpp` inside `#if IPLUG_EDITOR`) |
