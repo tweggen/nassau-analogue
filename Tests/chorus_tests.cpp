@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -77,6 +78,17 @@ void checkNum(const std::string& name, bool cond, double measured) {
 
 constexpr double kFs = 48000.0;
 constexpr int kControlBlock = 32;  // DESIGN.md §2's default, mirrored here for the control-step maths
+
+// ---- SynthCore instances live on the heap, not the stack -----------------
+// A SynthCore is ~69 KB, 32 KB of it this gate's own two chorus delay lines,
+// and main() below builds sixteen of them. As stack locals that is ~1.1 MB in
+// ONE frame -- past the 1 MB main-thread stack MSVC links by default (Linux and
+// macOS give 8 MB) -- so on Windows the binary died of a stack overflow
+// (0xC00000FD, which ctest reports as SEGFAULT) before printing a single line.
+// Nothing in the DSP was at fault: the plugin holds its SynthCore as a member
+// of the heap-allocated plugin object. Every construction here happens outside
+// G12.13's measured window, so the allocation counter is unaffected.
+std::unique_ptr<SynthCore> makeCore() { return std::make_unique<SynthCore>(); }
 
 // ---- Render helpers (same shape as stereo_tests.cpp) ----------------------
 
@@ -241,7 +253,8 @@ int main() {
     const std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 57, 0.9f}};
 
     // (a) Off throughout.
-    SynthCore alwaysOff;
+    const auto alwaysOffOwner = makeCore();
+    SynthCore& alwaysOff = *alwaysOffOwner;
     configureSmooth(alwaysOff);
     std::vector<float> aL, aR;
     renderAbsEvents(alwaysOff, ev, total, 512, aL, aR);
@@ -249,7 +262,8 @@ int main() {
     // (b) II for 0.5 s, then Off for the rest -- rendered through the SAME
     // helper in two contiguous segments so the only difference from (a) is
     // the parameter, not the blocking.
-    SynthCore toggled;
+    const auto toggledOwner = makeCore();
+    SynthCore& toggled = *toggledOwner;
     configureSmooth(toggled);
     toggled.setChorusMode(SynthCore::Chorus::Two);
     std::vector<float> bL(static_cast<size_t>(total), 0.0f), bR(static_cast<size_t>(total), 0.0f);
@@ -295,14 +309,16 @@ int main() {
     const int total = static_cast<int>(1.0 * kFs);
     const std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 60, 0.9f}};
 
-    SynthCore off;
+    const auto offOwner = makeCore();
+    SynthCore& off = *offOwner;
     configureSmooth(off);
     std::vector<float> oL, oR;
     renderAbsEvents(off, ev, total, 512, oL, oR);
     checkNum("G12.2: kStereoMode off + kChorus Off -> outL == outR bit-exactly (G8.1 unperturbed)",
              maxAbsDiff(oL, oR, 0, total) == 0.0, maxAbsDiff(oL, oR, 0, total));
 
-    SynthCore on;
+    const auto onOwner = makeCore();
+    SynthCore& on = *onOwner;
     configureSmooth(on);
     on.setChorusMode(SynthCore::Chorus::Two);
     std::vector<float> nL, nR;
@@ -332,7 +348,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: per-mode LFO rate (G12.3)\n";
   for (int m = 1; m <= 3; ++m) {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(static_cast<float>(kFs));
     core.setChorusMode(static_cast<SynthCore::Chorus>(m));
 
@@ -375,7 +392,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: per-mode delay envelope and antiphase sweep (G12.4, G12.5)\n";
   for (int m = 1; m <= 3; ++m) {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(static_cast<float>(kFs));
     core.setChorusMode(static_cast<SynthCore::Chorus>(m));
 
@@ -420,7 +438,8 @@ int main() {
   {
     double cents[4] = {0.0, 0.0, 0.0, 0.0};
     for (int m = 1; m <= 3; ++m) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(static_cast<float>(kFs));
       core.setChorusMode(static_cast<SynthCore::Chorus>(m));
 
@@ -461,7 +480,8 @@ int main() {
     const std::vector<int> chord = {36, 43, 48, 52, 55, 60, 64, 67};
     const int total = static_cast<int>(2.0 * kFs);
     for (int m = 0; m <= 3; ++m) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(static_cast<float>(kFs));
       core.setChorusMode(static_cast<SynthCore::Chorus>(m));
       std::vector<NoteEvent> ev;
@@ -510,12 +530,14 @@ int main() {
     const int win = static_cast<int>(0.05 * kFs);
     const std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 55, 0.9f}};
 
-    SynthCore refOff;
+    const auto refOffOwner = makeCore();
+    SynthCore& refOff = *refOffOwner;
     configureSmooth(refOff);
     std::vector<float> rL, rR;
     renderAbsEvents(refOff, ev, total, 512, rL, rR);
 
-    SynthCore refOn;
+    const auto refOnOwner = makeCore();
+    SynthCore& refOn = *refOnOwner;
     configureSmooth(refOn);
     refOn.setChorusMode(SynthCore::Chorus::Two);
     std::vector<float> oL, oR;
@@ -526,7 +548,8 @@ int main() {
 
     for (int direction = 0; direction < 2; ++direction) {
       const bool onAtToggle = direction == 0;
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureSmooth(core);
       if (!onAtToggle) core.setChorusMode(SynthCore::Chorus::Two);
 
@@ -567,7 +590,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: the 20 ms wet fade, exact endpoints (G12.9)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     configureSmooth(core);
     std::vector<float> l(1), r(1);
     for (int i = 0; i < 4800; ++i) core.process(nullptr, 0, l.data(), r.data(), 1);
@@ -621,7 +645,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: live mode changes glide, not jump (G12.10)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(static_cast<float>(kFs));
     core.setChorusMode(SynthCore::Chorus::Two);
     std::vector<double> d0, d1;
@@ -669,7 +694,8 @@ int main() {
     const int blockSizes[] = {1, 7, 32, 33, 512, 8192};
     std::vector<std::vector<float>> rendersL, rendersR;
     for (int bs : blockSizes) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureSmooth(core);
       core.setChorusMode(SynthCore::Chorus::Two);
       std::vector<float> l, r;
@@ -702,7 +728,8 @@ int main() {
     const int total = static_cast<int>(0.75 * kFs);
     const std::vector<NoteEvent> ev = {{0, NoteEvent::NoteOn, 62, 0.9f}};
 
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     configureSmooth(core);
     core.setChorusMode(SynthCore::Chorus::Two);
     std::vector<float> firstL, firstR;
@@ -729,7 +756,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: zero heap allocation with the chorus running (G12.13)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     configureSmooth(core);
     const int block = 512;
     std::vector<float> l(static_cast<size_t>(block)), r(static_cast<size_t>(block));
