@@ -98,8 +98,8 @@
 // selector and an IVKeyboardControl strip along the bottom.
 //
 // These two numbers are NOT free parameters and must not be hand-tuned:
-// NassauAnalogueUI.cpp's layout-metrics block computes the editor size its
-// own constants add up to and static_asserts it against exactly these
+// NassauAnalogueUI.cpp computes the editor size its rows (built from the
+// SDK's nassau::ui metrics) add up to and static_asserts it against exactly these
 // macros, so the two can no longer drift apart. (They had: the height here
 // said 672 while the layout needed more, and the overflow showed up as
 // clipped and overlapping text -- worse on macOS, whose Helvetica is wider
@@ -113,6 +113,10 @@
 // slack than a tab-switch row needs. Two pixels, taken by following the
 // arithmetic rather than by trimming something to fit -- which is what the
 // static_assert exists to force.
+//
+// Unchanged by the move onto nassau-plugin-sdk's shared editor style
+// (docs/UI_STYLE.md there): its metrics are the ones this layout had already
+// derived, so the same rows add up to the same 944 x 714.
 #define PLUG_WIDTH      944
 #define PLUG_HEIGHT     714
 #define PLUG_FPS        60
