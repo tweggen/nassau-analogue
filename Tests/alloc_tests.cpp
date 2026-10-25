@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -118,6 +119,17 @@ double peakAbs(const std::vector<float>& v, int from, int to) {
   for (int i = from; i < to && i < static_cast<int>(v.size()); ++i) p = std::max(p, std::fabs(static_cast<double>(v[static_cast<size_t>(i)])));
   return p;
 }
+
+// ---- SynthCore instances live on the heap, not the stack -----------------
+// A SynthCore is ~69 KB (32 KB of it the G12 chorus's two delay lines), and
+// main() below builds 23 of them. A Debug build gives each block-scoped
+// local its own slot, so as stack locals they need well over 1 MB in ONE
+// frame -- past the 1 MB main-thread stack MSVC links by default -- and the
+// binary died of a stack overflow (0xC00000FD, which ctest reports as
+// SEGFAULT) before printing a line. Release survived only because the
+// optimiser overlaps the disjoint scopes. Same cause and same fix as
+// chorus_tests.cpp's makeCore().
+std::unique_ptr<SynthCore> makeCore() { return std::make_unique<SynthCore>(); }
 
 }  // namespace
 
@@ -230,7 +242,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: polyphony is honoured (G7.1)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setPolyphony(SynthCore::Polyphony::Eight);
@@ -296,7 +309,8 @@ int main() {
   {
     // (a) Idle first: a fresh core's very first note-on lands on index 0
     // (the lowest-index Idle slot).
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setPolyphony(SynthCore::Polyphony::Eight);
@@ -311,7 +325,8 @@ int main() {
     // the 9th distinct note-on (nothing idle, two Released: 0 older, 1
     // newer) must land on voice 0, the OLDER of the two Released voices,
     // leaving voice 1 untouched (still Released).
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvAReleaseMs(5000.0f);  // long release -- stays Released, doesn't decay to Idle mid-test
@@ -337,7 +352,8 @@ int main() {
     // oldest-started, 7 newest), none released. A 9th distinct note-on
     // (nothing Idle, nothing Released) must steal the OLDEST-started voice,
     // index 0.
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -373,7 +389,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: stealing does not click (G7.3)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvAAttackMs(2.0f);
@@ -479,7 +496,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: three simultaneous steals, only 2 fade slots (G7.4)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -513,7 +531,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: retriggering a sounding note reuses its voice (G7.5)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -537,7 +556,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: sustain pedal (G7.6)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -570,7 +590,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: CC123 vs CC120 (G7.7)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -585,7 +606,8 @@ int main() {
           peakAbs(tail, 0, 32) > 1e-4);
   }
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -670,7 +692,8 @@ int main() {
   {
     const int testOffsets[] = {0, 1, 31, 32, 33, 511};
     for (int s : testOffsets) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvAAttackMs(1.0f);
@@ -699,7 +722,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: pitch bend (G7.9)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -713,7 +737,8 @@ int main() {
              std::fabs(f - target) / target < 0.01, f);
   }
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -739,7 +764,8 @@ int main() {
   std::cout << "\nGroup: glide (G7.10)\n";
   {
     auto runGlide = [&](float glideMs) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvASustainPercent(100.0f);
@@ -766,7 +792,8 @@ int main() {
     {
       // kGlideTime=0: instantaneous (first control block) -- measure almost
       // immediately after the legato retarget.
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvASustainPercent(100.0f);
@@ -799,7 +826,8 @@ int main() {
   std::cout << "\nGroup: velocity -> VCA / filter (G7.11)\n";
   {
     auto peakAt = [&](float vel, float velToVcaPct) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvASustainPercent(100.0f);
@@ -822,7 +850,8 @@ int main() {
              std::fabs(p0_full - p0_half) < 1e-12, std::fabs(p0_full - p0_half));
 
     auto cutoffAt = [&](float vel, float velToFilterPct) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setLpfCutoffHz(2000.0f);
@@ -857,7 +886,8 @@ int main() {
   std::cout << "\nGroup: Mono mode is legato (G7.12)\n";
   {
     auto dipAround = [&](bool overlapping) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvAAttackMs(2.0f);
@@ -912,7 +942,8 @@ int main() {
     // Glide is applied in the legato case: mid-transition frequency sits
     // strictly between 220Hz (note 60 - wait, use notes that make the math
     // simple) -- reusing notes 69/81 (440/880Hz) for a clean octave gap.
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -941,7 +972,8 @@ int main() {
   std::cout << "\nGroup: Unison mode (G7.13)\n";
   {
     auto peakJustAfterAttack = [&](SynthCore::VoiceMode mode) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       configureCleanSaw(core);
       core.setEnvAAttackMs(2.0f);
@@ -973,7 +1005,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: silent voices are skipped (G7.14)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     configureCleanSaw(core);
     core.setEnvASustainPercent(100.0f);
@@ -1060,7 +1093,8 @@ int main() {
 
     auto runStream = [&](SynthCore& core) { return renderAbsEvents(core, stream, totalSamples, 512); };
 
-    SynthCore coreA;
+    const auto coreAOwner = makeCore();
+    SynthCore& coreA = *coreAOwner;
     coreA.init(48000.0f);
     auto outA = runStream(coreA);
 
@@ -1075,7 +1109,8 @@ int main() {
     checkNum("G7.15: voice count returns to 0 once the stream's tail has settled",
              coreA.getDebugActiveVoiceCount() == 0, coreA.getDebugActiveVoiceCount());
 
-    SynthCore coreB;
+    const auto coreBOwner = makeCore();
+    SynthCore& coreB = *coreBOwner;
     coreB.init(48000.0f);
     auto outB = runStream(coreB);
     bool bitIdentical = outA.size() == outB.size();

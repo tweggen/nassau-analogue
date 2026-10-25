@@ -33,6 +33,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -202,6 +203,17 @@ double measureSweepZipperDbPerMs(SynthCore& core, const std::vector<NoteEvent>& 
   return worst;
 }
 
+// ---- SynthCore instances live on the heap, not the stack -----------------
+// A SynthCore is ~69 KB (32 KB of it the G12 chorus's two delay lines), and
+// main() below builds 29 of them. A Debug build gives each block-scoped
+// local its own slot, so as stack locals they need well over 1 MB in ONE
+// frame -- past the 1 MB main-thread stack MSVC links by default -- and the
+// binary died of a stack overflow (0xC00000FD, which ctest reports as
+// SEGFAULT) before printing a line. Release survived only because the
+// optimiser overlaps the disjoint scopes. Same cause and same fix as
+// chorus_tests.cpp's makeCore().
+std::unique_ptr<SynthCore> makeCore() { return std::make_unique<SynthCore>(); }
+
 }  // namespace
 
 int main() {
@@ -224,7 +236,8 @@ int main() {
   // =========================================================================
   std::cout << "Group: ParamSnapshot built exactly once per host block (G3.1)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.resetDebugAtomicLoadCount();
     std::vector<float> l(512), r(512);
@@ -260,7 +273,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: zero atomic loads, zero transcendentals in the audio-rate loop (G3.2)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.resetDebugAtomicLoadCount();
     std::vector<float> l(17), r(17);  // < 1 control block: no control-rate update point is ever reached
@@ -330,7 +344,8 @@ int main() {
     const int blockSizes[] = {1, 7, 32, 33, 512, 8192};
     std::vector<std::vector<float>> renders;
     for (int bs : blockSizes) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configure(core);
       renders.push_back(renderAbsEvents(core, absEvents, totalSamples, bs));
     }
@@ -363,7 +378,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: ENV-A drives the VCA -- attack/decay/release timing (G3.4)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setOsc1Wave(SynthCore::Wave::Saw);
     core.setOsc1FineCents(fineCentsFor(kNote1k, 1000.0));
@@ -411,7 +427,8 @@ int main() {
              foundDecay && std::fabs(decayMs - 200.0) <= 0.15 * 200.0, decayMs);
 
     // Release, measured separately with sustain=100% (see comment above).
-    SynthCore coreR;
+    const auto coreROwner = makeCore();
+    SynthCore& coreR = *coreROwner;
     coreR.init(48000.0f);
     coreR.setOsc1Wave(SynthCore::Wave::Saw);
     coreR.setOsc1FineCents(fineCentsFor(kNote1k, 1000.0));
@@ -496,16 +513,19 @@ int main() {
       c.setOutputClip(false);
     };
 
-    SynthCore coreA;
+    const auto coreAOwner = makeCore();
+    SynthCore& coreA = *coreAOwner;
     configure(coreA);
     auto outA = renderNoteHeld(coreA, 69, 1.0f, n);
 
-    SynthCore coreB;
+    const auto coreBOwner = makeCore();
+    SynthCore& coreB = *coreBOwner;
     configure(coreB);
     coreB.setDebugDisableVcaInterpolation(true);
     auto outB = renderNoteHeld(coreB, 69, 1.0f, n);
 
-    SynthCore coreU;
+    const auto coreUOwner = makeCore();
+    SynthCore& coreU = *coreUOwner;
     configure(coreU);
     coreU.setDebugForceUnityVca(true);
     auto outU = renderNoteHeld(coreU, 69, 1.0f, n);
@@ -573,7 +593,8 @@ int main() {
     // to Decay) throughout the measured window, comfortably clear of the
     // onset.
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureCommon(core);
       core.setEnvADecayMs(3000.0f);
       core.setEnvASustainPercent(50.0f);
@@ -591,7 +612,8 @@ int main() {
     }
     // ---- envADecayMs: pre-roll into Decay, then sweep (same 15ms floor, same reasoning) ----
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureCommon(core);
       core.setEnvAAttackMs(2.0f);
       core.setEnvASustainPercent(10.0f);
@@ -621,7 +643,8 @@ int main() {
     // project, e.g. G2.7's own nonHarmonicEnergyDb-vs-aliasFloorDb lesson).
     // 10%..100% keeps the measurement in the well-posed region. ----
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureCommon(core);
       core.setEnvAAttackMs(2.0f);
       core.setEnvADecayMs(2.0f);
@@ -652,7 +675,8 @@ int main() {
     // releases) guarantees the release never gets anywhere near completing
     // within the 100ms window.
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       configureCommon(core);
       core.setEnvAAttackMs(2.0f);
       core.setEnvADecayMs(2.0f);
@@ -723,7 +747,8 @@ int main() {
     // 500->10000ms over the measured window, so Attack is genuinely still
     // in progress but nowhere near its own steep onset.
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setEnvFDecayMs(3000.0f);
       core.setEnvFSustainPercent(50.0f);
@@ -741,7 +766,8 @@ int main() {
                worst < 0.5, worst);
     }
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setEnvFAttackMs(2.0f);
       core.setEnvFSustainPercent(10.0f);
@@ -763,7 +789,8 @@ int main() {
     // 500ms and only sweeping upward guarantees Release never gets near
     // completing within the 100ms measured window.
     {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setEnvFAttackMs(2.0f);
       core.setEnvFDecayMs(2.0f);
@@ -799,7 +826,8 @@ int main() {
       // (R11), not tested around. What IS correctly testable now: that
       // ENV-F's Sustain state tracks a LIVE kEnvFSustain sweep EXACTLY,
       // matching AdsrEnv's own contract.
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setEnvFAttackMs(2.0f);
       core.setEnvFDecayMs(2.0f);
@@ -841,7 +869,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: LFO -> pitch, +-50 cents at 5 Hz (G3.7)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setOsc1Wave(SynthCore::Wave::Saw);
     core.setOsc2LevelPercent(0.0f);
@@ -886,7 +915,8 @@ int main() {
     // Sanity baseline: with the LFO amount at 0, the swing must collapse to
     // ~0 -- confirms the 50-cent figure above is genuinely caused by the
     // LFO, not by measurement noise in the quarter-window method itself.
-    SynthCore coreOff;
+    const auto coreOffOwner = makeCore();
+    SynthCore& coreOff = *coreOffOwner;
     coreOff.init(48000.0f);
     coreOff.setOsc1Wave(SynthCore::Wave::Saw);
     coreOff.setOsc2LevelPercent(0.0f);
@@ -921,7 +951,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: LFO -> PWM (G3.8)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setOsc1Wave(SynthCore::Wave::Pulse);
     core.setOsc1PwPercent(50.0f);
@@ -957,7 +988,8 @@ int main() {
     // Baseline: no LFO amount -> PW stays 50% -> H2/H1 deeply negative (a
     // square has (near-)no even harmonics, G2.4), confirming the sweep
     // above genuinely moved the duty rather than measuring a fixed pulse.
-    SynthCore coreOff;
+    const auto coreOffOwner = makeCore();
+    SynthCore& coreOff = *coreOffOwner;
     coreOff.init(48000.0f);
     coreOff.setOsc1Wave(SynthCore::Wave::Pulse);
     coreOff.setOsc1PwPercent(50.0f);
@@ -988,7 +1020,8 @@ int main() {
   std::cout << "\nGroup: the control rate is inaudible (G3.9)\n";
   {
     // (a)
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setOsc1Wave(SynthCore::Wave::Saw);
     core.setOsc2LevelPercent(0.0f);
@@ -1007,7 +1040,8 @@ int main() {
     // turning the LFO on -- measuredF0 IS the right tool here (steady tone,
     // no modulation yet).
     {
-      SynthCore coreCheck;
+      const auto coreCheckOwner = makeCore();
+      SynthCore& coreCheck = *coreCheckOwner;
       coreCheck.init(48000.0f);
       coreCheck.setOsc1Wave(SynthCore::Wave::Saw);
       coreCheck.setOsc1FineCents(fineCents);
@@ -1063,7 +1097,8 @@ int main() {
 
     // (b)
     auto renderCB = [&](int cb) {
-      SynthCore c;
+      const auto cOwner = makeCore();
+      SynthCore& c = *cOwner;
       c.init(48000.0f);
       c.setDebugControlBlock(cb);
       c.setOsc1Wave(SynthCore::Wave::Saw);
@@ -1116,7 +1151,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: the LFO is global (G3.10)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setLfoPitchAmountPercent(50.0f);
     core.setLfoRateHz(3.0f);
@@ -1149,7 +1185,8 @@ int main() {
     // Independent cross-check: the LFO's own trace is bit-identical whether
     // a second voice starts 100ms in or not.
     auto traceLfo = [&](bool addSecondVoice) {
-      SynthCore c;
+      const auto cOwner = makeCore();
+      SynthCore& c = *cOwner;
       c.init(48000.0f);
       c.setLfoRateHz(3.0f);
       c.setLfoWave(SynthCore::LfoWave::Tri);
@@ -1197,7 +1234,8 @@ int main() {
   // =========================================================================
   std::cout << "\nGroup: LFO delay retriggers only on 0->1 voice count (G3.11)\n";
   {
-    SynthCore core;
+    const auto coreOwner = makeCore();
+    SynthCore& core = *coreOwner;
     core.init(48000.0f);
     core.setLfoDelayMs(500.0f);
     core.setEnvAAttackMs(5.0f);
@@ -1333,7 +1371,8 @@ int main() {
     bool allOk = true;
     const SynthCore::Wave waves[] = {SynthCore::Wave::Saw, SynthCore::Wave::Pulse, SynthCore::Wave::Tri};
     for (auto wave : waves) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setOsc1Wave(wave);
       core.setOsc1FineCents(fineDc);
@@ -1361,7 +1400,8 @@ int main() {
     // core sound of this instrument, not an exotic corner.
     bool pwOk = true;
     for (double pw : {10.0, 25.0, 40.0, 50.0}) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       core.setOsc1Wave(SynthCore::Wave::Pulse);
       core.setOsc1PwPercent(static_cast<float>(pw));
@@ -1397,7 +1437,8 @@ int main() {
     bool allOk = true;
     const int kTrials = 3000;
     for (int t = 0; t < kTrials; ++t) {
-      SynthCore core;
+      const auto coreOwner = makeCore();
+      SynthCore& core = *coreOwner;
       core.init(48000.0f);
       auto pick3 = [&](float lo, float mid, float hi) {
         const uint32_t r = rng.next() % 3u;
