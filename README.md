@@ -22,6 +22,14 @@ sustain-pedal state, stereo duplication — lives in the core, behind a
 framework-free `NoteEvent` interface. It builds and is unit-tested standalone,
 with no SDK present.
 
+Its filters and shapers — the 24 dB ladder, the 12 dB SVF, the HP cascade,
+`shapeTriodeK`, `nassau_real` and the control-block contract (`synth_dsp.h`,
+`synth_filter.h`) — live in [`nassau-dsp`](https://github.com/tweggen/nassau-dsp),
+a header-only library shared with NassauDigital, checked out as the submodule
+`extern/nassau-dsp`. Clone with `--recurse-submodules`, or run
+`git submodule update --init` once; the configure step stops with that
+command if it is missing.
+
 > **Status: G0–G8 and G11 done** (every gate this Linux box can execute
 > without the plugin SDK, DESIGN.md §0.4) — full signal chain, voice
 > allocation, MIDI, stereo, the golden battery, and the CPU budget are all

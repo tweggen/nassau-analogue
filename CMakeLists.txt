@@ -29,7 +29,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NassauSDK.cmake)
 # double-precision path stays the shipped default and must remain
 # bit-identical to every gate through G11 (both golden batteries verify at
 # exactly 0.000e+00). Turning this ON redefines `nassau_real`
-# (Source/DSP/synth_dsp.h) from `double` to `float` for filter state, filter
+# (synth_dsp.h, extern/nassau-dsp since X1) from `double` to `float` for filter state, filter
 # coefficients and the DC blockers ONLY -- oscillator phase accumulators and
 # everything else stay `double` unconditionally (G2.8 needs 1e-9, float only
 # carries ~1e-7). Targets weak/ARM machines (half-rate double throughput,
@@ -67,6 +67,21 @@ if(NASSAU_NO_SIMD)
     add_compile_definitions(NASSAU_NO_SIMD)
 endif()
 
+
+# Shared DSP primitives (NassauDigital gate X1): synth_dsp.h and
+# synth_filter.h -- the ladder, the SVF, the HP cascade, shapeTriodeK,
+# nassau_real and the control-block contract -- live in tweggen/nassau-dsp,
+# a header-only library this repo takes as a submodule, so NassauDigital's
+# core and this one share a single copy. It must be added BEFORE Source/DSP
+# (whose target links it) and after the SDK prologue above, like every
+# subdirectory. NASSAU_DSP_FLOAT / NASSAU_NO_SIMD above are directory-wide
+# compile definitions and so reach its headers in every translation unit here.
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/nassau-dsp/CMakeLists.txt)
+    message(FATAL_ERROR
+        "extern/nassau-dsp is missing: the shared DSP headers are a git submodule.\n"
+        "Run:  git submodule update --init extern/nassau-dsp")
+endif()
+add_subdirectory(extern/nassau-dsp)
 
 # DSP core (always builds — no framework dependencies, R2/R14).
 add_subdirectory(Source/DSP)

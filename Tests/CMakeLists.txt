@@ -12,11 +12,12 @@ target_compile_options(synth_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 
 add_test(NAME SynthTests COMMAND synth_tests)
 
-# ---- G1: DSP primitives (Source/DSP/synth_dsp.h) ---------------------------
+# ---- G1: DSP primitives (synth_dsp.h, in extern/nassau-dsp since X1) -------
 # Header-only (no nassau_synth_core link needed) -- dsp_tests.cpp exercises
 # synth_dsp.h's structs/free functions directly, using the shared
 # Tests/test_util.h harness helpers (docs/GATES.md "Shared test harness").
 add_executable(dsp_tests dsp_tests.cpp)
+target_link_libraries(dsp_tests nassau::dsp)   # synth_dsp.h, from extern/nassau-dsp (X1)
 target_include_directories(dsp_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
 target_compile_options(dsp_tests PRIVATE ${NASSAU_WARNING_FLAGS})
@@ -28,6 +29,7 @@ add_test(NAME DspTests COMMAND dsp_tests)
 # synth_osc.h's structs directly, same shape as dsp_tests.cpp above (and
 # nassau-zermatt's Tests/cabinet_tests.cpp driving Cabinet directly).
 add_executable(osc_tests osc_tests.cpp)
+target_link_libraries(osc_tests nassau::dsp)   # synth_dsp.h, from extern/nassau-dsp (X1)
 target_include_directories(osc_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP)
 target_compile_options(osc_tests PRIVATE ${NASSAU_WARNING_FLAGS})
@@ -51,7 +53,7 @@ target_compile_definitions(envlfo_tests PRIVATE
 
 add_test(NAME EnvLfoTests COMMAND envlfo_tests)
 
-# ---- G4: the low-pass filter (Source/DSP/synth_filter.h) -------------------
+# ---- G4: the low-pass filter (synth_filter.h, extern/nassau-dsp since X1) --
 # Links nassau_synth_core: G4.1-G4.8/G4.10 drive LadderFilter/SvfFilter
 # directly (header-only, same shape as dsp_tests.cpp/osc_tests.cpp), but
 # G4.9 reads SynthCore::getDebugLpfCutoff(), so the library is needed too.
@@ -64,7 +66,7 @@ target_compile_options(filter_tests PRIVATE ${NASSAU_WARNING_FLAGS})
 # (between its "PER-SAMPLE PROCESS BEGIN/END" markers) at an ABSOLUTE path,
 # matching envlfo_tests.cpp's NASSAU_CORE_CPP_PATH precedent (G3.2).
 target_compile_definitions(filter_tests PRIVATE
-    NASSAU_FILTER_H_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../Source/DSP/synth_filter.h")
+    NASSAU_FILTER_H_PATH="${PROJECT_SOURCE_DIR}/extern/nassau-dsp/Source/DSP/synth_filter.h")
 
 add_test(NAME FilterTests COMMAND filter_tests)
 
