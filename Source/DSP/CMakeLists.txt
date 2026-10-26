@@ -5,7 +5,7 @@ add_library(nassau_synth_core
 )
 
 target_include_directories(nassau_synth_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-# synth_dsp.h / synth_filter.h come from the nassau-dsp submodule (X1).
+# synth_dsp.h / synth_filter.h come from nassau-dsp (X1, cmake/NassauDSP.cmake).
 # PUBLIC, so every target that links the core -- the plugin, the tests --
 # finds them where it used to find them here.
 target_link_libraries(nassau_synth_core PUBLIC nassau::dsp)
