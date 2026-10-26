@@ -1,3 +1,0 @@
-[submodule "extern/nassau-dsp"]
-	path = extern/nassau-dsp
-	url = https://github.com/tweggen/nassau-dsp.git

@@ -25,10 +25,11 @@ with no SDK present.
 Its filters and shapers — the 24 dB ladder, the 12 dB SVF, the HP cascade,
 `shapeTriodeK`, `nassau_real` and the control-block contract (`synth_dsp.h`,
 `synth_filter.h`) — live in [`nassau-dsp`](https://github.com/tweggen/nassau-dsp),
-a header-only library shared with NassauDigital, checked out as the submodule
-`extern/nassau-dsp`. Clone with `--recurse-submodules`, or run
-`git submodule update --init` once; the configure step stops with that
-command if it is missing.
+a header-only library shared with NassauDigital. `cmake/NassauDSP.cmake` finds
+it: an explicit `-DNASSAU_DSP_DIR` (what nassau-suite passes), else a sibling
+checkout `../nassau-dsp`, else a fetch of the commit pinned in
+`CMakeLists.txt`. It is deliberately not a submodule here: nassau-suite pins
+it, once.
 
 > **Status: G0–G8 and G11 done** (every gate this Linux box can execute
 > without the plugin SDK, DESIGN.md §0.4) — full signal chain, voice
