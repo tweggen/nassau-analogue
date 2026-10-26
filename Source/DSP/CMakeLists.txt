@@ -5,6 +5,10 @@ add_library(nassau_synth_core
 )
 
 target_include_directories(nassau_synth_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# synth_dsp.h / synth_filter.h come from the nassau-dsp submodule (X1).
+# PUBLIC, so every target that links the core -- the plugin, the tests --
+# finds them where it used to find them here.
+target_link_libraries(nassau_synth_core PUBLIC nassau::dsp)
 target_compile_options(nassau_synth_core PRIVATE ${NASSAU_WARNING_FLAGS})
 
 # G0: build the DSP core at -O3 in Release (MSVC Release already implies /O2,
