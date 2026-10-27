@@ -81,7 +81,7 @@ endif()
 #
 # NASSAU_DSP_GIT_REF is what a bare clone of this repo builds. A commit, never
 # a branch; move it in the same change that needs newer nassau-dsp code.
-set(NASSAU_DSP_GIT_REF "32346d5141c000a41c38e3646373072a6d1b5b9a")
+set(NASSAU_DSP_GIT_REF "76e38fb3207092fbc3139a588b2726e9ad1405cd")
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NassauDSP.cmake)
 
 # DSP core (always builds — no framework dependencies, R2/R14).
