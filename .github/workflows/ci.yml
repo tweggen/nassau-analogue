@@ -93,7 +93,7 @@ jobs:
     name: Plugin bundles (macOS, headless)
     needs: sdk-key
     if: needs.sdk-key.outputs.enabled == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
